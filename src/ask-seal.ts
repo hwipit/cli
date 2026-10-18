@@ -139,7 +139,8 @@ export type PreparedAsk =
     | { kind: 'refused'; cause: AskRefusal; why?: RegisterWhy; detail?: string };
 
 export type OpenedAnswer =
-    | { ok: true; actionId?: string; value?: string; exit?: true }
+    /** `files` comes with the key that sealed them, which opens each file's slot (answer-files.ts). */
+    | { ok: true; actionId?: string; value?: string; exit?: true; files?: SealedFileMeta[]; senderPublicKey?: string }
     | { ok: false; cause: AskRefusal };
 
 const defaultAskId = (): string => randomBytes(16).toString('base64url');
@@ -261,12 +262,15 @@ export const openAnswer = async (
 
     const { actionId, exit } = opened.answer;
     if (actionId !== undefined && (offered === undefined || !offered.includes(actionId))) return { ok: false, cause: 'unknown-action' };
-    if (actionId === undefined && !opened.body && exit !== true) return { ok: false, cause: 'empty-answer' };
+    // What the seal says each attached file is; the bytes come with the response's wire `files` (answer-files.ts).
+    const files = opened.files?.length ? opened.files : undefined;
+    if (actionId === undefined && !opened.body && exit !== true && !files) return { ok: false, cause: 'empty-answer' };
     return {
         ok: true,
         ...(actionId === undefined ? {} : { actionId }),
         ...(opened.body ? { value: opened.body } : {}),
         ...(exit === true ? { exit } : {}),
+        ...(files ? { files, senderPublicKey: sealed.senderPublicKey } : {}),
     };
 };
 

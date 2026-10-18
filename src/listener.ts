@@ -5035,6 +5035,48 @@ export const downloadAttachments = async (
     return paths;
 };
 
+/**
+ * The attachments of a sealed answer (`hwip ask`, answer-files.ts), saved one by one to
+ * `~/.hwip/attachments/<eventId>/<name>`. Unlike a command's, a file that fails does not take the
+ * others with it: the answer is the user's word either way, and each file not saved is named with why.
+ * `sealed.files` gives each file's meta in the same order.
+ */
+export const downloadSealedEach = async (
+    eventId: string,
+    files: PushFileAttachment[],
+    ctx: { apiKey: string; baseUrl: string },
+    sealed: SealedAttachments & { files: SealedFileMeta[] },
+    io: AttachmentIo = {},
+): Promise<{ paths: string[]; missing: string[] }> => {
+    const dir = join(ATTACHMENTS_DIR, safeSegment(eventId, 'answer'));
+    const taken = new Map<string, string>();
+    const paths: string[] = [];
+    const missing: string[] = [];
+    for (const [i, f] of files.entries()) {
+        const meta = sealed.files[i];
+        const name = meta?.name || f.fileName || `file-${i}`;
+        try {
+            if (!f.fileKey) throw new Error('no fileKey');
+            const opened = await openSealedAttachment(await fetchAttachmentBytes(f.fileKey, ctx, io), f, sealed);
+            // Padded before sealing: cut back to the size the seal gives.
+            const bytes = meta && Number.isSafeInteger(meta.size) && meta.size >= 0 ? opened.subarray(0, meta.size) : opened;
+            mkdirHandedBack(dir);
+            const abs = attachmentPath(taken, dir, safeSegment(name, `file-${i}`), bytes);
+            if (abs === null) {
+                // The same bytes under a name already saved: said, so no file goes unaccounted for.
+                missing.push(`${name}: the same file was attached twice`);
+                continue;
+            }
+            writeFileSync(abs, bytes);
+            handBackToSudoUser(abs);
+            paths.push(abs);
+        } catch (err) {
+            missing.push(`${name}: ${(err as Error).message}`);
+        }
+    }
+    return { paths, missing };
+};
+
 const defaultDownloadAttachments = (pushId: string, files: PushFileAttachment[], sealed?: SealedAttachments): Promise<string[]> => {
     if (!attachmentCtx) {
         log('! attachment context not initialised — skipping files');

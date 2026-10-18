@@ -25,7 +25,8 @@ import { AUTH_HINT, httpFailureMessage, isConfigFailure, isInvalidUrl, isRedirec
 import { warnInsecureUrl } from './insecure-url.js';
 import { flagOn } from './args.js';
 import { apiFetch, apiUrl, fitsInHeader } from './api.js';
-import { getDevicePublicKey, initDeviceCrypto } from './crypto.js';
+import { getDevicePublicKey, initDeviceCrypto, type SealedFileMeta } from './crypto.js';
+import { saveAnswerFiles, type AnswerFileOpener, type SavedAnswerFiles } from './answer-files.js';
 import { listenerDeviceId } from './listener-device-id.js';
 import { TRUST_FILE } from './config.js';
 import { registerOverApi } from './self-register.js';
@@ -108,6 +109,11 @@ export interface AskOptions {
      * stray `exitRemote` on its answer is dropped.
      */
     acceptsExit?: boolean;
+    /**
+     * Lets the phone attach files to a typed answer; they are saved to `~/.hwip/attachments/<eventId>/`
+     * and their paths follow the text. Set with `acceptsExit`: only an agent's own ask reads a reply.
+     */
+    acceptsFiles?: boolean;
 }
 
 /** Injected so the poll loop is testable without a clock or a network. */
@@ -119,6 +125,8 @@ export interface AskDeps {
     seal: AskSealDeps;
     /** Where a question that went up is kept, so one cut short can be taken up again. Without it, every ask is a new question. */
     pending?: PendingAsks;
+    /** Saves the files a sealed answer names (answer-files.ts). Without it they are left on the server. */
+    saveFiles?: (eventId: string, wire: unknown, metas: SealedFileMeta[], opener: AnswerFileOpener) => Promise<SavedAnswerFiles>;
 }
 
 /** Why an ask ended unanswered: the user cancelled it on the phone, nobody
@@ -127,7 +135,15 @@ export type UnansweredReason = 'cancelled' | 'timeout' | 'error';
 
 export type AskOutcome = (
     | { readonly answered: true; readonly actionId: string }
-    | { readonly answered: true; readonly value: string; readonly exitRemote?: true }
+    | {
+        readonly answered: true;
+        readonly value: string;
+        readonly exitRemote?: true;
+        /** Where the answer's files were saved; their paths also follow the text in `value`. */
+        readonly files?: readonly string[];
+        /** `<name>: <why>` for each attached file that was not saved. */
+        readonly missingFiles?: readonly string[];
+    }
     | { readonly answered: false; readonly reason: UnansweredReason; readonly error?: string }
 ) & {
     /** This is the end of a question an earlier run of the same command put up and did not see through: nothing was sent. */
@@ -169,7 +185,7 @@ interface ApiShape {
         /** A trigger's first answer only: whether the native push was queued. */
         notified?: boolean;
         status?: string;
-        response?: { actionId?: string; value?: string; exitRemote?: boolean; sealed?: unknown; respondedDeviceId?: string } | null;
+        response?: { actionId?: string; value?: string; exitRemote?: boolean; sealed?: unknown; respondedDeviceId?: string; files?: unknown } | null;
     };
     error?: { code?: string; message?: string };
 }
@@ -294,6 +310,7 @@ const trigger = async (deps: AskDeps, opts: AskOptions, deadline: number, prepar
         agentDeviceId: opts.agentDeviceId,
         agentSessionName: opts.agentSessionName,
         ...(opts.acceptsExit ? { acceptsExit: true } : {}),
+        ...(opts.acceptsFiles ? { acceptsFiles: true } : {}),
     });
     const payload = { body, headers: { 'Idempotency-Key': randomUUID() } };
     let backoffs = 0;
@@ -320,13 +337,37 @@ const trigger = async (deps: AskDeps, opts: AskOptions, deadline: number, prepar
     }
 };
 
-/** What an opened answer means to the caller: the choice, or the text (with the exit when this ask offers it). */
-const sealedOutcome = (opened: OpenedAnswer, acceptsExit: boolean): AskOutcome => {
+/**
+ * What an opened answer means to the caller: the choice, or the text (with the exit when this ask offers
+ * it). Saved files' paths follow the text, so a reader of `value` alone still finds them.
+ */
+const sealedOutcome = (opened: OpenedAnswer, acceptsExit: boolean, saved?: SavedAnswerFiles): AskOutcome => {
     if (!opened.ok) return { answered: false, reason: 'error', error: refusalMessage(opened.cause) };
     if (opened.actionId !== undefined) return { answered: true, actionId: opened.actionId };
-    if (opened.exit === true && acceptsExit) return { answered: true, value: opened.value ?? '', exitRemote: true };
-    if (opened.value) return { answered: true, value: opened.value };
+    const value = [opened.value ?? '', ...(saved?.paths ?? [])].filter(Boolean).join('\n');
+    const files = {
+        ...(saved?.paths.length ? { files: saved.paths } : {}),
+        ...(saved?.missing.length ? { missingFiles: saved.missing } : {}),
+    };
+    if (opened.exit === true && acceptsExit) return { answered: true, value, exitRemote: true, ...files };
+    if (value || saved) return { answered: true, value, ...files };
     return { answered: false, reason: 'error', error: refusalMessage('empty-answer') };
+};
+
+/** The answer's files, saved — when this ask took files, the answer names some, and this machine has its key. */
+const saveFilesOf = async (
+    deps: AskDeps,
+    opts: AskOptions,
+    eventId: string,
+    response: { files?: unknown } | null | undefined,
+    opened: OpenedAnswer,
+): Promise<SavedAnswerFiles | undefined> => {
+    if (!opened.ok || !opened.files || !opened.senderPublicKey) return undefined;
+    // Not offered on this ask: said, not dropped.
+    if (!opts.acceptsFiles || !deps.saveFiles) return { paths: [], missing: opened.files.map((m) => `${m.name}: this ask does not take files`) };
+    const deviceId = deps.seal.self()?.deviceId;
+    if (!deviceId) return { paths: [], missing: opened.files.map((m) => `${m.name}: this machine has no key`) };
+    return deps.saveFiles(eventId, response?.files, opened.files, { deviceId, senderPublicKey: opened.senderPublicKey });
 };
 
 /** A question on the phone, as the wait needs it: where its answer is read and what opens it. */
@@ -379,7 +420,8 @@ const awaitAnswer = async (
                 if (mayPass && (unusable += 1) < MAX_CONSECUTIVE_FAILURES) {
                     lastError = new Error(refusalMessage(opened.cause));
                 } else {
-                    return { outcome: sealedOutcome(opened, opts.acceptsExit === true), end: mayPass ? 'open' : 'over' };
+                    const saved = await saveFilesOf(deps, opts, asked.eventId, event.data.response, opened);
+                    return { outcome: sealedOutcome(opened, opts.acceptsExit === true, saved), end: mayPass ? 'open' : 'over' };
                 }
             }
             if (event.data?.status === 'cancelled') return { outcome: { answered: false, reason: 'cancelled' }, end: 'over' };
@@ -578,6 +620,14 @@ export const liveDeps = (account: { apiKey: string; baseUrl: string; deadline?: 
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     seal: liveSealDeps(account.apiKey, account.baseUrl, account.deadline),
     pending: pendingAsks(stateDir()),
+    saveFiles: async (eventId, wire, metas, opener) => {
+        // The listener's download, borrowed: its log is the daemon's stdout, and this command's stdout is one JSON line.
+        const { downloadSealedEach } = await import('./listener.js');
+        const { silenceListenerLog } = await import('./listener-log.js');
+        silenceListenerLog();
+        return saveAnswerFiles(eventId, wire, metas, opener, (dirId, files, sealed) =>
+            downloadSealedEach(dirId, files, { apiKey: account.apiKey, baseUrl: account.baseUrl }, sealed));
+    },
 });
 
 /**
@@ -639,6 +689,7 @@ export const handleAsk = async (args: Record<string, string | boolean>): Promise
             timeoutSeconds: windowSeconds,
             ...(agentSessionContext() ?? {}),
             acceptsExit,
+            acceptsFiles: acceptsExit,
         },
         liveDeps({ apiKey, baseUrl: baseUrl.replace(/\/+$/, ''), deadline: Date.now() + windowSeconds * 1000 }),
     );

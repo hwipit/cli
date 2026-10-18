@@ -95,6 +95,8 @@ export interface RecordableSession {
     path: string;
     /** `RegisteredRemoteAgent.kind` — which projector reads it. */
     kind: string;
+    /** The run (tmux session) writing it (hwip docs/session-runs.md); every chunk read from it carries this. */
+    runId?: string;
 }
 
 /** A pinned device's key, or this machine's own. */
@@ -114,6 +116,8 @@ export interface OutboxChunk {
     seq: number;
     firstAt: string;
     lastAt: string;
+    /** The run the events were recorded in. Absent from chunks made before runs were recorded. */
+    runId?: string;
     sealed: SealedChunk;
 }
 
@@ -150,6 +154,8 @@ export interface TurnRecorderDeps {
     /** The newest `seq` the server holds for a session, or null when it cannot be read. After a 409
      *  (the same `seq` under another body) the next chunk is numbered past it. */
     latestSeq?: (sessionKey: string) => Promise<number | null>;
+    /** The seqs a run was just handed, once they are in the outbox: the run's seq block is reported from these (`run-seqs.ts`). */
+    noteSeqs?: (name: string, runId: string, firstSeq: number, lastSeq: number) => void;
     log: (message: string) => void;
     now?: () => number;
 }
@@ -161,6 +167,8 @@ interface SessionState {
     path: string;
     /** The agent kind that wrote it, so a session that is gone after a restart can still be read to its end. */
     kind?: string;
+    /** The run that wrote it, for the same reason: what is read from it after a restart is still that run's. */
+    runId?: string;
     ino: number;
     /** End of the last complete line whose events are in a chunk. */
     offset: number;
@@ -239,6 +247,7 @@ export const readSessionState = (dir: string, sessionKey: string): SessionState 
             sessionKey,
             path: raw.path,
             ...(typeof raw.kind === 'string' ? { kind: raw.kind } : {}),
+            ...(typeof raw.runId === 'string' ? { runId: raw.runId } : {}),
             ino: typeof raw.ino === 'number' ? raw.ino : 0,
             offset: raw.offset as number,
             ...(raw.cursor !== undefined ? { cursor: raw.cursor } : {}),
@@ -342,6 +351,11 @@ export const createTurnRecorder = (deps: TurnRecorderDeps) => {
     const kindOf = (live: Live, path: string | null): string =>
         path !== live.source.path ? live.state?.kind ?? live.source.kind : live.source.kind;
 
+    /** The run that wrote `path`, by the same rule: a file the session has left is the run its state names.
+     *  A new run under the same name keeps the name's `seq` numbering (the server's key) but tags its own. */
+    const runOf = (live: Live, path: string | null): string | undefined =>
+        path !== live.source.path ? live.state?.runId ?? live.source.runId : live.source.runId;
+
     const readerOf = (live: Live, path: string | null): TranscriptReader | null => deps.readerFor?.(kindOf(live, path)) ?? null;
 
     const startTail = (live: Live): void => {
@@ -395,6 +409,7 @@ export const createTurnRecorder = (deps: TurnRecorderDeps) => {
         };
         const fallbackAt = new Date(now()).toISOString();
         const chunks: OutboxChunk[] = [];
+        const runId = runOf(live, live.tailPath);
         let seq = base.seq;
         try {
             for (const page of pages) {
@@ -402,7 +417,7 @@ export const createTurnRecorder = (deps: TurnRecorderDeps) => {
                 const firstAt = eventAt(page, 'first', fallbackAt);
                 const lastAt = eventAt(page, 'last', fallbackAt);
                 const sealed = await deps.seal(JSON.stringify({ sessionKey: live.sessionKey, seq, events: page }), recipients);
-                chunks.push({ seq, firstAt, lastAt, sealed });
+                chunks.push({ seq, firstAt, lastAt, ...(runId ? { runId } : {}), sealed });
             }
         } catch (err) {
             if (!live.sealWarned) {
@@ -418,6 +433,7 @@ export const createTurnRecorder = (deps: TurnRecorderDeps) => {
             ...base,
             path: live.tailPath,
             kind: kindOf(live, live.tailPath),
+            runId,
             ino: live.tail.ino,
             offset: committed,
             cursor: live.tail.cursor,
@@ -426,6 +442,7 @@ export const createTurnRecorder = (deps: TurnRecorderDeps) => {
             outbox: [...base.outbox, ...chunks],
         };
         if (!persist(live, next)) return;
+        if (runId && chunks.length) deps.noteSeqs?.(live.name, runId, chunks[0].seq, seq);
         live.pending = [];
         live.pendingBytes = 0;
         live.hasPrompt = false;
@@ -697,7 +714,7 @@ export const createTurnRecorder = (deps: TurnRecorderDeps) => {
             if (!name || sessions.has(name)) continue;
             const state = readSessionState(deps.dir, sessionKey);
             if (!state) continue;
-            sessions.set(name, newLive(name, { path: state.path, kind: state.kind ?? '' }, now()));
+            sessions.set(name, newLive(name, { path: state.path, kind: state.kind ?? '', ...(state.runId ? { runId: state.runId } : {}) }, now()));
         }
     };
 

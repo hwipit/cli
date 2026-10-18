@@ -130,7 +130,7 @@ describe('in-process subagents in the inventory sweep', () => {
         const { recordable } = listener.collectSessionsVerbose();
 
         expect(recordable).toEqual({
-            'hwip-a': { path: join(PROJECT_DIR, `${SESSION_ID}.jsonl`), kind: 'claude' },
+            'hwip-a': { path: join(PROJECT_DIR, `${SESSION_ID}.jsonl`), kind: 'claude', runId: '1700000000' },
         });
     });
 
@@ -158,7 +158,7 @@ describe('in-process subagents in the inventory sweep', () => {
         });
         try {
             const { recordable } = listener.collectSessionsVerbose();
-            expect(recordable).toEqual({ 'hwip-a': { path: `${db}#ses_abc123`, kind: 'opencode' } });
+            expect(recordable).toEqual({ 'hwip-a': { path: `${db}#ses_abc123`, kind: 'opencode', runId: '1700000000' } });
             const source = listener.resolveWatchTranscript('hwip-a');
             expect(source?.path).toBe(`${db}#ses_abc123`);
             expect(typeof source?.read).toBe('function');

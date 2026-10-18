@@ -1159,3 +1159,72 @@ describe('the to-do list', () => {
         expect(todos(rig).at(-1)?.items.map((item) => item.text)).toEqual(['new task']);
     });
 });
+
+describe('separate runs of one name (hwip docs/session-runs.md)', () => {
+    it('tags each chunk with the run that wrote it, and keeps numbering across runs', async () => {
+        const rig = newRig();
+        writeFileSync(transcript('a'), prompt('first run'));
+        const recorder = makeRecorder(rig);
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: '1790000000' } });
+        await advance(recorder, 1000);
+
+        // The agent ended; another started in the same folder under the same tmux name.
+        writeFileSync(transcript('b'), prompt('second run'));
+        recorder.observe({ 'hwip-a': { path: transcript('b'), kind: 'claude', runId: '1790003600' } });
+        await advance(recorder, 3000);
+
+        expect(rig.uploads.map((u) => [opened(u.chunk).events.map((e) => (e as { text?: string }).text), u.chunk.runId]))
+            .toEqual([[['first run'], '1790000000'], [['second run'], '1790003600']]);
+        expect(rig.uploads[1]!.chunk.seq).toBeGreaterThan(rig.uploads[0]!.chunk.seq);
+    });
+
+    it('sends what is left of the previous run\'s file under that run', async () => {
+        const rig = newRig();
+        writeFileSync(transcript('a'), prompt('one'));
+        const first = makeRecorder(rig);
+        first.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: '1790000000' } });
+        await advance(first, 1000);
+
+        // The old file grew while the listener was down, and a new run took the name.
+        appendFileSync(transcript('a'), answer('late'));
+        writeFileSync(transcript('b'), prompt('new'));
+        const second = makeRecorder(rig);
+        second.observe({ 'hwip-a': { path: transcript('b'), kind: 'claude', runId: '1790003600' } });
+        await advance(second, 5000);
+
+        const byText = Object.fromEntries(rig.uploads.flatMap((u) => opened(u.chunk).events.map((e) => [(e as { text?: string }).text, u.chunk.runId])));
+        expect(byText).toEqual({ one: '1790000000', late: '1790000000', new: '1790003600' });
+    });
+
+    it('uploads a chunk a restart found waiting under the run it was recorded in', async () => {
+        const rig = newRig();
+        rig.outcome = () => ({ kind: 'retry', why: 'offline' });
+        writeFileSync(transcript('a'), prompt('kept'));
+        const first = makeRecorder(rig);
+        first.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: '1790000000' } });
+        await advance(first, 1000);
+        expect(rig.uploads).toHaveLength(0);
+
+        // The listener restarts (a reboot ends the tmux session): the chunk comes back from disk.
+        rig.outcome = () => ({ kind: 'ok' });
+        const second = makeRecorder(rig);
+        second.start();
+        try {
+            await advance(second, 120_000, 10_000);
+        } finally {
+            second.stop();
+        }
+
+        expect(rig.uploads.map((u) => u.chunk.runId)).toEqual(['1790000000']);
+    });
+
+    it('sends no run for a session the sweep gave none', async () => {
+        const rig = newRig();
+        writeFileSync(transcript('a'), prompt('hello'));
+        const recorder = makeRecorder(rig);
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        await advance(recorder, 1000);
+
+        expect(rig.uploads[0]!.chunk).not.toHaveProperty('runId');
+    });
+});

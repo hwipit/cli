@@ -64,6 +64,7 @@ import {
     recallSession,
     rememberSessions,
     sessionDirectoryExists,
+    type KnownSession,
 } from './session-registry.js';
 import { foregroundAgentFor, REMOTE_AGENTS, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
 import {
@@ -1659,6 +1660,25 @@ export interface SessionResumeResult {
     at: string;
 }
 
+/** What an agent conversation id looks like — a value, never an option. */
+const CONVERSATION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+
+/**
+ * The flags that pick a resumed run's last conversation back up, or null to
+ * start it fresh. The id is one this machine read off the live pane, but the
+ * registry is a file on disk: it reaches argv only once it reads as an id, so
+ * nothing in it can turn into an option of the agent's own.
+ */
+const resumableConversation = (
+    agent: RegisteredRemoteAgent,
+    known: KnownSession,
+): { id: string; args: readonly string[] } | null => {
+    const id = known.agentSessionId;
+    if (typeof id !== 'string' || !CONVERSATION_ID.test(id)) return null;
+    const args = agent.resumeArgs?.(id, known.cwd);
+    return args ? { id, args } : null;
+};
+
 /**
  * Start a remembered session again, detached, and tell the phone what happened.
  * Returns true when the message was ours to answer.
@@ -1732,16 +1752,18 @@ export const handleSessionResumeRequest = (
     const sidecar = known.label && known.project
         ? [';', 'set-option', SESSION_PROJECT_OPTION, known.project, ';', 'set-option', SESSION_LABEL_OPTION, known.label]
         : [];
+    const conversation = resumableConversation(agent, known);
     const started = spawnSync(
         'tmux',
-        tmuxArgs(['new-session', '-d', '-s', sessionName, '-c', known.cwd, agent.binary, ...sidecar]),
+        tmuxArgs(['new-session', '-d', '-s', sessionName, '-c', known.cwd, agent.binary, ...(conversation?.args ?? []), ...sidecar]),
         { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] },
     );
     if (started.status !== 0) {
         log(`✗ resume ${sessionName}: tmux refused (${(started.stderr ?? '').trim() || 'no detail'})`);
         return reply({ error: 'start_failed' });
     }
-    log(`⟲ resume ${sessionName}: ${agent.binary} in ${known.cwd}`);
+    const resumedFrom = conversation ? ` (conversation ${conversation.id.slice(0, 8)})` : '';
+    log(`⟲ resume ${sessionName}: ${agent.binary}${resumedFrom} in ${known.cwd}`);
     return reply({ resumed: true });
 };
 
@@ -4153,6 +4175,8 @@ export const collectSessionsVerbose = (): CollectResult => {
     // rather than in it: AgentSession is a server/phone contract and the
     // directory is local knowledge the registry needs, nothing the phone gets.
     const paneCwdOf = new Map<string, string>();
+    // The conversation a resume may pick back up, beside it for the same reason.
+    const resumeIdOf = new Map<string, string>();
     const targets: Record<string, string> = {};
     const subagentTranscripts: Record<string, string> = {};
     const recordable: Record<string, RecordableSession> = {};
@@ -4215,6 +4239,10 @@ export const collectSessionsVerbose = (): CollectResult => {
             ? (main.agent.resolveSessionName?.(info.currentPath, info.panePid ?? undefined) ?? null)
             : null;
         if (info.currentPath) paneCwdOf.set(name, info.currentPath);
+        const resumeId = info.currentPath
+            ? main.agent.resolveResumeId?.(info.currentPath, info.panePid ?? undefined)
+            : null;
+        if (resumeId) resumeIdOf.set(name, resumeId);
         targets[name] = main.row.paneId;
         sessions.push({
             name,
@@ -4326,6 +4354,19 @@ export const collectSessionsVerbose = (): CollectResult => {
     }
     pruneToLive(subagentScans, new Set(groups.keys()));
     pruneToLive(sessionStates, new Set(sessions.map((s) => s.name)));
+    // An id two panes both answer to belongs to at most one of them, and the
+    // sweep cannot tell which — opencode names the busiest session in the
+    // folder — so neither may resume it.
+    const resumeIdCount = new Map<string, number>();
+    for (const id of resumeIdOf.values()) resumeIdCount.set(id, (resumeIdCount.get(id) ?? 0) + 1);
+    // Undefined (not read this sweep) keeps the run's last id; null (shared)
+    // forgets it, or a run that had the id alone would keep resuming into
+    // the pane that now answers to it.
+    const ownResumeId = (name: string): string | null | undefined => {
+        const id = resumeIdOf.get(name);
+        if (!id) return undefined;
+        return resumeIdCount.get(id) === 1 ? id : null;
+    };
     // Write down what each live session IS, while it still exists to be read.
     // tmux forgets a session the moment it ends, which is exactly when the
     // phone wants it back — and a resume must take its directory and its binary
@@ -4342,6 +4383,7 @@ export const collectSessionsVerbose = (): CollectResult => {
             agentKind: s.agentKind,
             project: s.project,
             label: s.label,
+            agentSessionId: ownResumeId(s.name),
         })),
     );
     return { sessions, rejected, targets, subagentTranscripts, recordable };

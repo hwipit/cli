@@ -8,7 +8,7 @@
  * relay posing as one — cannot name a directory, a command, or an argument.
  */
 
-import { mkdirSync, mkdtempSync, rmSync } from 'fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
@@ -66,6 +66,7 @@ mkdirSync(PROJECT_DIR, { recursive: true });
 
 const { handleSessionResumeRequest, computeListenerDeviceId } = await import('./listener.js');
 const { rememberSessions } = await import('./session-registry.js');
+const { claudeProjectDirName, REMOTE_AGENTS } = await import('./remote-agents.js');
 
 describe('agent.session.resume.request — starting a session that ended', () => {
     const device = computeListenerDeviceId();
@@ -279,5 +280,109 @@ describe('agent.session.resume.request — naming the run', () => {
 
         expect(reply).toMatchObject({ resumed: true });
         expect(newSessions()[0]?.at(-1)).toBe('claude');
+    });
+});
+
+/**
+ * Resuming means the conversation, not just the binary. The id comes from the
+ * registry — what the sweep read off the live pane — and reaches argv only as
+ * a value the agent's own flag takes, after it has been checked to be an id.
+ */
+describe('agent.session.resume.request — the conversation it last had', () => {
+    const device = computeListenerDeviceId();
+    const CLAUDE_ID = '0b5f3c8e-1d2a-4c6b-9e7f-123456789abc';
+    let sent: Array<Record<string, unknown>>;
+    const send = (data: Record<string, unknown>) => { sent.push(data); };
+    const ask = () => {
+        handleSessionResumeRequest(
+            { subtype: 'agent.session.resume.request', targetDeviceId: device,
+              sessionName: 'hwip-conv', requestId: 'r1' },
+            send,
+        );
+        return sent.at(-1);
+    };
+    const remember = (agentKind: string, agentSessionId: string | null) =>
+        rememberSessions([{ name: 'hwip-conv', cwd: PROJECT_DIR, agentKind, agentSessionId }]);
+    /** What follows `-c <cwd>` in the one new-session call. */
+    const launched = () => {
+        const call = tmuxCalls.find((c) => c[0] === 'new-session') ?? [];
+        return call.slice(call.indexOf('-c') + 2);
+    };
+    const claudeTranscript = (id: string) => {
+        const dir = join(TMP, '.claude', 'projects', claudeProjectDirName(PROJECT_DIR));
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, `${id}.jsonl`), '{}\n');
+    };
+
+    beforeEach(() => {
+        vi.spyOn(console, 'log').mockImplementation(() => {});
+        tmuxCalls = [];
+        sent = [];
+        liveSessions = [];
+        newSessionFails = false;
+        rmSync(join(TMP, 'state'), { recursive: true, force: true });
+        rmSync(join(TMP, '.claude'), { recursive: true, force: true });
+    });
+    afterEach(() => vi.restoreAllMocks());
+
+    it('resumes the claude conversation the session last had', () => {
+        claudeTranscript(CLAUDE_ID);
+        remember('claude', CLAUDE_ID);
+
+        expect(ask()).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['claude', '--resume', CLAUDE_ID]);
+    });
+
+    it('resumes the opencode conversation the session last had', () => {
+        remember('opencode', 'ses_3f2a1b');
+
+        expect(ask()).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['opencode', '--session', 'ses_3f2a1b']);
+    });
+
+    it('starts a fresh conversation when none was recorded', () => {
+        remember('claude', null);
+
+        expect(ask()).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['claude']);
+    });
+
+    it('starts a fresh conversation for an agent with no resume flag', () => {
+        remember('pi', 'some-id');
+
+        expect(ask()).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['pi']);
+    });
+
+    it('never puts a recorded conversation that is not an id into argv', () => {
+        // The registry is a file on disk; a value starting with `-` would be
+        // read by the agent as an option, not as the id its flag expects.
+        for (const bad of ['-x', '--dangerously-skip-permissions', 'a b', 'x'.repeat(129)]) {
+            tmuxCalls = [];
+            rmSync(join(TMP, 'state'), { recursive: true, force: true });
+            remember('opencode', bad);
+
+            ask();
+            expect(launched()).toEqual(['opencode']);
+        }
+    });
+
+    it('takes claude’s conversation from the pane’s process, never the newest in its folder', () => {
+        // The report may guess the newest transcript in the folder; that guess
+        // can be another `claude` in the same directory, so a resume never gets it.
+        claudeTranscript(CLAUDE_ID);
+        const claude = REMOTE_AGENTS.find((a) => a.kind === 'claude')!;
+
+        expect(claude.resolveSessionId?.(PROJECT_DIR)).toBe(CLAUDE_ID);
+        expect(claude.resolveResumeId?.(PROJECT_DIR)).toBeNull();
+    });
+
+    it('starts claude fresh when the conversation is no longer on disk', () => {
+        // `claude --resume <id>` with no such conversation exits at once — a
+        // session reported resumed that is already gone.
+        remember('claude', CLAUDE_ID);
+
+        expect(ask()).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['claude']);
     });
 });

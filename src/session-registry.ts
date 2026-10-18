@@ -30,6 +30,12 @@ export interface KnownSession {
     agentKind: string;
     project?: string;
     label?: string;
+    /**
+     * The agent's own id for the conversation this run last had, as the sweep
+     * read it off the live pane — what a resume picks back up. Absent for an
+     * agent whose id this machine cannot read, and in files written before it.
+     */
+    agentSessionId?: string;
     /** Last time this machine saw the session running. */
     lastSeenAt: string;
 }
@@ -152,6 +158,12 @@ export const rememberSessions = (
         agentKind: string;
         project?: string | null;
         label?: string | null;
+        /**
+         * The conversation a resume may pick up. Absent: not readable this
+         * sweep, so the run keeps the one it had. Null: read, but not this
+         * run's alone to resume — the run forgets it.
+         */
+        agentSessionId?: string | null;
     }>,
     now: number = Date.now(),
 ): void => {
@@ -161,12 +173,21 @@ export const rememberSessions = (
     const seenAt = new Date(now).toISOString();
     const byRun = new Map(knownSessions(now).map((e) => [runKey(e.name, e.agentKind), e]));
     for (const s of usable) {
-        byRun.set(runKey(s.name, s.agentKind), {
+        const key = runKey(s.name, s.agentKind);
+        // A sweep that could not read the id — the agent has not written its
+        // record yet — keeps the one this run already had. Keyed by run and
+        // directory, so neither another agent taking the name nor the same
+        // agent started elsewhere under it inherits a conversation.
+        const prev = byRun.get(key);
+        const keepPrev = s.agentSessionId === undefined && prev?.cwd === s.cwd;
+        const agentSessionId = s.agentSessionId || (keepPrev ? prev?.agentSessionId : undefined);
+        byRun.set(key, {
             name: s.name,
             cwd: s.cwd as string,
             agentKind: s.agentKind,
             ...(s.project ? { project: s.project } : {}),
             ...(s.label ? { label: s.label } : {}),
+            ...(agentSessionId ? { agentSessionId } : {}),
             lastSeenAt: seenAt,
         });
     }

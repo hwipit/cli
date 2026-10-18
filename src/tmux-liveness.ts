@@ -26,6 +26,25 @@ export const liveSessionNames = (): string[] | null => {
 };
 
 /**
+ * The run (hwip docs/session-runs.md) tmux holds under `name` right now: its
+ * `session_created` in epoch seconds. Null when the name is not running, and
+ * undefined when no tmux answered — a caller that deletes on "another run"
+ * must refuse on that, as it refuses on `unknown` liveness.
+ */
+export const liveRunIdOf = (name: string): string | null | undefined => {
+    const probe = spawnSync('tmux', tmuxArgs(['list-sessions', '-F', '#{session_name}\t#{session_created}']), {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    if (probe.error || probe.status !== 0) return undefined;
+    for (const line of (probe.stdout ?? '').split('\n')) {
+        const tab = line.lastIndexOf('\t');
+        if (tab > 0 && line.slice(0, tab) === name) return /^\d{1,12}$/.test(line.slice(tab + 1).trim()) ? line.slice(tab + 1).trim() : undefined;
+    }
+    return null;
+};
+
+/**
  * The three-state answer, for callers that destroy something on "ended".
  *
  * "tmux says no such session" and "no tmux answered" are not the same fact, and

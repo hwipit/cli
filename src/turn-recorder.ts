@@ -154,6 +154,8 @@ export interface TurnRecorderDeps {
     /** The newest `seq` the server holds for a session, or null when it cannot be read. After a 409
      *  (the same `seq` under another body) the next chunk is numbered past it. */
     latestSeq?: (sessionKey: string) => Promise<number | null>;
+    /** The seqs a run was just handed, once they are in the outbox: the run's seq block is reported from these (`run-seqs.ts`). */
+    noteSeqs?: (name: string, runId: string, firstSeq: number, lastSeq: number) => void;
     log: (message: string) => void;
     now?: () => number;
 }
@@ -440,6 +442,7 @@ export const createTurnRecorder = (deps: TurnRecorderDeps) => {
             outbox: [...base.outbox, ...chunks],
         };
         if (!persist(live, next)) return;
+        if (runId && chunks.length) deps.noteSeqs?.(live.name, runId, chunks[0].seq, seq);
         live.pending = [];
         live.pendingBytes = 0;
         live.hasPrompt = false;

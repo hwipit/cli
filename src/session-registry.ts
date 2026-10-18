@@ -50,7 +50,7 @@ export interface KnownSession {
  */
 export const MAX_KNOWN_SESSIONS = 100;
 /** Runs kept per name: a slot reused all day would otherwise fill the file with one project. */
-export const MAX_RUNS_PER_NAME = 5;
+export const MAX_RUNS_PER_NAME = 10;
 /** Forgotten after this long unseen — a directory from months ago is more
  *  likely to have moved than to be what the user meant. */
 export const KNOWN_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -230,7 +230,8 @@ export type ForgetOutcome =
     /** Registry entry gone, but the scrollback file would not delete. */
     | 'scrollback_kept';
 
-export const forgetSession = (name: string, agentKind?: string, runId?: string): ForgetOutcome => {
+/** `nameRunning`: a run of this name is going right now, so its scrollback stays whether or not the registry has written that run down yet. */
+export const forgetSession = (name: string, agentKind?: string, runId?: string, nameRunning = false): ForgetOutcome => {
     const entries = readAll();
     // With a kind, only that agent's runs go — the phone deletes the row it is
     // looking at, and a name that held both pi and claude shows two rows. With a
@@ -249,7 +250,7 @@ export const forgetSession = (name: string, agentKind?: string, runId?: string):
     // Except while another run still answers to the name: the scrollback is per
     // NAME, so deleting the pi row would take the claude row's history with it.
     // The record is gone either way; the file waits for the last run to go.
-    const nameStillHeld = kept.some((e) => e.name === name);
+    const nameStillHeld = nameRunning || kept.some((e) => e.name === name);
     writeAll(kept);
     if (nameStillHeld) return 'forgotten';
     return removeTurnRing(name) ? 'forgotten' : 'scrollback_kept';

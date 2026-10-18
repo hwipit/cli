@@ -369,12 +369,12 @@ describe('separate runs of one name (hwip docs/session-runs.md)', () => {
         expect(knownSessions(T0 + 60_000).map((e) => e.runId)).toEqual([R1, undefined]);
     });
 
-    it('keeps the newest five runs of a name', () => {
-        for (let i = 0; i < 7; i++) rememberSessions([run(String(T0 / 1000 + i * 100))], T0 + i * 100_000);
+    it('keeps the newest ten runs of a name', () => {
+        for (let i = 0; i < 12; i++) rememberSessions([run(String(T0 / 1000 + i * 100))], T0 + i * 100_000);
 
-        const runs = knownSessions(T0 + 700_000).map((e) => e.runId);
-        expect(runs).toHaveLength(5);
-        expect(runs[0]).toBe(String(T0 / 1000 + 600));
+        const runs = knownSessions(T0 + 1_200_000).map((e) => e.runId);
+        expect(runs).toHaveLength(10);
+        expect(runs[0]).toBe(String(T0 / 1000 + 1100));
     });
 
     it('forgets one run and leaves the other', () => {

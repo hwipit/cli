@@ -653,8 +653,13 @@ conversation apart from the one before it under the same name; a chunk read
 after a restart keeps the run it was recorded in. The listener's record of past
 sessions keeps runs apart the same way: closing `hwip cc` and starting it again
 in the same folder leaves the first run as a past session of its own (the
-newest five runs of a name are kept, 100 in all, and up to 50 are reported to
-the phone).
+newest ten runs of a name are kept, 100 in all, and up to 50 are reported to
+the phone). Each run is reported with the block of chunk numbers it took — the
+first and, once it has ended, the last — kept in `run-seqs.json` next to the
+registry, so the server reads one run's conversation from that range instead of
+every chunk the name ever had. Deleting a past run from the phone forgets that
+run on this machine too, even while a later run of the same name is going; the
+run that is going is refused (`still_running`).
 
 When a session waits for your approval, the listener also sends what it is waiting
 for — the tool, the command or the diff, and the answers — so the app can show it

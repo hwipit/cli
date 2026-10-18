@@ -129,7 +129,8 @@ import {
     detectRemoteAgent, FIELD_SEP, isSubagentSessionName, readPaneInfo, recordSubagentTranscripts, recordTargets,
     subagentTranscriptFor, tmuxTargetFor, type PaneInfo,
 } from './tmux-pane.js';
-import { liveSessionNames, sessionExists, sessionLiveness } from './tmux-liveness.js';
+import { liveRunIdOf, liveSessionNames, sessionExists, sessionLiveness } from './tmux-liveness.js';
+import { noteRunSeqs, runSeqsByRun, runSeqsKey, type RunSeqs } from './run-seqs.js';
 import { FlagValueError, flagOn } from './args.js';
 import { listSchedules, readScheduleState, writeScheduleState } from './schedule.js';
 import { launchHwip } from './schedule-launch.js';
@@ -327,6 +328,8 @@ interface AgentSession {
      * rows, which are panes of their parent's run.
      */
     runId?: string;
+    /** The smallest seq this run's chunks took (hwip docs/session-runs.md Q24): the server reads its conversation from there up. */
+    firstSeq?: number;
     lastActivityAt?: string;
     /**
      * Detected agent state (wire contract — flows to the server and the
@@ -423,12 +426,23 @@ export interface ReportedKnownSession {
     /** The run's id and start (hwip docs/session-runs.md); absent for entries recorded before runs. */
     runId?: string;
     startedAt?: string;
+    /** The seq block the run's chunks took (Q24): the server reads its conversation from that key range alone. */
+    firstSeq?: number;
+    lastSeq?: number;
     lastSeenAt: string;
 }
+
+/** Each live run's first seq, for the report (Q24). A run that has recorded nothing yet has none. */
+export const withRunSeqs = (sessions: AgentSession[], seqs: Map<string, RunSeqs> = runSeqsByRun()): AgentSession[] =>
+    sessions.map((s) => {
+        const block = s.runId ? seqs.get(runSeqsKey(s.name, s.runId)) : undefined;
+        return block ? { ...s, firstSeq: block.firstSeq } : s;
+    });
 
 export const knownSessionsToReport = (
     live: readonly AgentSession[],
     now: number = Date.now(),
+    seqs: Map<string, RunSeqs> = runSeqsByRun(),
 ): ReportedKnownSession[] => {
     // By name, kind AND run: a slot that is live under claude may still hold an
     // ended pi run — or an ended claude run before this one — and that run is a
@@ -446,18 +460,19 @@ export const knownSessionsToReport = (
             ...(e.label ? { label: e.label } : {}),
             ...(e.runId ? { runId: e.runId } : {}),
             ...(e.startedAt ? { startedAt: e.startedAt } : {}),
+            ...(e.runId ? seqs.get(runSeqsKey(e.name, e.runId)) : undefined),
             lastSeenAt: e.lastSeenAt,
         }));
 };
 
 export const knownSessionsFingerprint = (known: ReportedKnownSession[]): string =>
-    known.map((k) => `${k.name} ${k.agentKind} ${k.runId ?? ''} ${k.lastSeenAt}`).sort().join('|');
+    known.map((k) => `${k.name} ${k.agentKind} ${k.runId ?? ''} ${k.lastSeenAt} ${k.firstSeq ?? ''} ${k.lastSeq ?? ''}`).sort().join('|');
 
 export const sessionsFingerprint = (sessions: AgentSession[]): string =>
     sessions
         .map((s) => JSON.stringify([
             s.name, s.attached, s.agentKind, s.agentSessionId ?? null,
-            s.project, s.label ?? null, s.providerSessionName ?? null, s.createdAt ?? null, s.runId ?? null,
+            s.project, s.label ?? null, s.providerSessionName ?? null, s.createdAt ?? null, s.runId ?? null, s.firstSeq ?? null,
             s.lastActivityAt ?? null, s.state ?? null,
             s.stateChangedAt ?? null, s.stateRuleId ?? null,
             s.blockedPrompt?.id ?? null, s.blockedPrompt?.at ?? null,
@@ -1976,16 +1991,23 @@ export const handleSessionForgetRequest = (
     // alternative is an irreversible delete (registry AND scrollback) justified
     // by a question that failed to be asked. It says so in the log, because
     // from the phone the two refusals are the same sentence.
+    const runId = typeof req.runId === 'string' && /^\d{1,12}$/.test(req.runId) ? req.runId : undefined;
     const liveness = sessionLiveness(sessionName);
     if (liveness === 'unknown') {
         log(`✗ forget ${sessionName}: no tmux answered, so nothing was deleted`);
         return reply({ error: 'still_running' });
     }
-    if (liveness === 'running') return reply({ error: 'still_running' });
+    // A name running again is not the run being forgotten: an ended run of it goes on its own (Q29).
+    // The running run itself, a request naming no run, or a run tmux could not tell apart stay refused.
+    if (liveness === 'running') {
+        const live = runId ? liveRunIdOf(sessionName) : undefined;
+        if (!runId || !live || live === runId) return reply({ error: 'still_running' });
+    }
     const outcome = forgetSession(
         sessionName,
         typeof req.agentKind === 'string' ? req.agentKind : undefined,
-        typeof req.runId === 'string' && /^\d{1,12}$/.test(req.runId) ? req.runId : undefined,
+        runId,
+        liveness === 'running',
     );
     if (outcome === 'unknown') {
         log(`✗ forget ${sessionName}: never seen on this machine`);
@@ -2779,6 +2801,7 @@ const startTurnRecorder = (
         uploadReady: () => deviceKeyRegistered,
         devicePublicKey: getDevicePublicKey,
         latestSeq: createLatestSeqReader({ baseUrl, apiKey }),
+        noteSeqs: noteRunSeqs,
         log: (message) => log(message),
     });
     turnRecorder.start();
@@ -5903,9 +5926,11 @@ export const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             // request of their own: the phone is already reading this device
             // record, and a second round trip would need its own timeout, its
             // own failure wording and its own staleness question.
-            const known = knownSessionsToReport(sessions);
+            const seqs = runSeqsByRun();
+            const reported = withRunSeqs(sessions, seqs);
+            const known = knownSessionsToReport(sessions, Date.now(), seqs);
             const fingerprint =
-                `${sessionsFingerprint(sessions)}␞${knownSessionsFingerprint(known)}`;
+                `${sessionsFingerprint(reported)}␞${knownSessionsFingerprint(known)}`;
             if (!sessionsReportDue(fingerprint, lastSentFingerprint, lastSentAtMs, Date.now())) {
                 return;
             }
@@ -5914,7 +5939,7 @@ export const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             // One message when it fits; past 24 KB, parts (sessions-report.ts): API Gateway closes a
             // socket on a frame over 32 KB, so an uncut report from a machine with ~100 sessions would
             // drop the connection on every send.
-            const plan = planSessionsReport(sessions, known);
+            const plan = planSessionsReport(reported, known);
             if (plan.messages.length > 1) {
                 log(`⧉ inventory of ${plan.sessionCount} session(s), ${Math.round(plan.wholeBytes / 1024)} KB, is over the ${SESSIONS_REPORT_MAX_BYTES / 1024} KB message limit — sent in ${plan.messages.length - 1} parts + names`);
                 for (const name of plan.oversized) log(`! session ${name}: its own report entry is over the ${SESSIONS_REPORT_MAX_BYTES / 1024} KB part limit — sent alone`);

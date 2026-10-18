@@ -1,5 +1,5 @@
 import { createDecipheriv, randomBytes } from 'node:crypto';
-import { createWriteStream, rmSync } from 'node:fs';
+import { createWriteStream, rmSync, type WriteStream } from 'node:fs';
 import { link, open, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { Transform, type Readable } from 'node:stream';
@@ -228,12 +228,13 @@ export const saveStream = async (
     const counter = new Transform({
         transform(chunk: Buffer, _enc, done) { bytes += chunk.length; done(null, chunk); },
     });
+    let sink: WriteStream | undefined;
     try {
         // Before the part file exists: a key or an iv the format refuses throws here.
         const opened = !decrypt ? null : decrypt.chunk === undefined
             ? createFileDecryptStream(decrypt.rawKey, decrypt.iv)
             : createChunkedFileDecryptStream(decrypt.rawKey, decrypt.iv, decrypt.chunk);
-        const sink = createWriteStream(part, { flags: 'wx' });
+        sink = createWriteStream(part, { flags: 'wx' });
         if (opened) await pipeline(source, opened, counter, sink);
         else await pipeline(source, counter, sink);
         const fh = await open(part, 'r+');
@@ -252,6 +253,10 @@ export const saveStream = async (
         await unlink(part).catch(() => undefined);
         return { path: dest, bytes };
     } catch (err) {
+        // A failed pipeline destroys the sink without waiting for its open: wait for
+        // the close, or the file can appear after the rm below.
+        const opening = sink;
+        if (opening && !opening.closed) await new Promise<void>((done) => opening.once('close', () => done()));
         rmSync(part, { force: true });
         throw err;
     }

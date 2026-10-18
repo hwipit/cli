@@ -14,7 +14,7 @@ import { basename } from 'path';
 import { resolveCommand } from './agents.js';
 import { planTmuxInstall, type TmuxInstallPlan } from './tmux-install.js';
 import { cachedUpdateNotice, isNewer } from './check-update.js';
-import { checkoutOf, groupOf, HERDR_SESSION_OPTIONS, PROJECT_DIR_ENV_VARS, resolvedEnv, SESSION_LABEL_OPTION, SESSION_PROJECT_OPTION, SESSION_SHELL_OPTION, tmuxName, VERSION } from './config.js';
+import { checkoutOf, groupOf, HERDR_ENV_VARS, HERDR_SELF_REPORTING_KINDS, HERDR_SESSION_OPTIONS, PROJECT_DIR_ENV_VARS, resolvedEnv, SESSION_LABEL_OPTION, SESSION_PROJECT_OPTION, SESSION_SHELL_OPTION, tmuxName, VERSION } from './config.js';
 import {
     awaitServiceListener,
     LISTENER_LAUNCH_ENV,
@@ -87,12 +87,49 @@ export const sessionSidecarArgs = (session: string, projectDir: string, label?: 
  * `HERDR_SESSION_OPTIONS` at the herdr pane this attach runs in, or clear them
  * outside herdr.
  */
+const inHerdr = (env: NodeJS.ProcessEnv): boolean => env.HERDR_ENV === '1' && !!env.HERDR_PANE_ID && !!env.HERDR_SOCKET_PATH;
+
 export const herdrSessionArgs = (session: string, env: NodeJS.ProcessEnv = process.env): string[] => {
-    const inHerdr = env.HERDR_ENV === '1' && !!env.HERDR_PANE_ID && !!env.HERDR_SOCKET_PATH;
+    const attached = inHerdr(env);
     return Object.entries(HERDR_SESSION_OPTIONS).flatMap(([name, option]) => {
-        const value = inHerdr ? env[name] : undefined;
+        const value = attached ? env[name] : undefined;
         return [';', 'set-option', ...(value ? [] : ['-u']), '-t', sessionOptionTarget(session), option, ...(value ? [value] : [])];
     });
+};
+
+/**
+ * `new-session -e` flags for config `HERDR_ENV_VARS`, so herdr's native integration
+ * in the agent reports to the herdr pane this launch attaches from — or, empty, to no
+ * pane at all: for an agent hwip reports itself (`HERDR_SELF_REPORTING_KINDS`), a
+ * detached launch, or a launch from outside herdr. Without them the agent inherits the
+ * tmux server's global env and reports to a pane that is gone. Session env, so a later
+ * split pane gets the same. A reattach does not move a running agent's env: herdr's
+ * integrations keep the pane the session was created from. `new-session -e` is tmux 3.2;
+ * an older tmux gets none, as before.
+ */
+export const herdrEnvArgs = (agentKind: string | undefined, env: NodeJS.ProcessEnv, tmuxVersion: string): string[] => {
+    if (!sessionEnvSupported(tmuxVersion)) return [];
+    const native = inHerdr(env) && !HERDR_SELF_REPORTING_KINDS.has(agentKind ?? '');
+    return HERDR_ENV_VARS.flatMap((name) => ['-e', `${name}=${native ? env[name] ?? '' : ''}`]);
+};
+
+/** `tmux -V` says 3.2 or later (`new-session -e`); a development build (`next-3.7`, `master`) is newer. */
+const sessionEnvSupported = (version: string): boolean => {
+    if (/\b(master|next-)/.test(version)) return true;
+    const m = version.match(/(\d+)\.(\d+)/);
+    if (!m) return false;
+    const [major, minor] = [Number(m[1]), Number(m[2])];
+    return major > 3 || (major === 3 && minor >= 2);
+};
+
+let tmuxVersionCache: string | undefined;
+/** `tmux -V`, read once per process; empty when tmux does not answer. */
+export const installedTmuxVersion = (): string => {
+    if (tmuxVersionCache === undefined) {
+        const ver = spawnSync('tmux', ['-V'], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000 });
+        tmuxVersionCache = (ver.stdout ?? '').trim();
+    }
+    return tmuxVersionCache;
 };
 
 /**
@@ -348,10 +385,13 @@ export const targetForAgent = (
     // would otherwise get a session named for one tree running in another.
     const sidecar = sessionSidecarArgs(session, projectDir, opts.label);
     if (opts.detach) {
-        return { kind: 'tmux-detached', cmd: 'tmux', args: ['new', '-d', '-s', session, '-c', projectDir, shellCmd, ...sidecar], session };
+        // Attached to no herdr pane: blank, whatever pane this command was typed in.
+        const herdrEnv = herdrEnvArgs(agentKind, {}, installedTmuxVersion());
+        return { kind: 'tmux-detached', cmd: 'tmux', args: ['new', '-d', '-s', session, '-c', projectDir, ...herdrEnv, shellCmd, ...sidecar], session };
     }
-    // `tmux new -A`: attach if the named session exists, else create it.
-    return { kind: 'tmux-new', cmd: 'tmux', args: ['new', '-A', '-s', session, shellCmd, ...sidecar, ...herdrSessionArgs(session)], session };
+    // `tmux new -A`: attach if the named session exists, else create it. `-e` applies only when it creates.
+    const herdrEnv = herdrEnvArgs(agentKind, process.env, installedTmuxVersion());
+    return { kind: 'tmux-new', cmd: 'tmux', args: ['new', '-A', '-s', session, ...herdrEnv, shellCmd, ...sidecar, ...herdrSessionArgs(session)], session };
 };
 
 // ── Background listener auto-start ────────────────────────────────────

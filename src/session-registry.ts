@@ -30,6 +30,14 @@ export interface KnownSession {
     agentKind: string;
     project?: string;
     label?: string;
+    /**
+     * Which run of the name this was (hwip docs/session-runs.md): tmux
+     * `session_created` in epoch seconds, as a decimal string. Absent from
+     * entries written before runs were recorded.
+     */
+    runId?: string;
+    /** When that run started (ISO) — the same instant as `runId`. */
+    startedAt?: string;
     /** Last time this machine saw the session running. */
     lastSeenAt: string;
 }
@@ -41,6 +49,8 @@ export interface KnownSession {
  * that has run agents for years.
  */
 export const MAX_KNOWN_SESSIONS = 100;
+/** Runs kept per name: a slot reused all day would otherwise fill the file with one project. */
+export const MAX_RUNS_PER_NAME = 5;
 /** Forgotten after this long unseen — a directory from months ago is more
  *  likely to have moved than to be what the user meant. */
 export const KNOWN_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -61,7 +71,8 @@ const readAll = (): KnownSession[] => {
                 typeof (e as KnownSession).name === 'string' &&
                 typeof (e as KnownSession).cwd === 'string' &&
                 typeof (e as KnownSession).agentKind === 'string' &&
-                typeof (e as KnownSession).lastSeenAt === 'string',
+                typeof (e as KnownSession).lastSeenAt === 'string' &&
+                ((e as KnownSession).runId === undefined || typeof (e as KnownSession).runId === 'string'),
         );
     } catch {
         return [];
@@ -83,8 +94,8 @@ const writeAll = (entries: KnownSession[]): void => {
 };
 
 /**
- * What makes two sightings the same remembered run: the tmux name AND the
- * agent that was running under it.
+ * What makes two sightings the same remembered run: the tmux name, the agent
+ * that was running under it, AND the tmux session it ran in (`runId`).
  *
  * Keyed by name alone, a `hwip cc` in a project erased whatever pi had done in
  * the same slot — the ended run left no row to resume and no row to read, and
@@ -94,8 +105,14 @@ const writeAll = (entries: KnownSession[]): void => {
  * NUL rather than a printable separator: a project directory can be called
  * almost anything, and a name holding the separator must not be able to forge
  * another run's key.
+ *
+ * The run id splits two sittings of the same agent in the same slot: closing
+ * `hwip cc` and starting it again is a new conversation, and the record of the
+ * first is a past session of its own. An entry without one (written before
+ * runs were recorded) keys as the empty run.
  */
-export const runKey = (name: string, agentKind: string): string => `${name}\u0000${agentKind}`;
+export const runKey = (name: string, agentKind: string, runId?: string): string =>
+    `${name}\u0000${agentKind}\u0000${runId ?? ''}`;
 
 /** Sessions this machine has seen, newest first, expired ones dropped. */
 export const knownSessions = (now: number = Date.now()): KnownSession[] =>
@@ -152,6 +169,8 @@ export const rememberSessions = (
         agentKind: string;
         project?: string | null;
         label?: string | null;
+        runId?: string;
+        startedAt?: string;
     }>,
     now: number = Date.now(),
 ): void => {
@@ -159,19 +178,34 @@ export const rememberSessions = (
     const usable = live.filter((s) => !!s.name && !!s.cwd);
     if (usable.length === 0) return;
     const seenAt = new Date(now).toISOString();
-    const byRun = new Map(knownSessions(now).map((e) => [runKey(e.name, e.agentKind), e]));
+    const byRun = new Map(knownSessions(now).map((e) => [runKey(e.name, e.agentKind, e.runId), e]));
     for (const s of usable) {
-        byRun.set(runKey(s.name, s.agentKind), {
+        // The entry this run had before runs were recorded: same slot and agent,
+        // no run, seen while this run was already going. It is this run, not a
+        // past one, and would otherwise be reported as one.
+        if (s.runId && s.startedAt) {
+            const before = byRun.get(runKey(s.name, s.agentKind));
+            if (before && before.lastSeenAt >= s.startedAt) byRun.delete(runKey(s.name, s.agentKind));
+        }
+        byRun.set(runKey(s.name, s.agentKind, s.runId), {
             name: s.name,
             cwd: s.cwd as string,
             agentKind: s.agentKind,
             ...(s.project ? { project: s.project } : {}),
             ...(s.label ? { label: s.label } : {}),
+            ...(s.runId ? { runId: s.runId } : {}),
+            ...(s.startedAt ? { startedAt: s.startedAt } : {}),
             lastSeenAt: seenAt,
         });
     }
+    const perName = new Map<string, number>();
     const entries = [...byRun.values()]
         .sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt))
+        .filter((e) => {
+            const n = (perName.get(e.name) ?? 0) + 1;
+            perName.set(e.name, n);
+            return n <= MAX_RUNS_PER_NAME;
+        })
         .slice(0, MAX_KNOWN_SESSIONS);
     writeAll(entries);
 };
@@ -196,13 +230,16 @@ export type ForgetOutcome =
     /** Registry entry gone, but the scrollback file would not delete. */
     | 'scrollback_kept';
 
-export const forgetSession = (name: string, agentKind?: string): ForgetOutcome => {
+export const forgetSession = (name: string, agentKind?: string, runId?: string): ForgetOutcome => {
     const entries = readAll();
-    // With a kind, only that run goes — the phone deletes the row it is looking
-    // at, and a name that held both pi and claude shows two rows. Without one
-    // (an older phone, which sends no kind), the name goes entirely: that is
-    // what the request meant when a name could only mean one run.
-    const kept = entries.filter((e) => e.name !== name || (agentKind ? e.agentKind !== agentKind : false));
+    // With a kind, only that agent's runs go — the phone deletes the row it is
+    // looking at, and a name that held both pi and claude shows two rows. With a
+    // run as well, only that one run. Without a kind (an older phone, which
+    // sends none), the name goes entirely: that is what the request meant when a
+    // name could only mean one run.
+    const doomed = (e: KnownSession): boolean =>
+        e.name === name && (!agentKind || e.agentKind === agentKind) && (!runId || e.runId === runId);
+    const kept = entries.filter((e) => !doomed(e));
     if (kept.length === entries.length) return 'unknown';
     // The chat's scrollback for that session goes with it. Forgetting a session
     // everywhere except the one file that holds a day of its prompts and tool

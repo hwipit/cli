@@ -338,3 +338,50 @@ describe('one row per run, not per name', () => {
         expect(knownSessions(T0 + 1000)).toEqual([]);
     });
 });
+
+describe('separate runs of one name (hwip docs/session-runs.md)', () => {
+    const run = (runId: string, over: Record<string, unknown> = {}) =>
+        live({ runId, startedAt: new Date(Number(runId) * 1000).toISOString(), ...over });
+    const R1 = String(T0 / 1000);
+    const R2 = String(T0 / 1000 + 3600);
+
+    it('keeps the same agent in the same slot twice as two remembered runs', () => {
+        rememberSessions([run(R1)], T0 + 60_000);
+        rememberSessions([run(R2)], T0 + 3_660_000);
+
+        expect(knownSessions(T0 + 3_660_000).map((e) => e.runId)).toEqual([R2, R1]);
+        expect(knownSessions(T0 + 3_660_000)[1]).toMatchObject({ runId: R1, startedAt: new Date(T0).toISOString() });
+    });
+
+    it('folds the entry a run had before runs were recorded into that run', () => {
+        // Written by an older listener while this run was already going.
+        rememberSessions([live()], T0 + 30_000);
+        rememberSessions([run(R1)], T0 + 60_000);
+
+        expect(knownSessions(T0 + 60_000)).toHaveLength(1);
+        expect(knownSessions(T0 + 60_000)[0]!.runId).toBe(R1);
+    });
+
+    it('keeps an older runless entry from before this run as its own past session', () => {
+        rememberSessions([live()], T0 - 60_000);
+        rememberSessions([run(R1)], T0 + 60_000);
+
+        expect(knownSessions(T0 + 60_000).map((e) => e.runId)).toEqual([R1, undefined]);
+    });
+
+    it('keeps the newest five runs of a name', () => {
+        for (let i = 0; i < 7; i++) rememberSessions([run(String(T0 / 1000 + i * 100))], T0 + i * 100_000);
+
+        const runs = knownSessions(T0 + 700_000).map((e) => e.runId);
+        expect(runs).toHaveLength(5);
+        expect(runs[0]).toBe(String(T0 / 1000 + 600));
+    });
+
+    it('forgets one run and leaves the other', () => {
+        rememberSessions([run(R1)], T0 + 60_000);
+        rememberSessions([run(R2)], T0 + 3_660_000);
+
+        expect(forgetSession('hwip-api', 'claude', R1)).toBe('forgotten');
+        expect(knownSessions(T0 + 3_660_000).map((e) => e.runId)).toEqual([R2]);
+    });
+});

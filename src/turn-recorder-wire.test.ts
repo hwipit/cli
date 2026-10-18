@@ -64,6 +64,13 @@ describe('createChunkUploader', () => {
         expect(JSON.parse(seen[0]!.body)).toEqual({ seq: CHUNK.seq, firstAt: CHUNK.firstAt, lastAt: CHUNK.lastAt, sealed: CHUNK.sealed });
     });
 
+    it('separate runs: names the chunk\'s run in the body', async () => {
+        const upload = await uploader();
+        await upload('dev_listener_x:hwip-app', { ...CHUNK, runId: '1790000000' });
+
+        expect(JSON.parse(seen[0]!.body)).toEqual({ seq: CHUNK.seq, firstAt: CHUNK.firstAt, lastAt: CHUNK.lastAt, runId: '1790000000', sealed: CHUNK.sealed });
+    });
+
     it('sends the same bytes every time, and takes a repeat (200) as stored', async () => {
         answer = (res, n) => reply(res, n === 1 ? 201 : 200);
         const upload = await uploader();

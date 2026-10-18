@@ -28,6 +28,7 @@ const {
     knownSessionsToReport,
     knownSessionsFingerprint,
     KNOWN_SESSIONS_REPORTED,
+    runIdOfEpoch,
 } = await import('./listener.js');
 const { rememberSessions } = await import('./session-registry.js');
 
@@ -152,5 +153,48 @@ describe('a slot that has held two agents', () => {
         // The live claude run is out (its lastSeenAt moves every sweep); the pi
         // run that ended in that same slot is a past session and stays in.
         expect(reported.map((k) => [k.name, k.agentKind])).toEqual([['hwip-api', 'pi']]);
+    });
+});
+
+describe('separate runs in the report (hwip docs/session-runs.md)', () => {
+    beforeEach(() => {
+        rmSync(join(TMP, 'state'), { recursive: true, force: true });
+    });
+    const at = (sec: number) => new Date(sec * 1000).toISOString();
+    const R1 = 1_790_000_000;
+    const R2 = R1 + 3600;
+    const remember = (runId: number, seenAt: number) =>
+        rememberSessions([{ name: 'hwip-api', cwd: '/work/api', agentKind: 'claude', project: 'api', runId: String(runId), startedAt: at(runId) }], seenAt);
+
+    it('reports the ended run of a name the same agent runs again, with its run id and start', () => {
+        remember(R1, (R1 + 60) * 1000);
+        remember(R2, (R2 + 60) * 1000);
+
+        const known = knownSessionsToReport([{ ...live('hwip-api'), runId: String(R2) }], (R2 + 60) * 1000);
+
+        expect(known).toEqual([{ name: 'hwip-api', agentKind: 'claude', project: 'api', runId: String(R1), startedAt: at(R1), lastSeenAt: at(R1 + 60) }]);
+    });
+
+    it('reports up to fifty', () => {
+        expect(KNOWN_SESSIONS_REPORTED).toBe(50);
+    });
+
+    it('sees a different run as a change', () => {
+        const base = { name: 'hwip-api', agentKind: 'claude', lastSeenAt: at(R1) };
+        expect(knownSessionsFingerprint([{ ...base, runId: String(R1) }]))
+            .not.toBe(knownSessionsFingerprint([{ ...base, runId: String(R2) }]));
+    });
+});
+
+describe('separate runs: the run id', () => {
+    it('is the run id the server derives from createdAt for a listener that sends none', () => {
+        // hwip server/src/shared/utils/sessionRun.ts `runIdOf` (hwip f9c5e1ca), copied: no import across repos.
+        expect(runIdOfEpoch('1792310400')).toBe('1792310400');
+        const serverRunIdOf = (createdAt: string) => String(Math.floor(Date.parse(createdAt) / 1000));
+        for (const epoch of ['1792310400', '1', '1700000000']) {
+            expect(runIdOfEpoch(epoch)).toBe(serverRunIdOf(new Date(Number(epoch) * 1000).toISOString()));
+        }
+        expect(runIdOfEpoch(undefined)).toBeUndefined();
+        expect(runIdOfEpoch('0')).toBeUndefined();
     });
 });

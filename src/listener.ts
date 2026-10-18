@@ -319,6 +319,14 @@ interface AgentSession {
      */
     providerSessionName?: string | null;
     createdAt?: string;
+    /**
+     * Which run of the name this is (hwip docs/session-runs.md): tmux
+     * `session_created` in epoch seconds, as a decimal string — the same
+     * instant as `createdAt`. A name is handed out again when an agent starts
+     * in the same folder; this is what tells the two apart. Absent on subagent
+     * rows, which are panes of their parent's run.
+     */
+    runId?: string;
     lastActivityAt?: string;
     /**
      * Detected agent state (wire contract — flows to the server and the
@@ -405,13 +413,16 @@ export const staleConnectionAction = (message: unknown, drops: number): StaleCon
     return drops < MAX_STALE_CONNECTION_DROPS ? 'drop' : 'exhausted';
 };
 
-export const KNOWN_SESSIONS_REPORTED = 30;
+export const KNOWN_SESSIONS_REPORTED = 50;
 
 export interface ReportedKnownSession {
     name: string;
     agentKind: string;
     project?: string;
     label?: string;
+    /** The run's id and start (hwip docs/session-runs.md); absent for entries recorded before runs. */
+    runId?: string;
+    startedAt?: string;
     lastSeenAt: string;
 }
 
@@ -419,31 +430,34 @@ export const knownSessionsToReport = (
     live: readonly AgentSession[],
     now: number = Date.now(),
 ): ReportedKnownSession[] => {
-    // By name AND kind: a slot that is live under claude may still hold an
-    // ended pi run, and that run is a past session — excluding the whole name
-    // would drop it from the report exactly the way the registry used to drop
-    // it from disk. The live run itself stays out for the reason below.
-    const running = new Set(live.map((s) => runKey(s.name, s.agentKind)));
+    // By name, kind AND run: a slot that is live under claude may still hold an
+    // ended pi run — or an ended claude run before this one — and that run is a
+    // past session. Excluding the whole name would drop it from the report
+    // exactly the way the registry used to drop it from disk. The live run
+    // itself stays out for the reason below.
+    const running = new Set(live.map((s) => runKey(s.name, s.agentKind, s.runId)));
     return knownSessions(now)
-        .filter((e) => !running.has(runKey(e.name, e.agentKind)))
+        .filter((e) => !running.has(runKey(e.name, e.agentKind, e.runId)))
         .slice(0, KNOWN_SESSIONS_REPORTED)
         .map((e) => ({
             name: e.name,
             agentKind: e.agentKind,
             ...(e.project ? { project: e.project } : {}),
             ...(e.label ? { label: e.label } : {}),
+            ...(e.runId ? { runId: e.runId } : {}),
+            ...(e.startedAt ? { startedAt: e.startedAt } : {}),
             lastSeenAt: e.lastSeenAt,
         }));
 };
 
 export const knownSessionsFingerprint = (known: ReportedKnownSession[]): string =>
-    known.map((k) => `${k.name} ${k.lastSeenAt}`).sort().join('|');
+    known.map((k) => `${k.name} ${k.agentKind} ${k.runId ?? ''} ${k.lastSeenAt}`).sort().join('|');
 
 export const sessionsFingerprint = (sessions: AgentSession[]): string =>
     sessions
         .map((s) => JSON.stringify([
             s.name, s.attached, s.agentKind, s.agentSessionId ?? null,
-            s.project, s.label ?? null, s.providerSessionName ?? null, s.createdAt ?? null,
+            s.project, s.label ?? null, s.providerSessionName ?? null, s.createdAt ?? null, s.runId ?? null,
             s.lastActivityAt ?? null, s.state ?? null,
             s.stateChangedAt ?? null, s.stateRuleId ?? null,
             s.blockedPrompt?.id ?? null, s.blockedPrompt?.at ?? null,
@@ -781,6 +795,17 @@ const epochToIso = (epoch: string | undefined): string | undefined => {
     const n = Number(epoch);
     if (!Number.isFinite(n) || n <= 0) return undefined;
     return new Date(n * 1000).toISOString();
+};
+
+/**
+ * A run's id from tmux's `session_created` (hwip docs/session-runs.md): the
+ * whole epoch seconds as a decimal string. The server derives the same string
+ * from `createdAt` for listeners that do not send one (`runIdOf`), so the two
+ * must agree: `epochToIso` keeps whole seconds and this floors them.
+ */
+export const runIdOfEpoch = (epoch: string | undefined): string | undefined => {
+    const iso = epochToIso(epoch);
+    return iso ? String(Math.floor(Date.parse(iso) / 1000)) : undefined;
 };
 
 // ─── Agent state detection (SPEC-AGENT-AWARENESS §S1) ──────────────
@@ -1882,6 +1907,8 @@ export interface SessionForgetRequest {
      *  the phone deletes the row it is looking at. Absent (older phone) deletes
      *  every run under the name, which is what the request used to mean. */
     agentKind?: string;
+    /** With `agentKind`, the one run of it to delete (hwip docs/session-runs.md). Absent: every run of that agent. */
+    runId?: string;
     requestId?: string;
 }
 
@@ -1958,6 +1985,7 @@ export const handleSessionForgetRequest = (
     const outcome = forgetSession(
         sessionName,
         typeof req.agentKind === 'string' ? req.agentKind : undefined,
+        typeof req.runId === 'string' && /^\d{1,12}$/.test(req.runId) ? req.runId : undefined,
     );
     if (outcome === 'unknown') {
         log(`✗ forget ${sessionName}: never seen on this machine`);
@@ -4181,6 +4209,7 @@ export const collectSessionsVerbose = (): CollectResult => {
                 project: parsed.project,
                 label: parsed.label,
                 createdAt: epochToIso(group.created),
+                runId: runIdOfEpoch(group.created),
                 lastActivityAt: epochToIso(group.activity),
                 // No `state`: the server arms its completion and `gone` pushes
                 // on reported state, and a shell going idle is not news.
@@ -4225,6 +4254,7 @@ export const collectSessionsVerbose = (): CollectResult => {
             label: parsed.label,
             providerSessionName,
             createdAt: epochToIso(group.created),
+            runId: runIdOfEpoch(group.created),
             lastActivityAt: epochToIso(group.activity),
             ...deriveSessionState(name, main.agent.kind, capturePaneText(name, main.row.paneId)),
         });
@@ -4282,7 +4312,10 @@ export const collectSessionsVerbose = (): CollectResult => {
         const mainTranscript = info.currentPath && main.agent.resolveTranscript && main.agent.projectTranscript
             ? (main.agent.resolveTranscript(info.currentPath, info.panePid ?? undefined) ?? null)
             : null;
-        if (mainTranscript) recordable[name] = { path: mainTranscript, kind: main.agent.kind };
+        if (mainTranscript) {
+            const runId = runIdOfEpoch(group.created);
+            recordable[name] = { path: mainTranscript, kind: main.agent.kind, ...(runId ? { runId } : {}) };
+        }
         const transcriptPath = main.agent.kind === 'claude' ? mainTranscript : null;
         if (transcriptPath) {
             const scan = subagentScans.get(name) ?? initialSubagentScanState();
@@ -4342,6 +4375,8 @@ export const collectSessionsVerbose = (): CollectResult => {
             agentKind: s.agentKind,
             project: s.project,
             label: s.label,
+            runId: s.runId,
+            startedAt: s.createdAt,
         })),
     );
     return { sessions, rejected, targets, subagentTranscripts, recordable };

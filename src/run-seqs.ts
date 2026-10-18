@@ -14,7 +14,7 @@
  * and the largest only up, here and on the server.
  */
 
-import { readFileSync, writeFileSync } from 'fs';
+import { readFileSync, statSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { stateDir } from './gate.js';
 import { handBackToSudoUser, mkdirHandedBack } from './private-files.js';
@@ -39,16 +39,24 @@ const filePath = (): string => join(stateDir(), 'run-seqs.json');
 
 const isSeq = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0;
 
+/** The last parse, keyed by the file's mtime and size: the 5 s report sweep reads it without parsing again. */
+let cached: { path: string; stamp: string; rows: Row[] } | undefined;
+
 const readAll = (): Row[] => {
+    const path = filePath();
     try {
-        const parsed: unknown = JSON.parse(readFileSync(filePath(), 'utf-8'));
-        if (!Array.isArray(parsed)) return [];
-        return parsed.filter(
+        const stat = statSync(path);
+        const stamp = `${stat.mtimeMs}:${stat.size}`;
+        if (cached?.path === path && cached.stamp === stamp) return cached.rows;
+        const parsed: unknown = JSON.parse(readFileSync(path, 'utf-8'));
+        const rows = !Array.isArray(parsed) ? [] : parsed.filter(
             (r): r is Row =>
                 !!r && typeof r === 'object' &&
                 typeof (r as Row).name === 'string' && typeof (r as Row).runId === 'string' && typeof (r as Row).at === 'string' &&
                 isSeq((r as Row).firstSeq) && isSeq((r as Row).lastSeq),
         );
+        cached = { path, stamp, rows };
+        return rows;
     } catch {
         return [];
     }

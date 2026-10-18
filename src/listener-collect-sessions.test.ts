@@ -58,6 +58,7 @@ vi.mock('child_process', async (importOriginal) => {
 
 const listener = await import('./listener.js');
 const { recallSession } = await import('./session-registry.js');
+const { REMOTE_AGENTS } = await import('./remote-agents.js');
 
 let logSpy: ReturnType<typeof vi.spyOn>;
 const logged = (): string => logSpy.mock.calls.map((c) => String(c[0])).join('\n');
@@ -174,6 +175,64 @@ describe('collectSessionsVerbose — what the sweep does today', () => {
             );
             listener.collectSessionsVerbose();
             expect(recallSession('hwip-cwd')).toMatchObject({ cwd: '/tmp/proj', agentKind: 'claude' });
+        });
+
+        // A resume hands this id to `claude --resume`, so only an id read off
+        // this pane's own process goes into the registry — never the reported
+        // one, which may be a guess at the newest conversation in the folder.
+        it('records the conversation a resume can pick up, not the reported one', () => {
+            const claude = REMOTE_AGENTS.find((a) => a.kind === 'claude')!;
+            vi.spyOn(claude, 'resolveSessionId').mockReturnValue('folder-guess');
+            vi.spyOn(claude, 'resolveResumeId').mockReturnValue('conv-exact');
+            listPanes = answer(paneRow({ session: 'hwip-conv' }));
+
+            listener.collectSessionsVerbose();
+
+            expect(recallSession('hwip-conv')?.agentSessionId).toBe('conv-exact');
+        });
+
+        it('records no conversation that two panes both answer to', () => {
+            // opencode resolves the busiest session in the folder, so two panes
+            // there can both name one conversation — resuming either would
+            // write into the other's.
+            const claude = REMOTE_AGENTS.find((a) => a.kind === 'claude')!;
+            vi.spyOn(claude, 'resolveResumeId').mockReturnValue('conv-shared');
+            listPanes = answer(
+                paneRow({ session: 'hwip-twin', paneId: '%1' }),
+                paneRow({ session: 'hwip-twin-2', paneId: '%2' }),
+            );
+
+            listener.collectSessionsVerbose();
+
+            expect(recallSession('hwip-twin')?.agentSessionId).toBeUndefined();
+            expect(recallSession('hwip-twin-2')?.agentSessionId).toBeUndefined();
+        });
+
+        it('forgets the conversation a pane had alone once another pane answers to it too', () => {
+            const claude = REMOTE_AGENTS.find((a) => a.kind === 'claude')!;
+            vi.spyOn(claude, 'resolveResumeId').mockReturnValue('conv-was-mine');
+            listPanes = answer(paneRow({ session: 'hwip-solo', paneId: '%1' }));
+            listener.collectSessionsVerbose();
+            expect(recallSession('hwip-solo')?.agentSessionId).toBe('conv-was-mine');
+
+            listPanes = answer(
+                paneRow({ session: 'hwip-solo', paneId: '%1' }),
+                paneRow({ session: 'hwip-solo-2', paneId: '%2' }),
+            );
+            listener.collectSessionsVerbose();
+
+            expect(recallSession('hwip-solo')?.agentSessionId).toBeUndefined();
+        });
+
+        it('records no conversation when only a guess was read', () => {
+            const claude = REMOTE_AGENTS.find((a) => a.kind === 'claude')!;
+            vi.spyOn(claude, 'resolveSessionId').mockReturnValue('folder-guess');
+            vi.spyOn(claude, 'resolveResumeId').mockReturnValue(null);
+            listPanes = answer(paneRow({ session: 'hwip-conv-guess' }));
+
+            listener.collectSessionsVerbose();
+
+            expect(recallSession('hwip-conv-guess')?.agentSessionId).toBeUndefined();
         });
     });
 

@@ -54,6 +54,24 @@ export interface RemoteAgent {
      */
     resolveSessionId?: (paneCwd: string, panePid?: number) => string | null;
     /**
+     * The conversation id a resume may hand back to this agent: anchored to
+     * the pane's own process, never a guess at the newest conversation in the
+     * folder — `resolveSessionId` may fall back to one for reporting, and a
+     * resume built on it would continue another session's work. Where the
+     * agent's store cannot tell two panes in one folder apart, both answer the
+     * same id; the sweep records no id that more than one pane answers to.
+     */
+    resolveResumeId?: (paneCwd: string, panePid?: number) => string | null;
+    /**
+     * The arguments that start this agent on the conversation `id` (as
+     * `resolveResumeId` read it) in `cwd`, or null when that conversation
+     * cannot be picked back up and the agent should start fresh. Carried only
+     * where `resolveResumeId` is — an agent whose id is unknown here is never
+     * pointed at "the latest conversation in this folder", which may be
+     * another session's.
+     */
+    resumeArgs?: (id: string, cwd: string) => readonly string[] | null;
+    /**
      * Resolve the name the agent calls this session by — what the user sees in
      * their own terminal, which the phone shows instead of the computed
      * `<project> · <Agent> #N` label.
@@ -552,10 +570,17 @@ export const claudeTranscriptPath = (paneCwd: string | null, panePid?: number): 
 
     // A mis-encoded directory yields a path that never exists, and the watcher
     // would then poll a missing file forever without ever saying so.
-    const projectDir = join(CLAUDE_PROJECTS_DIR, claudeProjectDirName(paneCwd));
-    const path = join(projectDir, `${sessionId}.jsonl`);
-    // Prove it before handing it out. The pid path never touches the filesystem,
-    // so without this a mis-encoded directory reads as a healthy silent session.
+    return claudeConversationFile(paneCwd, sessionId);
+};
+
+/**
+ * Where Claude Code keeps conversation `sessionId` begun in `cwd`, or null
+ * when no such file is there. Proven, not computed: the pid path never touches
+ * the filesystem, so without this a mis-encoded directory reads as a healthy
+ * silent session — and `claude --resume` of a missing id exits at once.
+ */
+const claudeConversationFile = (cwd: string, sessionId: string): string | null => {
+    const path = join(CLAUDE_PROJECTS_DIR, claudeProjectDirName(cwd), `${sessionId}.jsonl`);
     try {
         return statSync(path).isFile() ? path : null;
     } catch {
@@ -1265,6 +1290,12 @@ const REMOTE_AGENT_TABLE = [
             panePid !== undefined ? detectClaudeSessionNameByPid(panePid, paneCwd) : null,
         resolveTranscript: (paneCwd, panePid) => claudeTranscriptPath(paneCwd, panePid),
         projectTranscript: projectTranscriptEntries,
+        // The pid match alone: the mtime fallback above can name another
+        // `claude` in the same directory, which is a report's risk to take but
+        // not a resume's.
+        resolveResumeId: (paneCwd, panePid) =>
+            panePid !== undefined ? detectClaudeSessionIdByPid(panePid, paneCwd) : null,
+        resumeArgs: (id, cwd) => (claudeConversationFile(cwd, id) ? ['--resume', id] : null),
     },
     {
         kind: 'codex',
@@ -1332,6 +1363,12 @@ const REMOTE_AGENT_TABLE = [
         resolveTranscript: (paneCwd, panePid) => opencodeTranscriptPath(paneCwd, panePid),
         projectTranscript: projectOpencodeEntries,
         readTranscript: (path, prev) => readOpencodeTranscript(path, prev, { query: queryOpencodeTranscript }),
+        // Anchored to the pane's process start. Two opencode panes in one
+        // folder both answer the busier session; the sweep drops a shared id.
+        resolveResumeId: (paneCwd, panePid) => detectOpencodeSession(paneCwd, panePid)?.id ?? null,
+        // Not checked against the store: an unknown id makes opencode start a
+        // new session rather than exit, so a stale one costs nothing.
+        resumeArgs: (id) => ['--session', id],
     },
     // The rows below are the minimum: launch in a tmux pane and be addressable.
     // Binary names come from Happier's provider table; only `copilot` and

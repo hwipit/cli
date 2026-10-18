@@ -385,3 +385,72 @@ describe('separate runs of one name (hwip docs/session-runs.md)', () => {
         expect(knownSessions(T0 + 3_660_000).map((e) => e.runId)).toEqual([R2]);
     });
 });
+
+/**
+ * A resume that starts the agent fresh hands the phone an empty chat where the
+ * work it tapped used to be. The id of the conversation a run last had is what
+ * lets the listener pick that work back up — and only an id this machine read
+ * off the live pane, never one a request carries.
+ */
+describe('the conversation a run last had', () => {
+    it('remembers the conversation id the sweep read', () => {
+        rememberSessions([live({ agentSessionId: 'conv-1' })], T0);
+
+        expect(recallSession('hwip-api', T0)?.agentSessionId).toBe('conv-1');
+    });
+
+    it('keeps the conversation when a later sweep of the same run could not read it', () => {
+        // The resolver comes up empty between a pane starting and the agent
+        // writing its record; that gap must not erase what was known.
+        rememberSessions([live({ agentSessionId: 'conv-1' })], T0);
+        rememberSessions([live({ agentSessionId: undefined })], T0 + 1000);
+
+        expect(recallSession('hwip-api', T0 + 1000)?.agentSessionId).toBe('conv-1');
+    });
+
+    it('forgets the conversation once the sweep finds it is not this run’s alone', () => {
+        rememberSessions([live({ agentSessionId: 'conv-1' })], T0);
+        rememberSessions([live({ agentSessionId: null })], T0 + 1000);
+
+        expect(recallSession('hwip-api', T0 + 1000)?.agentSessionId).toBeUndefined();
+    });
+
+    it('follows the run to its newer conversation', () => {
+        rememberSessions([live({ agentSessionId: 'conv-1' })], T0);
+        rememberSessions([live({ agentSessionId: 'conv-2' })], T0 + 1000);
+
+        expect(recallSession('hwip-api', T0 + 1000)?.agentSessionId).toBe('conv-2');
+    });
+
+    it('drops the conversation when the run turns up in another directory', () => {
+        // The name is a reused slot: a run seen elsewhere is not the run that
+        // had that conversation, and opencode would open it from any folder.
+        rememberSessions([live({ agentKind: 'opencode', agentSessionId: 'ses_api' })], T0);
+        rememberSessions([live({ agentKind: 'opencode', cwd: '/Users/me/work/web', agentSessionId: undefined })], T0 + 1000);
+
+        expect(recallSession('hwip-api', T0 + 1000)?.agentSessionId).toBeUndefined();
+    });
+
+    it('does not hand one agent’s conversation to another agent under the same name', () => {
+        rememberSessions([live({ agentKind: 'opencode', agentSessionId: 'ses_open' })], T0);
+        rememberSessions([live({ agentKind: 'claude', agentSessionId: undefined })], T0 + 1000);
+
+        expect(recallRun('hwip-api', 'claude', T0 + 1000)?.agentSessionId).toBeUndefined();
+        expect(recallRun('hwip-api', 'opencode', T0 + 1000)?.agentSessionId).toBe('ses_open');
+    });
+
+    it('reads a registry written before runs carried a conversation id', () => {
+        const path = knownSessionsPath();
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(
+            path,
+            JSON.stringify([
+                { name: 'hwip-old', cwd: '/w/old', agentKind: 'claude', lastSeenAt: '2026-08-01T00:00:00.000Z' },
+            ]),
+        );
+
+        const row = recallSession('hwip-old', T0);
+        expect(row?.cwd).toBe('/w/old');
+        expect(row?.agentSessionId).toBeUndefined();
+    });
+});

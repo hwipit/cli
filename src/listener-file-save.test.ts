@@ -2,7 +2,8 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { existsSync, mkdtempSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
-import { downloadAttachments, saveFileFromS3, type SaveFileDeps } from './listener.js';
+import { answerFileBound, downloadAttachments, downloadSealedEach, saveFileFromS3, type SaveFileDeps } from './listener.js';
+import { DOWNLOAD_MAX_BYTES } from './file-crypto.js';
 import { getDevicePublicKey, initDeviceCrypto } from './crypto.js';
 import { sealForReceiver } from '../tests/helpers/seal.js';
 
@@ -344,5 +345,75 @@ describe('attachment downloads that stall', () => {
         const h = harness(Buffer.from('x'));
         const deps: SaveFileDeps = { ...h.deps, fetchFn: stallingFetch((url) => url === PRESIGNED), idleTimeoutMs: 50 };
         await expect(saveFileFromS3({ pushId: 'p' }, { fileKey: 'fk/1', fileName: 'hi.txt' }, deps)).rejects.toThrow(/no response in 50 ms/);
+    });
+});
+
+describe('downloadSealedEach — answer files', () => {
+    const ctx = { apiKey: 'k', baseUrl: API };
+
+    it('saves the files that open and names the one that did not, keeping the rest', async () => {
+        // Padded the way the apps pad (Padmé): 9 bytes go up as 10.
+        const good = await sealForReceiver(Buffer.from('hello-wor\0'), receiverPublicKey);
+        const bad = await sealForReceiver(Buffer.from('nope'), receiverPublicKey);
+        const fetchFn: typeof fetch = async (input) => {
+            const url = String(input);
+            if (url.startsWith(API)) return new Response(JSON.stringify({ data: { downloadUrl: `${PRESIGNED}&k=${url.endsWith('bad') ? 'bad' : 'good'}` } }));
+            return url.endsWith('bad') ? new Response('gone', { status: 403 }) : new Response(good.ciphertext);
+        };
+        const files = [
+            { fileKey: 'good', fileName: 'file', iv: good.iv, deviceKeyMap: { [ME]: good.entry } },
+            { fileKey: 'bad', fileName: 'file', iv: bad.iv, deviceKeyMap: { [ME]: bad.entry } },
+        ];
+
+        const saved = await downloadSealedEach('evt-answer-partial', files, ctx, {
+            deviceId: ME, senderPublicKey: good.senderPublicKey,
+            files: [{ iv: good.iv, name: 'note.txt', type: 'text/plain', size: 9 }, { iv: bad.iv, name: 'shot.png', type: 'image/png', size: 4 }],
+        }, { fetchFn });
+
+        expect(saved.paths.map((p) => basename(p))).toEqual(['note.txt']);
+        expect(readFileSync(saved.paths[0]!, 'utf8')).toBe('hello-wor');
+        expect(saved.missing).toEqual(['shot.png: download 403']);
+    });
+
+    it('reads no more of a file than its seal says it holds, padded', async () => {
+        const small = await sealForReceiver(Buffer.from('tiny'), receiverPublicKey);
+        // The relay points at a larger object than the seal names: refused before it is read whole.
+        const fetchFn: typeof fetch = async (input) =>
+            String(input).startsWith(API)
+                ? new Response(JSON.stringify({ data: { downloadUrl: PRESIGNED } }))
+                : new Response(Buffer.alloc(4096), { headers: { 'content-length': '4096' } });
+        const saved = await downloadSealedEach('evt-answer-bound', [{ fileKey: 'k', fileName: 'file', iv: small.iv, deviceKeyMap: { [ME]: small.entry } }], ctx, {
+            deviceId: ME, senderPublicKey: small.senderPublicKey,
+            files: [{ iv: small.iv, name: 'tiny.txt', type: 'text/plain', size: 4 }],
+        }, { fetchFn });
+        expect(saved.paths).toEqual([]);
+        expect(saved.missing).toEqual([`tiny.txt: download is over the ${4 + 16}-byte limit`]);
+        expect(answerFileBound(4)).toBe(20);
+        expect(answerFileBound(9)).toBe(10 + 16);
+        expect(answerFileBound(undefined)).toBe(DOWNLOAD_MAX_BYTES);
+    });
+
+    it('names a file sealed in chunks, and a second copy of the same file, instead of dropping them', async () => {
+        const once = await sealForReceiver(Buffer.from('same'), receiverPublicKey);
+        const chunked = await sealForReceiver(Buffer.from('big'), receiverPublicKey, CHUNK);
+        const fetchFn: typeof fetch = async (input) => {
+            const url = String(input);
+            if (url.startsWith(API)) return new Response(JSON.stringify({ data: { downloadUrl: `${PRESIGNED}&k=${url.split('/').pop()}` } }));
+            return new Response(url.endsWith('big') ? chunked.ciphertext : once.ciphertext);
+        };
+        const same = { fileKey: 'same', fileName: 'file', iv: once.iv, deviceKeyMap: { [ME]: once.entry } };
+        const big = { fileKey: 'big', fileName: 'file', iv: chunked.iv, deviceKeyMap: { [ME]: chunked.entry } };
+
+        const saved = await downloadSealedEach('evt-answer-dup', [same, same, big], ctx, {
+            deviceId: ME, senderPublicKey: once.senderPublicKey,
+            files: [
+                { iv: once.iv, name: 'a.txt', type: 'text/plain', size: 4 },
+                { iv: once.iv, name: 'a.txt', type: 'text/plain', size: 4 },
+                { iv: chunked.iv, name: 'clip.mov', type: 'video/quicktime', size: 3, chunk: CHUNK },
+            ],
+        }, { fetchFn });
+
+        expect(saved.paths.map((p) => basename(p))).toEqual(['a.txt']);
+        expect(saved.missing).toEqual(['a.txt: the same file was attached twice', expect.stringMatching(/^clip\.mov: .*sealed in chunks/)]);
     });
 });

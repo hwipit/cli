@@ -536,7 +536,7 @@ type Handler = (event: unknown, ctx: unknown) => unknown;
  * run so the host terminal can't leak in — this suite itself runs inside tmux,
  * and a bare load once picked up the session's real TMUX_PANE.
  */
-const loadExtension = (env: Record<string, string | undefined> = {}, herdrOptions = '', ctxExtra: Record<string, unknown> = { mode: 'tui' }, deferTmux = false) => {
+const loadExtension = (env: Record<string, string | undefined> = {}, herdrOptions = '', ctxExtra: Record<string, unknown> = { mode: 'tui' }, deferTmux = false, herdrSocket = { mtimeMs: 1 }) => {
     const js = transformSync(templates.PI_EXTENSION, { loader: 'ts', format: 'cjs' }).code;
     const spawned: { cmd: string; command: string; argv: string[]; env: Record<string, string | undefined> }[] = [];
     const mod = { exports: {} as Record<string, unknown> };
@@ -559,6 +559,8 @@ const loadExtension = (env: Record<string, string | undefined> = {}, herdrOption
             // right after the event that triggered it, or a tick later like tmux.
             execFile: (_cmd: string, _argv: string[], _opts: unknown, cb: (err: Error | null, out: string) => void) =>
                 deferTmux ? setTimeout(() => cb(null, herdrOptions + '\n'), 5) : cb(null, herdrOptions + '\n'),
+            // herdr's socket: recreated, so newer, when herdr restarts.
+            statSync: () => herdrSocket,
         }));
     } finally {
         for (const k of Object.keys(saved)) {
@@ -625,6 +627,27 @@ describe('templates.ts: the pi extension reports pi to herdr', () => {
         pi.emit('agent_settled');
         pi.emit('agent_settled');
         expect(pi.herdrCalls()).toHaveLength(1);
+    });
+
+    it('reads an empty pane option as no pane, not the socket as the pane', () => {
+        const pi = loadExtension({ TMUX_PANE: '%7' }, '\t/sock\t/bin/herdr');
+        pi.emit('session_start');
+        expect(pi.herdrCalls()).toEqual([]);
+    });
+
+    // herdr forgets every report when it restarts; an unchanged state must reach the new one.
+    it('resends an unchanged state once herdr has restarted', () => {
+        const socket = { mtimeMs: 1 };
+        const pi = loadExtension({ TMUX_PANE: '%7' }, inHerdr, { mode: 'tui' }, false, socket);
+        pi.emit('session_start');
+        pi.emit('agent_settled');
+        socket.mtimeMs = 2;
+        pi.emit('agent_settled');
+        pi.emit('agent_settled');
+        expect(pi.herdrCalls().map((c) => c.argv)).toEqual([
+            'pane report-agent wF:p1 --source hwip-pi --agent hwip pi --state idle',
+            'pane report-agent wF:p1 --source hwip-pi --agent hwip pi --state idle',
+        ]);
     });
 
     // A /reload replaces the extension mid-turn without another agent_start.

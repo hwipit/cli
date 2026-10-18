@@ -38,6 +38,12 @@ export interface KnownSession {
     runId?: string;
     /** When that run started (ISO) — the same instant as `runId`. */
     startedAt?: string;
+    /**
+     * The agent's own id for the conversation this run last had, as the sweep
+     * read it off the live pane — what a resume picks back up. Absent for an
+     * agent whose id this machine cannot read, and in files written before it.
+     */
+    agentSessionId?: string;
     /** Last time this machine saw the session running. */
     lastSeenAt: string;
 }
@@ -171,6 +177,12 @@ export const rememberSessions = (
         label?: string | null;
         runId?: string;
         startedAt?: string;
+        /**
+         * The conversation a resume may pick up. Absent: not readable this
+         * sweep, so the run keeps the one it had. Null: read, but not this
+         * run's alone to resume — the run forgets it.
+         */
+        agentSessionId?: string | null;
     }>,
     now: number = Date.now(),
 ): void => {
@@ -187,7 +199,15 @@ export const rememberSessions = (
             const before = byRun.get(runKey(s.name, s.agentKind));
             if (before && before.lastSeenAt >= s.startedAt) byRun.delete(runKey(s.name, s.agentKind));
         }
-        byRun.set(runKey(s.name, s.agentKind, s.runId), {
+        const key = runKey(s.name, s.agentKind, s.runId);
+        // A sweep that could not read the id — the agent has not written its
+        // record yet — keeps the one this run already had. Keyed by run and
+        // directory, so neither another agent taking the name nor the same
+        // agent started elsewhere under it inherits a conversation.
+        const prev = byRun.get(key);
+        const keepPrev = s.agentSessionId === undefined && prev?.cwd === s.cwd;
+        const agentSessionId = s.agentSessionId || (keepPrev ? prev?.agentSessionId : undefined);
+        byRun.set(key, {
             name: s.name,
             cwd: s.cwd as string,
             agentKind: s.agentKind,
@@ -195,6 +215,7 @@ export const rememberSessions = (
             ...(s.label ? { label: s.label } : {}),
             ...(s.runId ? { runId: s.runId } : {}),
             ...(s.startedAt ? { startedAt: s.startedAt } : {}),
+            ...(agentSessionId ? { agentSessionId } : {}),
             lastSeenAt: seenAt,
         });
     }

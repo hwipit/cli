@@ -64,6 +64,7 @@ import {
     recallSession,
     rememberSessions,
     sessionDirectoryExists,
+    type KnownSession,
 } from './session-registry.js';
 import { foregroundAgentFor, REMOTE_AGENTS, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
 import {
@@ -109,7 +110,7 @@ import { webSocketProxyOptions } from './http-failure.js';
 import { notifyDesktop, type DesktopNotification } from './desktop-notify.js';
 import { createWorktreeCleanup } from './listener-worktree-cleanup.js';
 import { tmuxRun } from './worktree.js';
-import { chunkOf, createFileDecryptStream, DOWNLOAD_MAX_BYTES, saveStream, withIdleTimeout } from './file-crypto.js';
+import { chunkOf, createFileDecryptStream, DOWNLOAD_MAX_BYTES, GCM_TAG_BYTES, saveStream, withIdleTimeout } from './file-crypto.js';
 import { createTurnWatchers, type SendTurnFrame, type TurnWatchControl } from './turn-watch.js';
 import { diskTurnRing } from './turn-ring.js';
 import { createInputSequencer, type InputSequencer, type SequencedInput } from './input-sequencer.js';
@@ -1699,6 +1700,25 @@ export interface SessionResumeResult {
     at: string;
 }
 
+/** What an agent conversation id looks like — a value, never an option. */
+const CONVERSATION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+
+/**
+ * The flags that pick a resumed run's last conversation back up, or null to
+ * start it fresh. The id is one this machine read off the live pane, but the
+ * registry is a file on disk: it reaches argv only once it reads as an id, so
+ * nothing in it can turn into an option of the agent's own.
+ */
+const resumableConversation = (
+    agent: RegisteredRemoteAgent,
+    known: KnownSession,
+): { id: string; args: readonly string[] } | null => {
+    const id = known.agentSessionId;
+    if (typeof id !== 'string' || !CONVERSATION_ID.test(id)) return null;
+    const args = agent.resumeArgs?.(id, known.cwd);
+    return args ? { id, args } : null;
+};
+
 /**
  * Start a remembered session again, detached, and tell the phone what happened.
  * Returns true when the message was ours to answer.
@@ -1772,16 +1792,18 @@ export const handleSessionResumeRequest = (
     const sidecar = known.label && known.project
         ? [';', 'set-option', SESSION_PROJECT_OPTION, known.project, ';', 'set-option', SESSION_LABEL_OPTION, known.label]
         : [];
+    const conversation = resumableConversation(agent, known);
     const started = spawnSync(
         'tmux',
-        tmuxArgs(['new-session', '-d', '-s', sessionName, '-c', known.cwd, agent.binary, ...sidecar]),
+        tmuxArgs(['new-session', '-d', '-s', sessionName, '-c', known.cwd, agent.binary, ...(conversation?.args ?? []), ...sidecar]),
         { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] },
     );
     if (started.status !== 0) {
         log(`✗ resume ${sessionName}: tmux refused (${(started.stderr ?? '').trim() || 'no detail'})`);
         return reply({ error: 'start_failed' });
     }
-    log(`⟲ resume ${sessionName}: ${agent.binary} in ${known.cwd}`);
+    const resumedFrom = conversation ? ` (conversation ${conversation.id.slice(0, 8)})` : '';
+    log(`⟲ resume ${sessionName}: ${agent.binary}${resumedFrom} in ${known.cwd}`);
     return reply({ resumed: true });
 };
 
@@ -4204,6 +4226,8 @@ export const collectSessionsVerbose = (): CollectResult => {
     // rather than in it: AgentSession is a server/phone contract and the
     // directory is local knowledge the registry needs, nothing the phone gets.
     const paneCwdOf = new Map<string, string>();
+    // The conversation a resume may pick back up, beside it for the same reason.
+    const resumeIdOf = new Map<string, string>();
     const targets: Record<string, string> = {};
     const subagentTranscripts: Record<string, string> = {};
     const recordable: Record<string, RecordableSession> = {};
@@ -4267,6 +4291,10 @@ export const collectSessionsVerbose = (): CollectResult => {
             ? (main.agent.resolveSessionName?.(info.currentPath, info.panePid ?? undefined) ?? null)
             : null;
         if (info.currentPath) paneCwdOf.set(name, info.currentPath);
+        const resumeId = info.currentPath
+            ? main.agent.resolveResumeId?.(info.currentPath, info.panePid ?? undefined)
+            : null;
+        if (resumeId) resumeIdOf.set(name, resumeId);
         targets[name] = main.row.paneId;
         sessions.push({
             name,
@@ -4382,6 +4410,19 @@ export const collectSessionsVerbose = (): CollectResult => {
     }
     pruneToLive(subagentScans, new Set(groups.keys()));
     pruneToLive(sessionStates, new Set(sessions.map((s) => s.name)));
+    // An id two panes both answer to belongs to at most one of them, and the
+    // sweep cannot tell which — opencode names the busiest session in the
+    // folder — so neither may resume it.
+    const resumeIdCount = new Map<string, number>();
+    for (const id of resumeIdOf.values()) resumeIdCount.set(id, (resumeIdCount.get(id) ?? 0) + 1);
+    // Undefined (not read this sweep) keeps the run's last id; null (shared)
+    // forgets it, or a run that had the id alone would keep resuming into
+    // the pane that now answers to it.
+    const ownResumeId = (name: string): string | null | undefined => {
+        const id = resumeIdOf.get(name);
+        if (!id) return undefined;
+        return resumeIdCount.get(id) === 1 ? id : null;
+    };
     // Write down what each live session IS, while it still exists to be read.
     // tmux forgets a session the moment it ends, which is exactly when the
     // phone wants it back — and a resume must take its directory and its binary
@@ -4400,6 +4441,7 @@ export const collectSessionsVerbose = (): CollectResult => {
             label: s.label,
             runId: s.runId,
             startedAt: s.createdAt,
+            agentSessionId: ownResumeId(s.name),
         })),
     );
     return { sessions, rejected, targets, subagentTranscripts, recordable };
@@ -4887,10 +4929,10 @@ const resolveDownloadUrl = async (
 };
 
 /** A download's body, refused at the headers when it says it is over the limit. */
-const cappedBody = (res: Response): NonNullable<Response['body']> => {
-    if (Number(res.headers.get('content-length')) > DOWNLOAD_MAX_BYTES) {
+const cappedBody = (res: Response, maxBytes: number = DOWNLOAD_MAX_BYTES): NonNullable<Response['body']> => {
+    if (Number(res.headers.get('content-length')) > maxBytes) {
         void res.body?.cancel().catch(() => undefined);
-        throw new Error(`download is over the ${DOWNLOAD_MAX_BYTES}-byte limit`);
+        throw new Error(`download is over the ${maxBytes}-byte limit`);
     }
     if (!res.body) throw new Error('download had no body');
     return res.body;
@@ -4902,6 +4944,7 @@ const fetchAttachmentBytes = async (
     fileKey: string,
     ctx: { apiKey: string; baseUrl: string },
     io: AttachmentIo,
+    maxBytes: number = DOWNLOAD_MAX_BYTES,
 ): Promise<Buffer> => {
     const fetchFn = io.fetchFn ?? fetch;
     const timeoutMs = io.timeoutMs ?? ATTACHMENT_FETCH_TIMEOUT_MS;
@@ -4910,7 +4953,7 @@ const fetchAttachmentBytes = async (
     // would take the GET wherever the answer points, past the check above.
     const bin = await fetchFn(url, { signal: AbortSignal.timeout(timeoutMs), redirect: 'error' });
     if (!bin.ok) throw new Error(`download ${bin.status}`);
-    const body = cappedBody(bin);
+    const body = cappedBody(bin, maxBytes);
     // Count as it comes: a body with no length, or a false one, is not held in full.
     const chunks: Uint8Array[] = [];
     let seen = 0;
@@ -4919,9 +4962,9 @@ const fetchAttachmentBytes = async (
         const { done, value } = await reader.read();
         if (done) break;
         seen += value.length;
-        if (seen > DOWNLOAD_MAX_BYTES) {
+        if (seen > maxBytes) {
             await reader.cancel().catch(() => undefined);
-            throw new Error(`download passed the ${DOWNLOAD_MAX_BYTES}-byte limit`);
+            throw new Error(`download passed the ${maxBytes}-byte limit`);
         }
         chunks.push(value);
     }
@@ -5049,6 +5092,63 @@ export const downloadAttachments = async (
         }
     }
     return paths;
+};
+
+/** Padmé: the size a file is padded to before it is sealed (the apps' `Envelope.padme`). */
+const padme = (size: number): number => {
+    if (size < 2) return size;
+    const e = Math.floor(Math.log2(size));
+    const step = 2 ** (e - (Math.floor(Math.log2(e)) + 1));
+    return Math.ceil(size / step) * step;
+};
+
+/**
+ * The most a sealed answer file may download as: its seal's size padded, and the tag. The relay
+ * points at the bytes, so it could name a larger object; nothing past this is read.
+ */
+export const answerFileBound = (size: number | undefined): number =>
+    size !== undefined && Number.isSafeInteger(size) && size >= 0 ? Math.min(padme(size) + GCM_TAG_BYTES, DOWNLOAD_MAX_BYTES) : DOWNLOAD_MAX_BYTES;
+
+/**
+ * The attachments of a sealed answer (`hwip ask`, answer-files.ts), saved one by one to
+ * `~/.hwip/attachments/<eventId>/<name>`. Unlike a command's, a file that fails does not take the
+ * others with it: the answer is the user's word either way, and each file not saved is named with why.
+ * `sealed.files` gives each file's meta in the same order.
+ */
+export const downloadSealedEach = async (
+    eventId: string,
+    files: PushFileAttachment[],
+    ctx: { apiKey: string; baseUrl: string },
+    sealed: SealedAttachments & { files: SealedFileMeta[] },
+    io: AttachmentIo = {},
+): Promise<{ paths: string[]; missing: string[] }> => {
+    const dir = join(ATTACHMENTS_DIR, safeSegment(eventId, 'answer'));
+    const taken = new Map<string, string>();
+    const paths: string[] = [];
+    const missing: string[] = [];
+    for (const [i, f] of files.entries()) {
+        const meta = sealed.files[i];
+        const name = meta?.name || f.fileName || `file-${i}`;
+        try {
+            if (!f.fileKey) throw new Error('no fileKey');
+            const opened = await openSealedAttachment(await fetchAttachmentBytes(f.fileKey, ctx, io, answerFileBound(meta?.size)), f, sealed);
+            // Padded before sealing: cut back to the size the seal gives.
+            const bytes = meta && Number.isSafeInteger(meta.size) && meta.size >= 0 ? opened.subarray(0, meta.size) : opened;
+            mkdirHandedBack(dir);
+            const abs = attachmentPath(taken, dir, safeSegment(name, `file-${i}`), bytes);
+            if (abs === null) {
+                // The same bytes under a name already saved: said, so no file goes unaccounted for.
+                missing.push(`${name}: the same file was attached twice`);
+                continue;
+            }
+            writeFileSync(abs, bytes);
+            handBackToSudoUser(abs);
+            paths.push(abs);
+        } catch (err) {
+            missing.push(`${name}: ${(err as Error).message}`);
+        }
+    }
+    return { paths, missing };
 };
 
 const defaultDownloadAttachments = (pushId: string, files: PushFileAttachment[], sealed?: SealedAttachments): Promise<string[]> => {

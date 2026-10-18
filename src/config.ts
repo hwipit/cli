@@ -67,6 +67,28 @@ export const HERDR_SESSION_OPTIONS = {
   HERDR_BIN_PATH: '@hwip_herdr_bin',
 } as const;
 /**
+ * The env herdr gives the processes of its panes, and its native agent integrations
+ * (`herdr integration install <agent>`) read to find their pane. Under tmux an agent
+ * inherits the tmux server's global env, copied from the terminal that started the
+ * server: a herdr pane long closed, never the pane attaching now. The wrapper sets
+ * them on every session it creates (wrapper `herdrEnvArgs`).
+ */
+export const HERDR_ENV_VARS = [
+  'HERDR_ENV',
+  'HERDR_PANE_ID',
+  'HERDR_SOCKET_PATH',
+  'HERDR_BIN_PATH',
+  'HERDR_TAB_ID',
+  'HERDR_WORKSPACE_ID',
+  'HERDR_STARTUP_CWD',
+] as const;
+/**
+ * Agent kinds hwip reports to herdr itself (`HERDR_SESSION_OPTIONS`). herdr's native
+ * integration must stay silent for them: a second report on the pane replaces hwip's
+ * label, and its release drops both (measured on herdr 0.9.3).
+ */
+export const HERDR_SELF_REPORTING_KINDS: ReadonlySet<string> = new Set(['claude', 'pi']);
+/**
  * Set by `hwip sh` on the session it opens, to that session's own name. The
  * one exception to the listener's shell-pane refusal. Only a process on this
  * machine can set a tmux option, so it says the user opened the shell — but it

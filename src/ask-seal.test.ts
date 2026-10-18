@@ -418,6 +418,18 @@ describe('openAnswer', () => {
         expect(await open(response)).toEqual({ ok: true, value: 'ship it', exit: true });
     });
 
+    it('answer files: reads the sealed file list with the text, and the key that sealed it', async () => {
+        const meta = { iv: 'ZmlsZS1pdg==', name: 'shot.png', type: 'image/png', size: 3 };
+        const response = await answerFrom({ body: 'see this', answer: { ask: ASK_ID }, files: [meta] });
+        expect(await open(response, {}, undefined)).toEqual({ ok: true, value: 'see this', files: [meta], senderPublicKey: expect.any(String) });
+    });
+
+    it('answer files: takes files with no text as an answer', async () => {
+        const meta = { iv: 'ZmlsZS1pdg==', name: 'log.txt', type: 'text/plain', size: 3 };
+        const response = await answerFrom({ answer: { ask: ASK_ID }, files: [meta] });
+        expect(await open(response, {}, undefined)).toEqual({ ok: true, files: [meta], senderPublicKey: expect.any(String) });
+    });
+
     it('reads typed text alone', async () => {
         const response = await answerFrom({ body: 'run the tests', answer: { ask: ASK_ID } });
         expect(await open(response, {}, undefined)).toEqual({ ok: true, value: 'run the tests' });

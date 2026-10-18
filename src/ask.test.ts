@@ -185,6 +185,69 @@ describe('requestApproval with a sealed question', () => {
         expect(await requestApproval(OPTS, deps(fetchFn))).toEqual({ answered: true, value: 'ship it' });
     });
 
+    describe('answer files', () => {
+        const META = { iv: 'IV', name: 'shot.png', type: 'image/png', size: 3 };
+        const WIRE = [{ fileKey: 'files/9', fileName: 'file', fileType: 'application/octet-stream', fileSize: 16, iv: 'IV', deviceKeyMap: { dev_laptop: 'w' } }];
+        const withFiles = (fetchFn: typeof fetch, saveFiles: AskDeps['saveFiles']): AskDeps => ({
+            ...deps(fetchFn),
+            seal: { self: () => ({ deviceId: 'dev_laptop', publicKey: 'P' }) } as never,
+            saveFiles,
+        });
+        const answered = () => stubFetch([{ data: { status: 'responded', response: { sealed: FIELDS, respondedDeviceId: 'dev_phone', files: WIRE } } }]);
+
+        it('offers files only on an ask that takes them, and saves what the answer names after its text', async () => {
+            ready();
+            sealMock.openAnswer.mockResolvedValue({ ok: true, value: 'see this', files: [META], senderPublicKey: 'PHONE' });
+            const { fetchFn, calls } = answered();
+            const saveFiles = vi.fn(async () => ({ paths: ['/h/.hwip/attachments/evt_1/shot.png'], missing: ['log.txt: not delivered'] }));
+
+            const result = await requestApproval({ ...OPTS, acceptsExit: true, acceptsFiles: true }, withFiles(fetchFn, saveFiles));
+
+            expect(result).toEqual({
+                answered: true,
+                value: 'see this\n/h/.hwip/attachments/evt_1/shot.png',
+                files: ['/h/.hwip/attachments/evt_1/shot.png'],
+                missingFiles: ['log.txt: not delivered'],
+            });
+            expect((calls[0]!.body as { acceptsFiles?: unknown }).acceptsFiles).toBe(true);
+            expect(saveFiles).toHaveBeenCalledWith('evt_1', WIRE, [META], { deviceId: 'dev_laptop', senderPublicKey: 'PHONE' });
+        });
+
+        it('saves no file on an ask that did not take them, and says so', async () => {
+            ready();
+            sealMock.openAnswer.mockResolvedValue({ ok: true, value: 'see this', files: [META], senderPublicKey: 'PHONE' });
+            const { fetchFn, calls } = answered();
+            const saveFiles = vi.fn();
+
+            expect(await requestApproval(OPTS, withFiles(fetchFn, saveFiles)))
+                .toEqual({ answered: true, value: 'see this', missingFiles: ['shot.png: this ask does not take files'] });
+            expect((calls[0]!.body as { acceptsFiles?: unknown }).acceptsFiles).toBeUndefined();
+            expect(saveFiles).not.toHaveBeenCalled();
+        });
+
+        it('names each file when this machine has no key to open them with', async () => {
+            ready();
+            sealMock.openAnswer.mockResolvedValue({ ok: true, value: 'see this', files: [META], senderPublicKey: 'PHONE' });
+            const { fetchFn } = answered();
+            const saveFiles = vi.fn();
+
+            const result = await requestApproval({ ...OPTS, acceptsFiles: true }, { ...withFiles(fetchFn, saveFiles), seal: { self: () => null } as never });
+
+            expect(result).toEqual({ answered: true, value: 'see this', missingFiles: ['shot.png: this machine has no key'] });
+            expect(saveFiles).not.toHaveBeenCalled();
+        });
+
+        it('takes files with no text as an answer, even when none could be saved', async () => {
+            ready();
+            sealMock.openAnswer.mockResolvedValue({ ok: true, files: [META], senderPublicKey: 'PHONE' });
+            const { fetchFn } = answered();
+            const saveFiles = vi.fn(async () => ({ paths: [], missing: ['shot.png: download 403'] }));
+
+            expect(await requestApproval({ ...OPTS, acceptsFiles: true }, withFiles(fetchFn, saveFiles)))
+                .toEqual({ answered: true, value: '', missingFiles: ['shot.png: download 403'] });
+        });
+    });
+
     it('does not read a plaintext answer on a sealed question', async () => {
         ready();
         // A response with an action but no valid seal: the relay put it there.

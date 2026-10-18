@@ -110,7 +110,7 @@ import { webSocketProxyOptions } from './http-failure.js';
 import { notifyDesktop, type DesktopNotification } from './desktop-notify.js';
 import { createWorktreeCleanup } from './listener-worktree-cleanup.js';
 import { tmuxRun } from './worktree.js';
-import { chunkOf, createFileDecryptStream, DOWNLOAD_MAX_BYTES, saveStream, withIdleTimeout } from './file-crypto.js';
+import { chunkOf, createFileDecryptStream, DOWNLOAD_MAX_BYTES, GCM_TAG_BYTES, saveStream, withIdleTimeout } from './file-crypto.js';
 import { createTurnWatchers, type SendTurnFrame, type TurnWatchControl } from './turn-watch.js';
 import { diskTurnRing } from './turn-ring.js';
 import { createInputSequencer, type InputSequencer, type SequencedInput } from './input-sequencer.js';
@@ -4871,10 +4871,10 @@ const resolveDownloadUrl = async (
 };
 
 /** A download's body, refused at the headers when it says it is over the limit. */
-const cappedBody = (res: Response): NonNullable<Response['body']> => {
-    if (Number(res.headers.get('content-length')) > DOWNLOAD_MAX_BYTES) {
+const cappedBody = (res: Response, maxBytes: number = DOWNLOAD_MAX_BYTES): NonNullable<Response['body']> => {
+    if (Number(res.headers.get('content-length')) > maxBytes) {
         void res.body?.cancel().catch(() => undefined);
-        throw new Error(`download is over the ${DOWNLOAD_MAX_BYTES}-byte limit`);
+        throw new Error(`download is over the ${maxBytes}-byte limit`);
     }
     if (!res.body) throw new Error('download had no body');
     return res.body;
@@ -4886,6 +4886,7 @@ const fetchAttachmentBytes = async (
     fileKey: string,
     ctx: { apiKey: string; baseUrl: string },
     io: AttachmentIo,
+    maxBytes: number = DOWNLOAD_MAX_BYTES,
 ): Promise<Buffer> => {
     const fetchFn = io.fetchFn ?? fetch;
     const timeoutMs = io.timeoutMs ?? ATTACHMENT_FETCH_TIMEOUT_MS;
@@ -4894,7 +4895,7 @@ const fetchAttachmentBytes = async (
     // would take the GET wherever the answer points, past the check above.
     const bin = await fetchFn(url, { signal: AbortSignal.timeout(timeoutMs), redirect: 'error' });
     if (!bin.ok) throw new Error(`download ${bin.status}`);
-    const body = cappedBody(bin);
+    const body = cappedBody(bin, maxBytes);
     // Count as it comes: a body with no length, or a false one, is not held in full.
     const chunks: Uint8Array[] = [];
     let seen = 0;
@@ -4903,9 +4904,9 @@ const fetchAttachmentBytes = async (
         const { done, value } = await reader.read();
         if (done) break;
         seen += value.length;
-        if (seen > DOWNLOAD_MAX_BYTES) {
+        if (seen > maxBytes) {
             await reader.cancel().catch(() => undefined);
-            throw new Error(`download passed the ${DOWNLOAD_MAX_BYTES}-byte limit`);
+            throw new Error(`download passed the ${maxBytes}-byte limit`);
         }
         chunks.push(value);
     }
@@ -5033,6 +5034,63 @@ export const downloadAttachments = async (
         }
     }
     return paths;
+};
+
+/** Padmé: the size a file is padded to before it is sealed (the apps' `Envelope.padme`). */
+const padme = (size: number): number => {
+    if (size < 2) return size;
+    const e = Math.floor(Math.log2(size));
+    const step = 2 ** (e - (Math.floor(Math.log2(e)) + 1));
+    return Math.ceil(size / step) * step;
+};
+
+/**
+ * The most a sealed answer file may download as: its seal's size padded, and the tag. The relay
+ * points at the bytes, so it could name a larger object; nothing past this is read.
+ */
+export const answerFileBound = (size: number | undefined): number =>
+    size !== undefined && Number.isSafeInteger(size) && size >= 0 ? Math.min(padme(size) + GCM_TAG_BYTES, DOWNLOAD_MAX_BYTES) : DOWNLOAD_MAX_BYTES;
+
+/**
+ * The attachments of a sealed answer (`hwip ask`, answer-files.ts), saved one by one to
+ * `~/.hwip/attachments/<eventId>/<name>`. Unlike a command's, a file that fails does not take the
+ * others with it: the answer is the user's word either way, and each file not saved is named with why.
+ * `sealed.files` gives each file's meta in the same order.
+ */
+export const downloadSealedEach = async (
+    eventId: string,
+    files: PushFileAttachment[],
+    ctx: { apiKey: string; baseUrl: string },
+    sealed: SealedAttachments & { files: SealedFileMeta[] },
+    io: AttachmentIo = {},
+): Promise<{ paths: string[]; missing: string[] }> => {
+    const dir = join(ATTACHMENTS_DIR, safeSegment(eventId, 'answer'));
+    const taken = new Map<string, string>();
+    const paths: string[] = [];
+    const missing: string[] = [];
+    for (const [i, f] of files.entries()) {
+        const meta = sealed.files[i];
+        const name = meta?.name || f.fileName || `file-${i}`;
+        try {
+            if (!f.fileKey) throw new Error('no fileKey');
+            const opened = await openSealedAttachment(await fetchAttachmentBytes(f.fileKey, ctx, io, answerFileBound(meta?.size)), f, sealed);
+            // Padded before sealing: cut back to the size the seal gives.
+            const bytes = meta && Number.isSafeInteger(meta.size) && meta.size >= 0 ? opened.subarray(0, meta.size) : opened;
+            mkdirHandedBack(dir);
+            const abs = attachmentPath(taken, dir, safeSegment(name, `file-${i}`), bytes);
+            if (abs === null) {
+                // The same bytes under a name already saved: said, so no file goes unaccounted for.
+                missing.push(`${name}: the same file was attached twice`);
+                continue;
+            }
+            writeFileSync(abs, bytes);
+            handBackToSudoUser(abs);
+            paths.push(abs);
+        } catch (err) {
+            missing.push(`${name}: ${(err as Error).message}`);
+        }
+    }
+    return { paths, missing };
 };
 
 const defaultDownloadAttachments = (pushId: string, files: PushFileAttachment[], sealed?: SealedAttachments): Promise<string[]> => {

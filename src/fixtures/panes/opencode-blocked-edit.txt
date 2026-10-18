@@ -1,0 +1,45 @@
+
+     touch e.txt 실행합니다.
+
+     + Thought · 66ms
+
+  ┃
+  ┃  $ touch e.txt
+  ┃
+  ┃  The user declined this tool call
+  ┃
+
+     Build · Auto · 24.2s · 0.2 tok/s · interrupted
+
+  ┃
+  ┃  Use your edit tool to replace hello with goodbye in a.txt.
+  ┃
+
+     + Thought · 170ms
+
+     a.txt 내용을 확인한 뒤 hello를 goodbye로 바꿉니다.
+
+     → Explored: 1 read
+
+     + Thought · 80ms
+
+  ┃
+  ┃  ← Edit a.txt
+  ┃
+
+  ┃
+  ┃  △ Permission required
+  ┃    → Edit a.txt
+  ┃
+  ┃  1 - hello
+  ┃  1 + goodbye
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃
+  ┃   Allow once   Always allow   Reject                       ctrl+f fullscreen  ⇆ select  enter confirm
+  ┃
+

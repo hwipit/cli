@@ -13,6 +13,8 @@ import type { SealedChunk } from './turn-recorder.js';
  */
 const FIELD_SEP = '␟';
 let paneText = '';
+/** The arguments of every `capture-pane` call. */
+let captures: string[][] = [];
 /** False: the session is gone from tmux. */
 let sessionAlive = true;
 
@@ -25,7 +27,10 @@ const fakeTmux = (args: readonly string[]) => {
     }
     if (a[0] === 'list-sessions') return { status: 0, stdout: '', stderr: '' };
     if (a[0] === 'display-message') return { status: 0, stdout: ['node', 'claude', '/tmp/proj', '1234', ''].join(FIELD_SEP), stderr: '' };
-    if (a[0] === 'capture-pane') return { status: 0, stdout: paneText, stderr: '' };
+    if (a[0] === 'capture-pane') {
+        captures.push([...a]);
+        return { status: 0, stdout: paneText, stderr: '' };
+    }
     return { status: 1, stdout: '', stderr: '' };
 };
 
@@ -48,7 +53,7 @@ const fixture = (name: string): string => readFileSync(new URL(`./fixtures/panes
 const BASH = fixture('claude-blocked-bash.txt');
 const MOVED = BASH.replace('❯ 1. Yes', '  1. Yes').replace('  3. No', '❯ 3. No');
 const IDLE = fixture('claude-idle.txt');
-const ID = parseBlockedDialog(BASH)!.id;
+const ID = parseBlockedDialog(BASH, 'claude')!.id;
 
 const SEALED: SealedChunk = { body: 'sealed-body', deviceKeyMap: { phone: 'k' }, senderPublicKey: 'spk' } as SealedChunk;
 
@@ -274,6 +279,15 @@ describe('handlePush — ifPrompt', () => {
         expect(await handlePush(keyPush({ ifPrompt: ID }), d.deps as never)).toBe(true);
         expect(d.sent).toEqual([['Enter']]);
         expect(d.refusals).toEqual([]);
+    });
+
+    it('captures the pane with escapes by default, the way the prompt was read for the report', async () => {
+        paneText = BASH;
+        captures = [];
+        const d = deps(BASH, { capturePane: undefined });
+        expect(await handlePush(keyPush({ ifPrompt: ID }), d.deps as never)).toBe(true);
+        expect(captures.length).toBeGreaterThan(0);
+        expect(captures.every((c) => c.includes('-e'))).toBe(true);
     });
 
     it('refuses with prompt_changed when the highlight moved, types nothing, spends no rate limit', async () => {

@@ -18,7 +18,7 @@
  *   still be working underneath, so it must not change the state.
  *
  * Every agent here carries the same rules the server manifest publishes
- * (hwip server/src/agent-rules/manifest.json, version 2026.10.15.1 — hwip#484),
+ * (hwip server/src/agent-rules/manifest.json, version 2026.10.18.1 — hwip#532, merged and deployed before this cli ships),
  * so a listener that never reaches the endpoint classifies them too. A fetched
  * manifest replaces this bundle whole for state reports; schedules read only
  * this bundle. An agent without rules here
@@ -29,7 +29,7 @@ import { ENGINE_VERSION, type DetectionManifest } from './agent-state.js';
 
 export const DEFAULT_MANIFEST: DetectionManifest = {
     engineVersion: ENGINE_VERSION,
-    version: '2026.10.15.1',
+    version: '2026.10.18.1',
     agents: {
         claude: [
             {
@@ -183,14 +183,27 @@ export const DEFAULT_MANIFEST: DetectionManifest = {
         ],
         gemini: [
             {
-                // KNOWN GAP — `blocked` here means the folder-trust dialog,
-                // the only blocked screen that was actually captured. Gemini's
-                // tool-approval prompt is the common blocked case in practice
-                // and has NO rule: the probe session had shell auto-approved,
-                // so it never rendered. Until someone captures it, a gemini
-                // session waiting on tool approval reports `working` (the
-                // spinner rule) or `idle`, not `blocked`. Do not read the
-                // bench matrix's green `blocked` cell as full coverage.
+                // Tool approval (Shell, Edit, WriteFile), captured 2026-10-18 on
+                // Gemini CLI v0.46.0: a rounded box whose answers start with
+                // `│ ● 1. Allow once` under a boxed question line. Keyed on
+                // both, not the bare phrase, so agent text or a tool output box
+                // printing the answer row is not a dialog. The
+                // dialog draws no footer and hides the input box; 30 lines
+                // because a long diff sits between the header and the answers
+                // and a later notice box can be drawn below it.
+                id: 'gemini-blocked-tool-approval',
+                state: 'blocked',
+                priority: 900,
+                tailLines: 30,
+                regex: ['^\\s*│\\s+(?:●\\s+)?1\\.\\s+allow once'],
+                any: [
+                    { regex: ['^\\s*│ allow execution of .*\\?\\s*│$'] },
+                    { regex: ['^\\s*│ apply this change\\?\\s*│$'] },
+                ],
+                // The input box is hidden while Gemini asks; with it on screen the box is the agent's own text.
+                not: [{ contains: ['type your message'] }],
+            },
+            {
                 // Observed on Gemini CLI v0.46.0.
                 id: 'gemini-blocked-trust-dialog',
                 state: 'blocked',
@@ -213,17 +226,17 @@ export const DEFAULT_MANIFEST: DetectionManifest = {
             },
         ],
         opencode: [
-            // Hand-written from the screen strings recorded in the C136
-            // backlog row (opencode 1.18.35) and a user's permission screen
-            // (`Allow once   Always allow   Reject … enter confirm`), not
-            // from a pane capture, so the bench has no fixture for it and
-            // agent-state.test.ts pins the strings instead. The button
-            // wording differs between versions (`Allow always` vs `Always
-            // allow`), hence the rule keys on the `Permission required`
-            // title line, guarded by any button or footer string so the
-            // phrase in tool output or agent text alone is not a dialog. tailLines 30 because an edit request draws its diff
-            // between that line and the buttons. Other prompts (the agent
-            // asking a question) are not captured and report `unknown`.
+            // Written from the screen strings recorded in the C136 backlog
+            // row (opencode 1.18.35) and a user's permission screen, then
+            // checked against panes captured 2026-10-18 on opencode 2.0.29
+            // (harness bench: bash and edit requests). The button wording
+            // differs between versions (`Allow always` vs `Always allow`),
+            // hence the rule keys on the `Permission required` title line,
+            // guarded by any button or footer string so the phrase in tool
+            // output or agent text alone is not a dialog. tailLines 30
+            // because an edit request draws its diff between that line and
+            // the buttons. Other prompts (the agent asking a question) are
+            // not captured and report `unknown`.
             // No idle rule: at rest the footer is only `ctrl+p commands`,
             // which says nothing the absence of `esc interrupt` does not.
             {

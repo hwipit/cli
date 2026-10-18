@@ -805,12 +805,12 @@ export const resetSessionStates = (): void => {
     sessionStates.clear();
 };
 
-const capturePaneText = (session: string, target?: string): string | null => {
+const capturePaneText = (session: string, target?: string, escapes = false): string | null => {
     // Explicit target for the sweep (subagent rows aren't in the recorded
     // target map yet); otherwise resolve through it.
     const resolved = target ?? tmuxTargetFor(session);
     if (resolved === null) return null; // unresolvable subagent — never spawn
-    const r = spawnSync('tmux', tmuxArgs(['capture-pane', '-p', '-t', resolved, '-S', `-${STATE_CAPTURE_LINES}`]), {
+    const r = spawnSync('tmux', tmuxArgs(['capture-pane', '-p', ...(escapes ? ['-e'] : []), '-t', resolved, '-S', `-${STATE_CAPTURE_LINES}`]), {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -876,8 +876,9 @@ export const withBlockedPrompts = ({ sessions, targets }: Pick<CollectResult, 's
     const shown = sessions.map((session) => {
         const target = targets[session.name];
         if (session.parentName !== undefined || session.agentKind === 'shell' || target === undefined) return session;
-        const pane = session.state === 'blocked' ? capturePaneText(session.name, target) : null;
-        const blockedPrompt = sealer.observe(session.name, session.state, pane);
+        // With escapes: OpenCode draws its chosen button as a background colour only. `deliverInput` captures the same way.
+        const pane = session.state === 'blocked' ? capturePaneText(session.name, target, true) : null;
+        const blockedPrompt = sealer.observe(session.name, session.agentKind, session.state, pane);
         return blockedPrompt ? { ...session, blockedPrompt } : session;
     });
     sealer.prune(new Set(sessions.map((s) => s.name)));
@@ -3789,7 +3790,7 @@ const deliverInput = (input: PendingInput): void => {
     const deps: HandlePushDeps = { noteRefusal: (r) => { reason ??= r; } };
     // Before anything is spent on it: a key bound to a prompt that is gone must not
     // take a rate-limit token, and must not land on whatever is on screen now.
-    const bound = input.ifPrompt === undefined || promptStillShown(input.ifPrompt, capturePaneText(input.sessionName));
+    const bound = input.ifPrompt === undefined || promptStillShown(input.ifPrompt, capturePaneText(input.sessionName, undefined, true));
     if (!bound) reason = 'prompt_changed';
     const injected = bound && hasStream(input.sessionName)
         // Stream input arrives on this listener's own subscription: addressed.
@@ -5464,7 +5465,7 @@ const handlePushInner = async (
 
     // A command bound to a blocked prompt types only while that prompt is on screen. Checked
     // before anything is downloaded or typed, and before the rate limit is spent.
-    if (push.ifPrompt !== undefined && !promptStillShown(push.ifPrompt, (deps.capturePane ?? capturePaneText)(push.agentSessionName))) {
+    if (push.ifPrompt !== undefined && !promptStillShown(push.ifPrompt, deps.capturePane ? deps.capturePane(push.agentSessionName) : capturePaneText(push.agentSessionName, undefined, true))) {
         log(`! ${push.agentSessionName}: the blocked prompt this command answers is gone — drop`);
         deps.noteRefusal?.('prompt_changed');
         return false;

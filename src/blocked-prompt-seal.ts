@@ -14,8 +14,9 @@
  * out: the session reports the bare `blocked` state, as it did before. Nothing
  * here logs the dialog text, the plaintext or the ciphertext.
  */
-import { parseBlockedDialog, promptPlaintext } from './blocked-prompt.js';
+import { parseBlockedDialog, promptPlaintext, showsPrompt } from './blocked-prompt.js';
 import type { AgentState } from './agent-state.js';
+import type { AgentKind } from './remote-agents.js';
 import type { RecorderRecipient, SealedChunk } from './turn-recorder.js';
 
 /** What the session report carries: the server stores it and never opens it. */
@@ -55,7 +56,7 @@ interface Entry {
 
 export interface PromptSealer {
     /** The sealed prompt for this session's screen, or undefined (not blocked, not a known dialog, not sealed yet). */
-    observe: (name: string, state: AgentState | undefined, paneText: string | null) => BlockedPromptWire | undefined;
+    observe: (name: string, kind: AgentKind, state: AgentState | undefined, paneText: string | null) => BlockedPromptWire | undefined;
     /** Forget sessions that are gone. */
     prune: (live: ReadonlySet<string>) => void;
     /** Settles when the seals running now are done, or undefined when none is. */
@@ -89,8 +90,8 @@ export const createPromptSealer = (deps: PromptSealerDeps): PromptSealer => {
     };
 
     return {
-        observe: (name, state, paneText) => {
-            const parsed = state === 'blocked' && paneText !== null ? parseBlockedDialog(paneText) : undefined;
+        observe: (name, kind, state, paneText) => {
+            const parsed = state === 'blocked' && paneText !== null ? parseBlockedDialog(paneText, kind) : undefined;
             if (!parsed) {
                 entries.delete(name);
                 return undefined;
@@ -122,6 +123,9 @@ export const createPromptSealer = (deps: PromptSealerDeps): PromptSealer => {
     };
 };
 
-/** True when the pane shows the prompt `id` right now (a fresh capture, not the one a report was made from). */
+/**
+ * True when the pane shows the prompt `id` right now (a fresh capture, not the one a report was made from). Capture it
+ * the way `observe` was fed (`-e`): OpenCode's highlight is in the escapes, and the id with it.
+ */
 export const promptStillShown = (id: string, paneText: string | null): boolean =>
-    paneText !== null && parseBlockedDialog(paneText)?.id === id;
+    paneText !== null && showsPrompt(id, paneText);

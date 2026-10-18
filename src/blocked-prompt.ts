@@ -1,12 +1,17 @@
 /**
- * What a blocked Claude Code session is waiting for, read off its screen.
+ * What a blocked agent session is waiting for, read off its screen.
  *
  * The state detector (`agent-state.ts`) only says "blocked". The app wants to
  * draw the question: which tool, which command, which answers. This module
- * reads the approval dialog at the bottom of the pane into that summary. Pure:
- * the listener owns tmux, sealing and timing (`blocked-prompt-seal.ts`).
+ * reads the approval dialog at the bottom of the pane into that summary, with a
+ * reader per agent kind (`parseBlockedDialog`). Pure: the listener owns tmux,
+ * sealing and timing (`blocked-prompt-seal.ts`).
  *
- * Layout read (Claude Code, captured from a live session; see the fixtures in
+ * The pane may carry terminal escapes (`tmux capture-pane -e`): OpenCode marks its
+ * chosen button with a background colour only. Every other reader works on the
+ * text with them stripped, so its ids are those of a plain capture.
+ *
+ * Claude Code layout (captured from a live session; see the fixtures in
  * `blocked-prompt.test.ts`):
  *
  *     ─────────────  full-width rule: the dialog starts below the last one
@@ -27,8 +32,20 @@
  * Only the titles in `KNOWN_TITLES` are read. Another dialog (a plan, a
  * question to the user, an MCP tool) has no captured layout, so it yields
  * nothing and the session keeps reporting the bare `blocked` state.
+ *
+ * Gemini CLI layout (v0.46.0, `blocked-prompt-gemini.test.ts`): one rounded box,
+ * a `? <Tool>  <summary>` header (a right-aligned `N of M` when approvals queue),
+ * the command or diff in a nested box, the question, then `●`-highlighted
+ * numbered answers. No footer.
+ *
+ * pi has no approval dialog of its own; extensions that gate tools ask through
+ * `ctx.ui.select` (`parsePiSelect`, `blocked-prompt-pi.test.ts`).
+ *
+ * OpenCode (v2.0.29, `blocked-prompt-opencode.test.ts`): a `┃` panel, `△ Permission required`, the request, and a
+ * row of buttons whose chosen one is told apart by background colour only (`parseOpencodePermission`).
  */
 import { createHash } from 'node:crypto';
+import type { AgentKind } from './remote-agents.js';
 
 /** Dialog titles whose layout was captured and is read. */
 export const KNOWN_TITLES: readonly string[] = ['Bash command', 'Edit file', 'Create file'];
@@ -90,8 +107,8 @@ const idOf = (region: readonly string[]): string => createHash('sha256').update(
 const keysFor = (from: number, to: number): string[] =>
     [...Array(Math.abs(to - from)).fill(to > from ? 'down' : 'up'), 'enter'];
 
-/** The dialog at the bottom of `pane`, or undefined when it is not one this module reads. */
-export const parseBlockedDialog = (pane: string): ParsedPrompt | undefined => {
+/** Claude Code's dialog at the bottom of `pane`, or undefined when it is not one this module reads. */
+const parseClaudeDialog = (pane: string): ParsedPrompt | undefined => {
     const lines = pane.split('\n').map((l) => l.trimEnd());
     // The question is the last "…?" line whose next non-blank line is option 1.
     let qAt = -1;
@@ -131,11 +148,6 @@ export const parseBlockedDialog = (pane: string): ParsedPrompt | undefined => {
             return undefined;
         }
     }
-    if (options.length < 2 || options.length > MAX_OPTIONS) return undefined;
-    if (!options.every((o, i) => o.n === i + 1)) return undefined;
-    const selected = options.findIndex((o) => o.selected);
-    if (selected < 0 || options.filter((o) => o.selected).length !== 1) return undefined;
-
     // Above the question: title, subtitle, dashed rule, detail, dashed rule, note.
     const head = region.slice(0, q);
     const title = head.find((l) => l.trim() !== '')?.trim();
@@ -149,25 +161,336 @@ export const parseBlockedDialog = (pane: string): ParsedPrompt | undefined => {
     while (detailLines.length > 0 && detailLines[detailLines.length - 1]!.trim() === '') detailLines.pop();
     const after = secondDash < 0 ? [] : rest.slice(secondDash + 1).map((l) => l.trim()).filter(Boolean);
 
-    const prompt: ParsedPrompt = {
-        id: idOf(region),
+    return assemble({
+        region,
         title,
-        detail: detailLines.slice(0, MAX_DETAIL_LINES).map((l) => cut(l, MAX_DETAIL_LINE_CHARS)),
-        question: cut(region[q]!.trim(), MAX_LABEL_CHARS),
+        subtitle: before.join(' '),
+        detail: detailLines,
+        note: after.join(' '),
+        question: region[q]!.trim(),
+        options,
+    });
+};
+
+// CSI sequences (colours and the rest) and OSC ones (OSC 8 hyperlinks, ended by BEL or ST): what `-e` adds.
+const ESCAPES = /\u001b\[[0-?]*[ -/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g;
+/** `pane` without terminal escapes: what `capture-pane` without `-e` gives. */
+export const stripEscapes = (pane: string): string => pane.replace(ESCAPES, '');
+
+/** The inside of a line drawn as `│ … │`, without its one-space padding; undefined for any other line. */
+const boxed = (line: string): string | undefined => {
+    const t = line.trim();
+    if (t.length < 2 || !t.startsWith('│') || !t.endsWith('│')) return undefined;
+    return t.slice(1, -1).replace(/^ /, '').trimEnd();
+};
+
+/** `lines` without blank lines at either end. */
+const trimBlank = (lines: readonly string[]): string[] => {
+    let from = 0;
+    let to = lines.length;
+    while (from < to && lines[from]!.trim() === '') from++;
+    while (to > from && lines[to - 1]!.trim() === '') to--;
+    return lines.slice(from, to);
+};
+
+/** `lines` without the indent they all share. */
+const dedent = (lines: readonly string[]): string[] => {
+    const indent = Math.min(...lines.filter((l) => l.trim() !== '').map((l) => l.length - l.trimStart().length));
+    return Number.isFinite(indent) ? lines.map((l) => l.slice(indent)) : [...lines];
+};
+
+const GEMINI_OPTION = /^([●\s])\s*(\d{1,2})\.\s+(\S.*)$/;
+const GEMINI_HEADER = /^\?\s+(\S.*)$/;
+const GEMINI_QUEUE = /\s{2,}\d+ of \d+$/;
+
+/** Gemini CLI's tool approval box, or undefined. */
+const parseGeminiDialog = (pane: string): ParsedPrompt | undefined => {
+    const lines = pane.split('\n').map((l) => l.trimEnd());
+    // The question is the last boxed "…?" line whose next non-blank boxed line is option 1.
+    let qAt = -1;
+    for (let i = lines.length - 2; i >= 0 && qAt < 0; i--) {
+        const q = boxed(lines[i]!);
+        if (q === undefined || !q.endsWith('?') || q.startsWith('│')) continue;
+        for (let j = i + 1; j < lines.length; j++) {
+            const next = boxed(lines[j]!);
+            if (next === undefined) break;
+            if (next === '') continue;
+            if (GEMINI_OPTION.exec(next)?.[2] === '1') qAt = i;
+            break;
+        }
+    }
+    if (qAt < 0) return undefined;
+
+    // Up to the box's top border, down to its bottom one.
+    let top = qAt - 1;
+    while (top >= 0 && boxed(lines[top]!) !== undefined) top--;
+    if (top < 0 || !lines[top]!.trim().startsWith('╭')) return undefined;
+    let end = qAt + 1;
+    while (end < lines.length && boxed(lines[end]!) !== undefined) end++;
+    if (end >= lines.length || !lines[end]!.trim().startsWith('╰')) return undefined;
+    // Gemini hides its input box while it asks: only blank lines and other boxes (a notice) may follow. The same box
+    // drawn in the agent's own text sits above the input box, and is not a dialog.
+    for (const line of lines.slice(end + 1)) {
+        const t = line.trim();
+        if (t !== '' && !t.startsWith('╭') && !t.startsWith('╰') && boxed(line) === undefined) return undefined;
+    }
+
+    const header = GEMINI_HEADER.exec(boxed(lines[top + 1]!)!.replace(GEMINI_QUEUE, ''));
+    if (!header) return undefined;
+    const [title, ...rest] = header[1]!.split(/\s{2,}/);
+    const subtitle = rest.join(' ').trim();
+
+    const options: { n: number; label: string; selected: boolean }[] = [];
+    for (const line of lines.slice(qAt + 1, end)) {
+        const text = boxed(line)!;
+        if (text === '') continue;
+        const m = GEMINI_OPTION.exec(text);
+        if (m) {
+            options.push({ n: Number(m[2]), label: m[3]!.trim(), selected: m[1] === '●' });
+        } else if (options.length > 0 && /^\s{4,}\S/.test(text)) {
+            const last = options[options.length - 1]!;
+            last.label = `${last.label} ${text.trim()}`;
+        } else {
+            return undefined;
+        }
+    }
+
+    // Between header and question: the nested box holds the command or diff; any other text is a note.
+    const detailLines: string[] = [];
+    const noteLines: string[] = [];
+    for (const line of lines.slice(top + 2, qAt)) {
+        const text = boxed(line)!;
+        if (text.startsWith('╭') || text.startsWith('╰')) continue;
+        const inner = boxed(text);
+        if (inner !== undefined) detailLines.push(inner);
+        else if (text.trim() !== '') noteLines.push(text.trim());
+    }
+    const detail = dedent(trimBlank(detailLines));
+
+    return assemble({
+        region: lines.slice(top, end + 1),
+        title: title!.trim(),
+        subtitle,
+        detail,
+        note: noteLines.join(' '),
+        question: boxed(lines[qAt]!)!.trim(),
+        options,
+    });
+};
+
+const PI_FOOTER = /^ ↑↓ navigate {2}\S.* select {2}\S.* cancel$/;
+const PI_OPTION = /^ (→| ) (\S.*)$/;
+const PI_COUNTDOWN = / \(\d+s\)$/;
+
+/**
+ * pi's `ctx.ui.select` dialog (`ExtensionSelectorComponent`), which approval extensions draw: a free title between
+ * full-width rules, unnumbered answers with `→` on the highlighted one, a `↑↓ navigate  … select  … cancel` footer.
+ * Title, question and detail come from the title's lines: first, last, and what is between.
+ */
+const parsePiSelect = (pane: string): ParsedPrompt | undefined => {
+    const lines = pane.split('\n').map((l) => l.trimEnd());
+    let footer = -1;
+    for (let i = lines.length - 1; i >= 0 && footer < 0; i--) if (PI_FOOTER.test(lines[i]!)) footer = i;
+    if (footer < 0) return undefined;
+    let top = -1;
+    for (let i = footer - 1; i >= 0 && top < 0; i--) if (FULL_RULE.test(lines[i]!)) top = i;
+    if (top < 0) return undefined;
+    // The select takes the editor's place, so one rule follows it. The same text in the agent's own output sits
+    // above the editor, which brings its two rules.
+    if (lines.slice(footer + 1).filter((l) => FULL_RULE.test(l)).length > 1) return undefined;
+
+    // The answers sit right above the footer's gap, with a gap above them too.
+    let last = footer - 1;
+    while (last > top && lines[last] === '') last--;
+    let first = last;
+    while (first - 1 > top && PI_OPTION.test(lines[first - 1]!)) first--;
+    if (first - 1 <= top || lines[first - 1] !== '') return undefined;
+    const options: { n: number; label: string; selected: boolean }[] = [];
+    for (const line of lines.slice(first, last + 1)) {
+        const m = PI_OPTION.exec(line);
+        if (!m) return undefined;
+        options.push({ n: options.length + 1, label: m[2]!.trim(), selected: m[1] === '→' });
+    }
+
+    // A select with a timeout redraws its title's end as ` (12s)` every second: not part of the prompt or its id.
+    for (let i = first - 1; i > top; i--) {
+        if (lines[i] === '') continue;
+        lines[i] = lines[i]!.replace(PI_COUNTDOWN, '');
+        break;
+    }
+    const text = trimBlank(lines.slice(top + 1, first).map((l) => l.replace(/^ /, '')));
+    if (text.length === 0) return undefined;
+
+    return assemble({
+        region: lines.slice(top, footer + 1),
+        title: text[0]!.trim(),
+        detail: dedent(trimBlank(text.slice(1, -1))),
+        question: text[text.length - 1]!.trim(),
+        options,
+    });
+};
+
+// One SGR sequence and its parameters; any other escape is dropped without changing the background.
+const SGR = /^\u001b\[([0-9;:]*)m/;
+const ANY_ESCAPE = new RegExp(`^(?:${ESCAPES.source})`);
+
+/** `line` without escapes, and the background each of its UTF-16 units is drawn on ('7' = reverse video). */
+const withBackground = (line: string): { text: string; bg: string[] } => {
+    let text = '';
+    const bg: string[] = [];
+    let current = '';
+    let reverse = false;
+    for (let i = 0; i < line.length;) {
+        const sgr = SGR.exec(line.slice(i));
+        if (sgr) {
+            const p = sgr[1] === '' ? ['0'] : sgr[1]!.split(/[;:]/);
+            for (let j = 0; j < p.length; j++) {
+                const code = Number(p[j]);
+                if (code === 0) { current = ''; reverse = false; }
+                else if (code === 7) reverse = true;
+                else if (code === 27) reverse = false;
+                else if (code === 49) current = '';
+                else if ((code >= 40 && code <= 47) || (code >= 100 && code <= 107)) current = String(code);
+                else if (code === 38 || code === 48 || code === 58) {
+                    const span = p[j + 1] === '2' ? 3 : p[j + 1] === '5' ? 1 : 0;
+                    if (code === 48) current = p.slice(j, j + 2 + span).join(';');
+                    j += 1 + span;
+                }
+            }
+            i += sgr[0].length;
+            continue;
+        }
+        const other = ANY_ESCAPE.exec(line.slice(i));
+        if (other) { i += other[0].length; continue; }
+        text += line[i];
+        bg.push(reverse ? '7' : current);
+        i++;
+    }
+    return { text, bg };
+};
+
+const OPENCODE_BAR = '┃';
+const OPENCODE_HEADER = /^\s*△ Permission required$/;
+const OPENCODE_HINTS = /ctrl\+|⇆|enter confirm/;
+const OPENCODE_SUBTITLE = /^→ (\S.*)$/;
+
+/**
+ * OpenCode's permission request: `△ Permission required` in a `┃` panel, the request (a `$ command`, or `→ Edit file`
+ * over its diff), then a row of buttons `Allow once   Always allow   Reject` beside `… enter confirm`. The chosen
+ * button differs from the others only by its background, so this reads the pane with its escapes: a plain capture
+ * yields nothing. Left/right move the choice; the dialog draws no question, so the question is a fixed one.
+ */
+const parseOpencodePermission = (pane: string): ParsedPrompt | undefined => {
+    const rows = pane.split('\n').map(withBackground);
+    // Text after the panel bar, with the bar's column, for every row drawn in the panel.
+    const inPanel = (row: { text: string }): number => {
+        const at = row.text.indexOf(OPENCODE_BAR);
+        return at >= 0 && row.text.slice(0, at).trim() === '' ? at + 1 : -1;
+    };
+    let head = -1;
+    for (let i = rows.length - 1; i >= 0 && head < 0; i--) {
+        const at = inPanel(rows[i]!);
+        if (at >= 0 && OPENCODE_HEADER.test(rows[i]!.text.slice(at).trimEnd())) head = i;
+    }
+    if (head < 0) return undefined;
+    // The panel's last row with the key hints is the button row: a request that prints the hint text sits above it.
+    let end = head + 1;
+    while (end < rows.length && inPanel(rows[end]!) >= 0) end++;
+    let bar = -1;
+    for (let i = end - 1; i > head && bar < 0; i--) {
+        if (/⇆ select +enter confirm/.test(rows[i]!.text)) bar = i;
+    }
+    if (bar < 0) return undefined;
+
+    // The buttons: runs of text split by two or more spaces, up to the first key hint.
+    const row = rows[bar]!;
+    const from = inPanel(row);
+    const options: { n: number; label: string; selected: boolean }[] = [];
+    const lit: string[] = [];
+    for (const m of row.text.slice(from).matchAll(/\S+(?: \S+)*/g)) {
+        if (OPENCODE_HINTS.test(m[0])) break;
+        options.push({ n: options.length + 1, label: m[0], selected: false });
+        lit.push(row.bg[from + m.index!]!);
+    }
+    // The chosen button: the one background no other button shares, the rest all alike. A theme drawing it in
+    // reverse video (or anything else) is not a captured layout.
+    if (lit.includes('7')) return undefined;
+    const odd = lit.filter((bg) => lit.filter((other) => other === bg).length === 1);
+    if (odd.length !== 1 || new Set(lit).size !== 2) return undefined;
+    const selected = lit.indexOf(odd[0]!);
+    options[selected]!.selected = true;
+
+    const body = rows.slice(head + 1, bar).map((r) => r.text.slice(inPanel(r)).trimEnd());
+    const first = body.findIndex((l) => l.trim() !== '');
+    const sub = first < 0 ? null : OPENCODE_SUBTITLE.exec(body[first]!.trim());
+    const detail = dedent(trimBlank(sub ? body.slice(first + 1) : body));
+
+    return assemble({
+        region: rows.slice(head, bar + 1).map((r) => r.text.trimEnd()),
+        title: 'Permission required',
+        ...(sub ? { subtitle: sub[1]!.trim() } : {}),
+        detail,
+        question: 'Allow this request?',
+        options,
+        keys: (at, to) => [...Array(Math.abs(to - at)).fill(to > at ? 'right' : 'left'), 'enter'],
+        idSalt: `opencode:selected=${selected}`,
+    });
+};
+
+/** The checks and caps every reader shares: numbering 1..n, one highlight, label and detail limits. */
+const assemble = (d: {
+    region: readonly string[];
+    title: string;
+    subtitle?: string;
+    detail: readonly string[];
+    note?: string;
+    question: string;
+    options: readonly { n: number; label: string; selected: boolean }[];
+    /** Keys from the highlighted option to option `to`; up/down by default. */
+    keys?: (from: number, to: number) => string[];
+    /** Folded into the id when the highlight is not in the region's text. */
+    idSalt?: string;
+}): ParsedPrompt | undefined => {
+    const { options } = d;
+    if (!d.title || options.length < 2 || options.length > MAX_OPTIONS) return undefined;
+    if (!options.every((o, i) => o.n === i + 1)) return undefined;
+    const selected = options.findIndex((o) => o.selected);
+    if (selected < 0 || options.filter((o) => o.selected).length !== 1) return undefined;
+    const keys = d.keys ?? keysFor;
+    const prompt: ParsedPrompt = {
+        id: idOf(d.idSalt === undefined ? d.region : [...d.region, d.idSalt]),
+        title: cut(d.title, MAX_LABEL_CHARS),
+        detail: d.detail.slice(0, MAX_DETAIL_LINES).map((l) => cut(l, MAX_DETAIL_LINE_CHARS)),
+        question: cut(d.question, MAX_LABEL_CHARS),
         options: options.map((o, i) => ({
             n: o.n,
             label: cut(o.label, MAX_LABEL_CHARS),
-            keys: keysFor(selected, i),
+            keys: keys(selected, i),
             ...(PERSISTENT.test(o.label) ? { persistent: true as const } : {}),
         })),
     };
-    if (before.length > 0) prompt.subtitle = cut(before.join(' '), MAX_LABEL_CHARS);
-    if (after.length > 0) prompt.note = cut(after.join(' '), MAX_LABEL_CHARS);
-    if (detailLines.length > MAX_DETAIL_LINES || detailLines.some((l) => l.length > MAX_DETAIL_LINE_CHARS)) {
+    if (d.subtitle) prompt.subtitle = cut(d.subtitle, MAX_LABEL_CHARS);
+    if (d.note) prompt.note = cut(d.note, MAX_LABEL_CHARS);
+    if (d.detail.length > MAX_DETAIL_LINES || d.detail.some((l) => l.length > MAX_DETAIL_LINE_CHARS)) {
         prompt.detailTruncated = true;
     }
     return prompt;
 };
+
+/** One reader per agent kind whose approval dialog was captured. Each takes the pane as captured, escapes and all. */
+const READERS: Partial<Record<AgentKind, (pane: string) => ParsedPrompt | undefined>> = {
+    claude: (pane) => parseClaudeDialog(stripEscapes(pane)),
+    gemini: (pane) => parseGeminiDialog(stripEscapes(pane)),
+    pi: (pane) => parsePiSelect(stripEscapes(pane)),
+    opencode: parseOpencodePermission,
+};
+
+/** The approval dialog at the bottom of `pane`, read the way `kind` draws it; undefined when it is not one of those. */
+export const parseBlockedDialog = (pane: string, kind: AgentKind): ParsedPrompt | undefined => READERS[kind]?.(pane);
+
+/** True when some reader finds the prompt `id` on `pane`: an id hashes the exact dialog, so the kind need not be known. */
+export const showsPrompt = (id: string, pane: string): boolean =>
+    Object.values(READERS).some((read) => read(pane)?.id === id);
 
 /** What the app opens: the prompt plus which session and listener it belongs to, and when it was first seen. */
 export interface PromptPlaintext {

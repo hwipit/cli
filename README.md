@@ -646,9 +646,13 @@ transcript, then forgotten. A session that has been quiet for a long time keeps 
 state while its transcript exists, so nothing already sent is sent again (an OpenCode
 session, which has no file to check, for 30 days).
 
-When a session waits for your approval (a Bash command, a file edit or a new file),
-the listener also sends what it is waiting for — the tool, the command or the diff,
-and the numbered answers — so the app can show it and answer. It is sealed the same
+When a session waits for your approval, the listener also sends what it is waiting
+for — the tool, the command or the diff, and the answers — so the app can show it
+and answer. That covers Claude Code (a Bash command, a file edit or a new file),
+Gemini CLI (its tool approvals), OpenCode (its permission request; the listener reads
+the screen with its colours, since only a colour marks the chosen button) and pi
+approval extensions that ask through `ctx.ui.select`. Codex's approval dialog is not
+read yet. It is sealed the same
 way as a chunk, for the same pinned devices, and turned off by the same
 `--no-turn-history`; the server stores ciphertext only. Other dialogs (a plan, a
 question, a trust prompt) send nothing beyond the state. An answer the app sends is

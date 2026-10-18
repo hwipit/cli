@@ -1129,7 +1129,7 @@ describe('hostile relay — a sealed REST command', () => {
             const keys: string[][] = [];
             const reasons: string[] = [];
             return {
-                id: parseBlockedDialog(BASH)!.id,
+                id: parseBlockedDialog(BASH, 'claude')!.id,
                 typed, keys, reasons,
                 deps: {
                     ...deps,
@@ -1832,7 +1832,7 @@ describe('hostile relay — a plaintext command to a listener that only seals', 
     it('should refuse plain keys bound to a prompt just the same', async () => {
         const { parseBlockedDialog } = await import('./blocked-prompt.js');
         const { rig, deps, plain, keys, reports } = await sealedOnlyListener();
-        const ifPrompt = parseBlockedDialog(BLOCKED)?.id;
+        const ifPrompt = parseBlockedDialog(BLOCKED, 'claude')?.id;
 
         expect(await rig.listener.handlePush(plain({ keys: ['enter'], ifPrompt }), deps)).toBe(false);
         expect(keys).toEqual([]);
@@ -1843,7 +1843,7 @@ describe('hostile relay — a plaintext command to a listener that only seals', 
         const { parseBlockedDialog } = await import('./blocked-prompt.js');
         const { rig, deps, plain, typed, reports } = await sealedOnlyListener();
 
-        expect(await rig.listener.handlePush(plain({ body: 'y', ifPrompt: parseBlockedDialog(BLOCKED)?.id }), deps)).toBe(false);
+        expect(await rig.listener.handlePush(plain({ body: 'y', ifPrompt: parseBlockedDialog(BLOCKED, 'claude')?.id }), deps)).toBe(false);
 
         expect(typed).toEqual([]);
         expect(reports).toEqual([expect.objectContaining({ reason: 'e2ee_required' })]);

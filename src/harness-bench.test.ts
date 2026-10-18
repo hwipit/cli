@@ -74,7 +74,13 @@ interface BenchCase {
  * and folder-trust dialogs at startup, the prompt at rest, and a turn up to the
  * point the server refused it for credits — the client draws its working line
  * before that answer, and the prompt at rest again after the refusal. No tool
- * ever ran, so the tool-approval dialog is still uncaptured.
+ * ever ran, so the tool-approval dialog is still uncaptured. Gemini's tool
+ * approvals captured 2026-10-18, same version and way, in a scratch git
+ * directory; the files keep the dialog box and what is drawn below it. pi
+ * 1.2.0 with the bundled permission-gate example extension (`pi -e`), same day.
+ * OpenCode 2.0.29 permission requests the same day and way, with `bash: ask` in
+ * the scratch project's `opencode.json`; each also kept with escapes (`.ansi.txt`)
+ * for `blocked-prompt-opencode.test.ts`.
  */
 const CASES: readonly BenchCase[] = [
     { agent: 'claude', expected: 'working', fixture: 'claude-working.txt', screen: 'spinner with elapsed time + token counter' },
@@ -90,9 +96,15 @@ const CASES: readonly BenchCase[] = [
     { agent: 'codex', expected: 'idle', fixture: 'codex-idle-after-failed-turn.txt', screen: 'at rest after a refused turn' },
     { agent: 'gemini', expected: 'working', fixture: 'gemini-working.txt', screen: 'Thinking… spinner with cancel hint' },
     { agent: 'gemini', expected: 'blocked', fixture: 'gemini-blocked-trust-dialog.txt', screen: 'folder trust dialog' },
+    { agent: 'gemini', expected: 'blocked', fixture: 'gemini-blocked-shell.txt', screen: 'Shell tool approval' },
+    { agent: 'gemini', expected: 'blocked', fixture: 'gemini-blocked-edit.txt', screen: 'Edit tool approval with its diff' },
+    { agent: 'gemini', expected: 'blocked', fixture: 'gemini-blocked-writefile-stacked.txt', screen: 'queued WriteFile approval under a notice box' },
     { agent: 'gemini', expected: 'idle', fixture: 'gemini-idle.txt', screen: 'input box at rest' },
+    { agent: 'opencode', expected: 'blocked', fixture: 'opencode-blocked-permission.txt', screen: 'bash permission request' },
+    { agent: 'opencode', expected: 'blocked', fixture: 'opencode-blocked-edit.txt', screen: 'edit permission request with its diff' },
     { agent: 'pi', expected: 'working', fixture: 'pi-working.txt', screen: 'Working spinner in the editor border' },
     { agent: 'pi', expected: 'blocked', fixture: 'pi-blocked.txt', screen: 'ask_user_question picker' },
+    { agent: 'pi', expected: 'blocked', fixture: 'pi-blocked-permission-gate.txt', screen: 'ctx.ui.select approval (permission-gate example)' },
     { agent: 'pi', expected: 'idle', fixture: 'pi-idle.txt', screen: 'fresh session at rest' },
 ];
 
@@ -181,7 +193,7 @@ describe('harness bench — bundled rules vs real panes', () => {
  * the cli. A floor that lags the merged version is harmless — it only ever
  * blocks a bundle bump, never a fetch.
  */
-const PUBLISHED_FLOOR = '2026.10.15.1';
+const PUBLISHED_FLOOR = '2026.10.18.1';
 
 describe('bundled manifest vs published manifest', () => {
     it('does not outrank what the endpoint serves', () => {

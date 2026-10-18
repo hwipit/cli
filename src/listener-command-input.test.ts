@@ -575,7 +575,7 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
         const shown = readFileSync(new URL('./fixtures/panes/claude-blocked-bash.txt', import.meta.url), 'utf-8');
         // The same dialog with the highlight on "No": a different prompt, whatever its text says.
         const moved = shown.replace('❯ 1. Yes', '  1. Yes').replace('  3. No', '❯ 3. No');
-        const id = parseBlockedDialog(shown)!.id;
+        const id = parseBlockedDialog(shown, 'claude')!.id;
 
         it('types while the pane still shows that prompt', () => {
             openStream('hwip-a');
@@ -583,6 +583,10 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
             handleCommandInput(input({ keys: ['down', 'enter'], ifPrompt: id }), send);
             expect(injections()).toEqual(['-t %0 Down Enter']);
             expect(rejections()).toEqual([]);
+            // Captured with escapes, the way the prompt was read for the report.
+            const captures = tmuxCalls.filter((c) => c[0] === 'capture-pane');
+            expect(captures.length).toBeGreaterThan(0);
+            expect(captures.every((c) => c.includes('-e'))).toBe(true);
         });
 
         it('refuses with prompt_changed once the highlight has moved, and types nothing', () => {
@@ -683,7 +687,7 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
         describe('ifPrompt inside the envelope', () => {
             const shown = readFileSync(new URL('./fixtures/panes/claude-blocked-bash.txt', import.meta.url), 'utf-8');
             const moved = shown.replace('❯ 1. Yes', '  1. Yes').replace('  3. No', '❯ 3. No');
-            const id = parseBlockedDialog(shown)!.id;
+            const id = parseBlockedDialog(shown, 'claude')!.id;
 
             it('types while the prompt is shown, and refuses once it has changed', async () => {
                 await openE2eeStream(await hostKey());

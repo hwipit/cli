@@ -1,0 +1,9 @@
+{
+  "hooks": {
+    // log every prompt
+    "pre_user_prompt": [{ "command": "./log.sh" }],
+    "post_cascade_response": [
+      { "command": "./my-log.sh", "show_output": true }, // mine
+    ],
+  },
+}

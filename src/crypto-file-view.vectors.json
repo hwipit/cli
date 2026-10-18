@@ -1,0 +1,18 @@
+{
+  "context" : "hwip-app",
+  "deviceKeys" : {
+    "privateKey" : "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUCGgAY6+naqw/aBJ+8KS4LlJQgPpNcmYHGg0eESyOKWhRANCAATS3U6CFYPNw0ALz3w6pRt9fPqravd5A5WNn4phuEkBx0HvhEnr/nqGXZaigFjJm3BhmP8MZa4GvGBcXDBGJvDF",
+    "publicKey" : "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0t1OghWDzcNAC898OqUbfXz6q2r3eQOVjZ+KYbhJAcdB74RJ6/56hl2WooBYyZtwYZj/DGWuBrxgXFwwRibwxQ=="
+  },
+  "envelope" : {
+    "ciphertext" : "LUjX8fc3dJqx38RAOuV8zImGSNs97xEApRnm+1ZoDR1sdU7Piuyy/C9gkj1989jxuPxfRZFtsx24x9mWxKV/tEj+j+7iO696TTl9HLsYxwXpTs4E",
+    "iv" : "3d1rYOh+/Oho3shl",
+    "salt" : "I9uSRQf/ZUe7BGZmPL7+ReZfoAbr5AtJgCiltSgpvnQ=",
+    "senderPublicKey" : "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEwd3WD2tfO6x4eCGPrlxBSJj06cn0heX5oYlAPy9356M5Rn+pJCwVKJpTBj2+kRG6P4xai32pVzCUz9Qek+FPLw==",
+    "v" : 2
+  },
+  "fingerprint" : "c3c1 5ac8 2cc0 b841 520c c1e6 d8c1 a29f",
+  "note" : "Sealed by the iOS app's Envelope.sealV2 (CryptoKit) for a synthetic listener key. Regenerate with EnvelopeV2Tests.writesTheCliFileViewVector in the Hwip iOS app (HwipKit).",
+  "plaintext" : "{\"kind\":\"tree.request\",\"path\":\"src\",\"requestId\":\"fv-vector-1\",\"v\":1}",
+  "purpose" : "session.diff"
+}

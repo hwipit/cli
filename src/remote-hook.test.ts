@@ -1,0 +1,407 @@
+import { describe, expect, it, beforeEach, afterEach, afterAll, vi } from 'vitest';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { projectHash } from './gate.js';
+import { writeRemoteMarker } from './listener.js';
+import { isRemoteHookAgent, runRemoteHook, remoteEntrySections } from './remote-hook.js';
+
+// config.ts binds ~/.hwip/config.json to $HOME at import time, so HOME moves
+// BEFORE the imports run (vi.hoisted) — the same real-$HOME seam cli.test.ts
+// uses, without a module mock. The dir is created/removed around the suite.
+const HOME = vi.hoisted(() => {
+    const saved = process.env.HOME;
+    process.env.HOME = `${process.env.TMPDIR || '/tmp'}/hwip-remote-hook-home-${process.pid}`;
+    return { dir: process.env.HOME, saved };
+});
+const CONFIG_FILE = `${HOME.dir}/.hwip/config.json`;
+/** ~/.hwip/config.json as `hwip setup` leaves it; no id = a notify-only install. */
+const writeConfig = (hookId?: string): void => {
+    mkdirSync(`${HOME.dir}/.hwip`, { recursive: true });
+    writeFileSync(CONFIG_FILE, JSON.stringify({ apiKey: 'k', ...(hookId ? { hookId } : {}) }));
+};
+afterAll(() => {
+    if (HOME.saved === undefined) delete process.env.HOME;
+    else process.env.HOME = HOME.saved;
+    rmSync(HOME.dir, { recursive: true, force: true });
+});
+
+/**
+ * TS twin of plugin/tests/test-hwip-remote.sh — same scenarios, same
+ * expected behavior. Markers are written through the real writer
+ * (listener.ts writeRemoteMarker), so every match test is a full
+ * write→read roundtrip: a parity break between the two sides fails here.
+ */
+/** The entry note minus the generated core it carries — the cli-authored prose only. */
+const stripCoreSections = (ctx: string): string => ctx.replace(remoteEntrySections(), '');
+
+describe('runRemoteHook (ADR-0002, gemini/codex)', () => {
+    let stateHome: string;
+    let savedXdg: string | undefined;
+
+    const NOW = 1_700_000_000_000;
+    const at = (msAgo: number) => () => NOW - msAgo;
+
+    beforeEach(() => {
+        stateHome = mkdtempSync(join(tmpdir(), 'hwip-remote-hook-'));
+        savedXdg = process.env.XDG_STATE_HOME;
+        process.env.XDG_STATE_HOME = stateHome;
+        rmSync(CONFIG_FILE, { force: true });
+    });
+
+    afterEach(() => {
+        if (savedXdg === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = savedXdg;
+        rmSync(stateHome, { recursive: true, force: true });
+    });
+
+    const markerPath = (cwd: string): string =>
+        join(stateHome, 'hwip', `remote-${projectHash(cwd)!}`);
+
+    const stdin = (prompt: string, cwd: string): string =>
+        JSON.stringify({ session_id: 's-1', hook_event_name: 'x', prompt, cwd });
+
+    const TWO_WAY = { HWIP_HOOK_ID: 'hook_123' } as NodeJS.ProcessEnv;
+    const ONE_WAY = {} as NodeJS.ProcessEnv;
+
+    const contextOf = (out: string | null): string => {
+        expect(out).not.toBeNull();
+        const parsed = JSON.parse(out!) as {
+            hookSpecificOutput: { hookEventName: string; additionalContext: string };
+        };
+        return parsed.hookSpecificOutput.additionalContext;
+    };
+
+    it('fresh marker + matching prompt → REMOTE context, marker consumed (gemini)', () => {
+        const cwd = '/proj/gemini-happy';
+        writeRemoteMarker(cwd, 'fix the login bug', () => NOW);
+        const out = runRemoteHook('gemini', stdin('fix the login bug', cwd), TWO_WAY, () => NOW);
+        const parsed = JSON.parse(out!) as { hookSpecificOutput: { hookEventName: string } };
+        expect(parsed.hookSpecificOutput.hookEventName).toBe('BeforeAgent');
+        expect(contextOf(out)).toContain('REMOTE mode');
+        expect(existsSync(markerPath(cwd))).toBe(false);
+    });
+
+    it('pi echoes its own hookEventName', () => {
+        const cwd = '/proj/pi-happy';
+        writeRemoteMarker(cwd, 'fix the login bug', () => NOW);
+        const out = runRemoteHook('pi', stdin('fix the login bug', cwd), TWO_WAY, () => NOW);
+        const parsed = JSON.parse(out!) as { hookSpecificOutput: { hookEventName: string } };
+        expect(parsed.hookSpecificOutput.hookEventName).toBe('before_agent_start');
+    });
+
+    it('codex echoes its own hookEventName', () => {
+        const cwd = '/proj/codex-happy';
+        writeRemoteMarker(cwd, 'check the deploy', () => NOW);
+        const out = runRemoteHook('codex', stdin('check the deploy', cwd), TWO_WAY, () => NOW);
+        const parsed = JSON.parse(out!) as { hookSpecificOutput: { hookEventName: string } };
+        expect(parsed.hookSpecificOutput.hookEventName).toBe('UserPromptSubmit');
+    });
+
+    it('HWIP_HOOK_ID unset → one-way conversion CTA, no two-way claim', () => {
+        const cwd = '/proj/oneway';
+        writeRemoteMarker(cwd, 'check the deploy status', () => NOW);
+        const ctx = contextOf(runRemoteHook('gemini', stdin('check the deploy status', cwd), ONE_WAY, () => NOW));
+        expect(ctx).toContain('npx @hwip/cli setup');
+        expect(ctx).not.toContain('end EVERY response');
+        expect(existsSync(markerPath(cwd))).toBe(false);
+    });
+
+    it('HWIP_HOOK_ID unset but hookId in config.json → two-way, state recorded', () => {
+        const cwd = '/proj/config-only';
+        writeConfig('hook_cfg');
+        writeRemoteMarker(cwd, 'from the phone, config only', () => NOW);
+        const ctx = contextOf(runRemoteHook('gemini', stdin('from the phone, config only', cwd), ONE_WAY, () => NOW));
+        expect(ctx).toContain('end EVERY response');
+        expect(ctx).not.toContain('npx @hwip/cli setup');
+        expect(existsSync(statePath(cwd))).toBe(true);
+    });
+
+    it('unresolved ${HWIP_HOOK_ID} placeholder → treated as unset (one-way when config has no id)', () => {
+        const cwd = '/proj/placeholder';
+        writeConfig();
+        writeRemoteMarker(cwd, 'placeholder in env', () => NOW);
+        const env = { HWIP_HOOK_ID: '${HWIP_HOOK_ID}' } as NodeJS.ProcessEnv;
+        const ctx = contextOf(runRemoteHook('gemini', stdin('placeholder in env', cwd), env, () => NOW));
+        expect(ctx).toContain('npx @hwip/cli setup');
+        expect(ctx).not.toContain('end EVERY response');
+    });
+
+    it('state alive, env unset, hookId in config.json → a terminal turn still ends REMOTE', () => {
+        const cwd = '/proj/sticky-config';
+        writeConfig('hook_cfg');
+        seedState(cwd);
+        const ctx = contextOf(runRemoteHook('gemini', stdin('typed at the terminal', cwd), ONE_WAY, () => NOW));
+        expect(ctx).toContain('LEFT sticky REMOTE mode');
+        expect(existsSync(statePath(cwd))).toBe(false);
+    });
+
+    // Same reason as the preambles (see rules-sync.test.ts): the agents that run
+    // this hook read the renumbered CLI core, so a CORE_RULES number injected
+    // here names a rule their own file numbers differently.
+    it('injected context names rules, never numbers', () => {
+        const remote = '/proj/no-numbers-remote';
+        writeRemoteMarker(remote, 'from the phone', () => NOW);
+        const entry = contextOf(runRemoteHook('gemini', stdin('from the phone', remote), TWO_WAY, () => NOW));
+        const exited = '/proj/no-numbers-exit';
+        seedState(exited);
+        const exit = contextOf(runRemoteHook('gemini', stdin('typed at the terminal', exited), TWO_WAY, () => NOW));
+        for (const ctx of [entry, exit]) {
+            // The core sections the entry note carries keep their own numbering
+            // (they are the generated core, verbatim); only cli-authored prose is checked.
+            expect(stripCoreSections(ctx)).not.toMatch(/\b[Rr]ules?\s+\d+/);
+        }
+    });
+
+    // The static rule file of a prompt-hook agent carries the NORMAL branch
+    // only (templates.ts PROMPT_HOOK_CORE), so the turn that enters REMOTE is
+    // where the contract has to arrive in full — the twin of the plugin's
+    // hwip-remote.sh reading CORE_RULES.md on entry.
+    it('entering REMOTE from NORMAL injects the REMOTE contract in full', () => {
+        const cwd = '/proj/entry-contract';
+        writeRemoteMarker(cwd, 'from the phone', () => NOW);
+        const ctx = contextOf(runRemoteHook('gemini', stdin('from the phone', cwd), TWO_WAY, () => NOW));
+        for (const heading of ['When hwip_ask is MANDATORY', 'Sticky REMOTE mode', 'When to use AskUserQuestion vs hwip_ask']) {
+            expect(ctx).toContain(`### ${heading}`);
+        }
+        // Every rule number the injected text cites is a rule it carries.
+        const carried = new Set([...ctx.matchAll(/^(\d+)\. /gm)].map((m) => m[1]));
+        for (const ref of ctx.matchAll(/\b[Rr]ules?\s+(\d+(?:(?:,\s*|\s+and\s+)\d+)*)/g)) {
+            for (const n of ref[1].split(/,\s*|\s+and\s+/)) expect(carried, `Rule ${n}`).toContain(n);
+        }
+    });
+
+    it('a phone prompt on a session already in REMOTE gets the note without the contract', () => {
+        const cwd = '/proj/entry-repeat';
+        seedState(cwd);
+        writeRemoteMarker(cwd, 'again from the phone', () => NOW);
+        const ctx = contextOf(runRemoteHook('gemini', stdin('again from the phone', cwd), TWO_WAY, () => NOW));
+        expect(ctx).toContain('REMOTE mode');
+        expect(ctx).not.toContain('### Sticky REMOTE mode');
+    });
+
+    // pi's before_agent_start can replace the system prompt for the run, and that
+    // change is not persisted — the contract vanishes with REMOTE instead of
+    // riding every later turn of the session as an injected message would.
+    it('pi carries the contract in systemPrompt on every phone prompt, never in the note', () => {
+        const systemPromptOf = (out: string | null): string | undefined =>
+            (JSON.parse(out!) as { hookSpecificOutput: { systemPrompt?: string } }).hookSpecificOutput.systemPrompt;
+        const cwd = '/proj/pi-system-prompt';
+        writeRemoteMarker(cwd, 'from the phone', () => NOW);
+        const entry = runRemoteHook('pi', stdin('from the phone', cwd), TWO_WAY, () => NOW);
+        expect(contextOf(entry)).toContain('REMOTE mode');
+        expect(contextOf(entry)).not.toContain('### Sticky REMOTE mode');
+        expect(systemPromptOf(entry)).toBe(remoteEntrySections());
+        writeRemoteMarker(cwd, 'again from the phone', () => NOW);
+        const again = runRemoteHook('pi', stdin('again from the phone', cwd), TWO_WAY, () => NOW);
+        expect(systemPromptOf(again)).toBe(remoteEntrySections()); // every run, not only entry
+        expect(contextOf(again)).not.toContain('### Sticky REMOTE mode');
+        // gemini gets no systemPrompt field: its hook cannot carry one.
+        const cwd2 = '/proj/gemini-no-system-prompt';
+        writeRemoteMarker(cwd2, 'from the phone', () => NOW);
+        expect(systemPromptOf(runRemoteHook('gemini', stdin('from the phone', cwd2), TWO_WAY, () => NOW))).toBeUndefined();
+    });
+
+    it('one-way entry never carries the two-way contract', () => {
+        const cwd = '/proj/entry-one-way';
+        writeRemoteMarker(cwd, 'from the phone', () => NOW);
+        const ctx = contextOf(runRemoteHook('pi', stdin('from the phone', cwd), ONE_WAY, () => NOW));
+        expect(ctx).not.toContain('### Sticky REMOTE mode');
+    });
+
+    it('text mismatch → silent, marker kept (terminal race cannot false-match)', () => {
+        const cwd = '/proj/mismatch';
+        writeRemoteMarker(cwd, 'the phone message', () => NOW);
+        expect(runRemoteHook('gemini', stdin('something typed at the terminal', cwd), TWO_WAY, () => NOW)).toBeNull();
+        expect(existsSync(markerPath(cwd))).toBe(true);
+    });
+
+    it('still matches at 10 min (mid-turn queueing survives the window)', () => {
+        const cwd = '/proj/longturn';
+        writeRemoteMarker(cwd, 'sent during a long turn', at(600_000));
+        expect(runRemoteHook('gemini', stdin('sent during a long turn', cwd), TWO_WAY, () => NOW)).not.toBeNull();
+    });
+
+    it('stale marker (>15 min) → silent, marker deleted', () => {
+        const cwd = '/proj/stale';
+        writeRemoteMarker(cwd, 'old command', at(1_000_000));
+        expect(runRemoteHook('gemini', stdin('old command', cwd), TWO_WAY, () => NOW)).toBeNull();
+        expect(existsSync(markerPath(cwd))).toBe(false);
+    });
+
+    it('muted project → silent, marker left unconsumed (mute rule)', () => {
+        const cwd = '/proj/muted';
+        writeRemoteMarker(cwd, 'while muted', () => NOW);
+        writeFileSync(join(stateHome, 'hwip', `muted-${projectHash(cwd)!}`), '');
+        expect(runRemoteHook('gemini', stdin('while muted', cwd), TWO_WAY, () => NOW)).toBeNull();
+        expect(existsSync(markerPath(cwd))).toBe(true);
+    });
+
+    it('no marker → silent no-op', () => {
+        expect(runRemoteHook('gemini', stdin('any prompt', '/proj/none'), TWO_WAY, () => NOW)).toBeNull();
+    });
+
+    it('whitespace-padded prompt still matches (trim mirrors the writer)', () => {
+        const cwd = '/proj/trim';
+        writeRemoteMarker(cwd, 'run the tests', () => NOW);
+        expect(runRemoteHook('gemini', stdin('  run the tests\n', cwd), TWO_WAY, () => NOW)).not.toBeNull();
+    });
+
+    it('multi-line prompt matches byte-for-byte', () => {
+        const cwd = '/proj/multiline';
+        const text = 'first line\nsecond line';
+        writeRemoteMarker(cwd, text, () => NOW);
+        expect(runRemoteHook('gemini', stdin(text, cwd), TWO_WAY, () => NOW)).not.toBeNull();
+    });
+
+    it('trailing U+00A0 NBSP survives the trim on both sides', () => {
+        const cwd = '/proj/nbsp';
+        const text = 'nbsp end ';
+        writeRemoteMarker(cwd, text, () => NOW);
+        // NBSP is part of the digest: the exact text matches …
+        expect(runRemoteHook('gemini', stdin(text, cwd), TWO_WAY, () => NOW)).not.toBeNull();
+        // … and the NBSP-stripped variant must NOT. This is the ambiguous
+        // case, not a terminal turn: a fresh marker the prompt failed to match
+        // means a phone message is still in flight, so the hook stays silent,
+        // keeps the marker for a later prompt, and leaves REMOTE alone.
+        writeRemoteMarker(cwd, text, () => NOW);
+        expect(runRemoteHook('gemini', stdin('nbsp end', cwd), TWO_WAY, () => NOW)).toBeNull();
+        expect(existsSync(markerPath(cwd))).toBe(true);
+        expect(existsSync(statePath(cwd))).toBe(true);
+    });
+
+    it('malformed marker content → silent, no crash, and the junk is swept', () => {
+        const cwd = '/proj/garbage';
+        mkdirSync(join(stateHome, 'hwip'), { recursive: true });
+        writeFileSync(markerPath(cwd), 'not-a-timestamp junk\n');
+        expect(runRemoteHook('gemini', stdin('whatever', cwd), TWO_WAY, () => NOW)).toBeNull();
+        expect(existsSync(markerPath(cwd))).toBe(false);
+    });
+
+    // C114 review: the marker's time is a plain number of at most 12 digits too (plugin hwip_age_sec).
+    it('a marker whose time has more than 12 digits is junk: swept, and the prompt counts as typed at the keyboard', () => {
+        const cwd = '/proj/long-time';
+        mkdirSync(join(stateHome, 'hwip'), { recursive: true });
+        const digest = 'a'.repeat(64);
+        writeFileSync(markerPath(cwd), `000${Math.floor(NOW / 1000)} ${digest}\n`);
+        expect(runRemoteHook('gemini', stdin('whatever', cwd), TWO_WAY, () => NOW)).toBeNull();
+        expect(existsSync(markerPath(cwd))).toBe(false);
+    });
+
+    it('empty prompt / missing cwd / invalid JSON → silent no-op', () => {
+        const cwd = '/proj/empty';
+        writeRemoteMarker(cwd, 'phone text', () => NOW);
+        expect(runRemoteHook('gemini', stdin('', cwd), TWO_WAY, () => NOW)).toBeNull();
+        expect(runRemoteHook('gemini', JSON.stringify({ prompt: 'phone text' }), TWO_WAY, () => NOW)).toBeNull();
+        expect(runRemoteHook('gemini', 'not json', TWO_WAY, () => NOW)).toBeNull();
+        expect(existsSync(markerPath(cwd))).toBe(true);
+    });
+
+    // Sticky REMOTE, same three scenarios as the bash twin's
+    // "[sticky state alive…]" blocks in plugin/tests/test-hwip-remote.sh.
+
+    const statePath = (cwd: string): string =>
+        join(stateHome, 'hwip', `remote-active-${projectHash(cwd)!}`);
+
+    const seedState = (cwd: string, secondsAgo = 0): void => {
+        mkdirSync(join(stateHome, 'hwip'), { recursive: true });
+        writeFileSync(statePath(cwd), `${Math.floor(NOW / 1000) - secondsAgo}\n`);
+    };
+
+    it('entering REMOTE records the state so later turns keep it', () => {
+        const cwd = '/proj/enter';
+        writeRemoteMarker(cwd, 'start from the phone', () => NOW);
+        runRemoteHook('gemini', stdin('start from the phone', cwd), TWO_WAY, () => NOW);
+        expect(existsSync(statePath(cwd))).toBe(true);
+    });
+
+    // No marker means the user's own keyboard — a phone answer comes back as a
+    // tool_result and never reaches a prompt hook. So they are back, and the
+    // session leaves REMOTE instead of answering the terminal with a phone loop.
+    it('state alive but no marker → the exit note, and the state is cleared', () => {
+        const cwd = '/proj/sticky';
+        seedState(cwd);
+        const ctx = contextOf(runRemoteHook('gemini', stdin('typed at the terminal', cwd), TWO_WAY, () => NOW));
+        expect(ctx).toContain('LEFT sticky REMOTE mode');
+        expect(ctx).not.toContain('arrived from the user');
+        expect(existsSync(statePath(cwd))).toBe(false);
+        // Said once: with the state gone, later terminal turns cost nothing.
+        expect(runRemoteHook('gemini', stdin('and another one', cwd), TWO_WAY, () => NOW)).toBeNull();
+    });
+
+    // Ambiguous evidence: the digest missing does not mean the user typed —
+    // the message may be queued behind a long turn, or the two sides may hash
+    // a composition differently. Dropping REMOTE strands a user still on the
+    // phone, so the mode is left exactly as it was.
+    it('fresh marker left unmatched → silent, and REMOTE survives', () => {
+        const cwd = '/proj/sticky-pending';
+        seedState(cwd);
+        writeRemoteMarker(cwd, 'the phone message', () => NOW);
+        expect(runRemoteHook('gemini', stdin('not the injected text', cwd), TWO_WAY, () => NOW)).toBeNull();
+        expect(existsSync(statePath(cwd))).toBe(true);
+        expect(existsSync(markerPath(cwd))).toBe(true);
+    });
+
+    it('empty prompt with a marker pending → no evidence, REMOTE survives', () => {
+        const cwd = '/proj/sticky-empty';
+        seedState(cwd);
+        writeRemoteMarker(cwd, 'the phone message', () => NOW);
+        expect(runRemoteHook('gemini', stdin('', cwd), TWO_WAY, () => NOW)).toBeNull();
+        expect(existsSync(statePath(cwd))).toBe(true);
+    });
+
+    it('stale marker on a live session → still a terminal turn, REMOTE ends', () => {
+        const cwd = '/proj/sticky-stale-marker';
+        seedState(cwd);
+        writeRemoteMarker(cwd, 'old phone text', () => NOW - 1_000_000);
+        const ctx = contextOf(runRemoteHook('gemini', stdin('typed at the terminal', cwd), TWO_WAY, () => NOW));
+        expect(ctx).toContain('LEFT sticky REMOTE mode');
+        expect(existsSync(statePath(cwd))).toBe(false);
+        expect(existsSync(markerPath(cwd))).toBe(false);
+    });
+
+    it('a phone message after that re-enters REMOTE', () => {
+        const cwd = '/proj/sticky-reentry';
+        seedState(cwd);
+        runRemoteHook('gemini', stdin('typed at the terminal', cwd), TWO_WAY, () => NOW);
+        writeRemoteMarker(cwd, 'back on the phone', () => NOW);
+        const ctx = contextOf(runRemoteHook('gemini', stdin('back on the phone', cwd), TWO_WAY, () => NOW));
+        expect(ctx).toContain('arrived from the user');
+        expect(existsSync(statePath(cwd))).toBe(true);
+    });
+
+    it('state past the TTL → silent, and the state is swept', () => {
+        const cwd = '/proj/sticky-stale';
+        seedState(cwd, 20_000);
+        expect(runRemoteHook('gemini', stdin('much later', cwd), TWO_WAY, () => NOW)).toBeNull();
+        expect(existsSync(statePath(cwd))).toBe(false);
+    });
+
+    it('state alive but muted → silent (mute outranks)', () => {
+        const cwd = '/proj/sticky-muted';
+        seedState(cwd);
+        writeFileSync(join(stateHome, 'hwip', `muted-${projectHash(cwd)!}`), '');
+        expect(runRemoteHook('gemini', stdin('anything', cwd), TWO_WAY, () => NOW)).toBeNull();
+        expect(existsSync(statePath(cwd))).toBe(true);
+    });
+
+    it('state alive but no HWIP_HOOK_ID → silent (no hwip_ask to remind about)', () => {
+        const cwd = '/proj/sticky-oneway';
+        seedState(cwd);
+        expect(runRemoteHook('gemini', stdin('typed at the terminal', cwd), ONE_WAY, () => NOW)).toBeNull();
+        expect(existsSync(statePath(cwd))).toBe(true);
+    });
+});
+
+describe('isRemoteHookAgent', () => {
+    it('accepts exactly the agents whose hooks the cli installs', () => {
+        expect(isRemoteHookAgent('gemini')).toBe(true);
+        expect(isRemoteHookAgent('codex')).toBe(true);
+        expect(isRemoteHookAgent('pi')).toBe(true);
+        // opencode's plugin API has no verified injection path (v1) — the
+        // command must reject it, not silently serve a dead hook.
+        expect(isRemoteHookAgent('opencode')).toBe(false);
+        expect(isRemoteHookAgent('cc')).toBe(false);
+        expect(isRemoteHookAgent('')).toBe(false);
+    });
+});

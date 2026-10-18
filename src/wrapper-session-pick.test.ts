@@ -1,0 +1,219 @@
+/**
+ * Which tmux session `hwip cc` lands in.
+ *
+ * The rule that matters is not "pick a free name" — it is that no session in
+ * the `hwip-<project>` family may become unreachable. A session nobody can get
+ * back to still holds a live agent process (a Claude Code CLI plus its whole
+ * MCP fleet, 250-550MB measured), so an unreachable one is memory the user
+ * cannot see and cannot reclaim.
+ *
+ * tmux is faked wholesale, as in listener-session-forget.test.ts: what is under
+ * test is the pick, not tmux.
+ */
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+/** session name → attached, as tmux would report it right now. */
+let live = new Map<string, boolean>();
+/** Every tmux argv the pick issued — the spawn budget is part of the contract. */
+let calls: string[][] = [];
+/** When false, `tmux list-sessions` fails the way it does with no server up. */
+let serverUp = true;
+
+const fakeTmux = (args: readonly string[]) => {
+    calls.push([...args]);
+    if (args[0] === 'list-sessions') {
+        if (!serverUp) return { status: 1, stdout: '', stderr: 'no server running' };
+        const stdout = [...live].map(([name, att]) => `${att ? 1 : 0} ${name}`).join('\n');
+        return { status: 0, stdout, stderr: '' };
+    }
+    if (args[0] === 'has-session') {
+        return { status: live.has(args[2] ?? '') ? 0 : 1, stdout: '', stderr: '' };
+    }
+    if (args[0] === 'list-clients') {
+        return { status: 0, stdout: live.get(args[2] ?? '') ? '/dev/ttys001' : '', stderr: '' };
+    }
+    return { status: 1, stdout: '', stderr: '' };
+};
+
+vi.mock('child_process', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('child_process')>();
+    return {
+        ...actual,
+        spawnSync: (cmd: string, args?: readonly string[]) =>
+            cmd === 'tmux' ? fakeTmux(args ?? []) : { status: 1, stdout: '', stderr: '' },
+    };
+});
+
+const { findAvailableSession } = await import('./wrapper.js');
+
+const sessions = (spec: Record<string, 'attached' | 'detached'>): void => {
+    live = new Map(Object.entries(spec).map(([n, s]) => [n, s === 'attached']));
+};
+
+beforeEach(() => {
+    live = new Map();
+    calls = [];
+    serverUp = true;
+});
+
+describe('findAvailableSession', () => {
+    it('creates the base name when the family is empty', () => {
+        expect(findAvailableSession('hwip-foo')).toBe('hwip-foo');
+    });
+
+    it('creates the base name when no tmux server is running', () => {
+        serverUp = false;
+        expect(findAvailableSession('hwip-foo')).toBe('hwip-foo');
+    });
+
+    it('reattaches a detached base', () => {
+        sessions({ 'hwip-foo': 'detached' });
+        expect(findAvailableSession('hwip-foo')).toBe('hwip-foo');
+    });
+
+    it('opens an independent session when the base is attached', () => {
+        sessions({ 'hwip-foo': 'attached' });
+        expect(findAvailableSession('hwip-foo')).toBe('hwip-foo-2');
+    });
+
+    it('reattaches a detached suffix rather than opening a third session', () => {
+        sessions({ 'hwip-foo': 'attached', 'hwip-foo-2': 'detached' });
+        expect(findAvailableSession('hwip-foo')).toBe('hwip-foo-2');
+    });
+
+    it('skips past a whole attached family', () => {
+        sessions({ 'hwip-foo': 'attached', 'hwip-foo-2': 'attached' });
+        expect(findAvailableSession('hwip-foo')).toBe('hwip-foo-3');
+    });
+
+    // The stranding case. Once the base is detached the old scan returned it and
+    // never looked further, so `hwip-foo-2` could not be reached by any future
+    // `hwip cc` — not after the base was used and exited (the base is then
+    // missing, and a missing base is taken fresh), not ever. Draining the
+    // highest detached suffix first is what makes the tail reachable again.
+    it('reattaches the highest detached suffix, not the detached base', () => {
+        sessions({ 'hwip-foo': 'detached', 'hwip-foo-2': 'detached' });
+        expect(findAvailableSession('hwip-foo')).toBe('hwip-foo-2');
+    });
+
+    it('leaves the base reachable on the next run once the tail is drained', () => {
+        sessions({ 'hwip-foo': 'detached' });
+        expect(findAvailableSession('hwip-foo')).toBe('hwip-foo');
+    });
+
+    it('prefers a detached session over a free name in a gap', () => {
+        sessions({ 'hwip-foo': 'attached', 'hwip-foo-3': 'detached' });
+        expect(findAvailableSession('hwip-foo')).toBe('hwip-foo-3');
+    });
+
+    it('ignores sessions of other projects that share a name prefix', () => {
+        sessions({ 'hwip-foobar': 'detached', 'hwip-foo-bar': 'detached' });
+        expect(findAvailableSession('hwip-foo')).toBe('hwip-foo');
+    });
+
+    it('handles a project name containing spaces', () => {
+        sessions({ 'hwip-my app': 'attached', 'hwip-my app-2': 'detached' });
+        expect(findAvailableSession('hwip-my app')).toBe('hwip-my app-2');
+    });
+
+    // Documented fallback, unreachable in practice: 20 attached sessions for
+    // one project. Nothing is free and nothing is detached, so the base is
+    // returned and `tmux new -A` joins a session someone else is looking at.
+    // Recorded so the family is not mistaken for exhaustively safe.
+    it('falls back to the base when all 20 of the family are attached', () => {
+        const all: Record<string, 'attached'> = { 'hwip-foo': 'attached' };
+        for (let i = 2; i <= 20; i++) all[`hwip-foo-${i}`] = 'attached';
+        sessions(all);
+        expect(findAvailableSession('hwip-foo')).toBe('hwip-foo');
+    });
+
+    // The pick runs on every `hwip cc`, on a box that may already be thrashing.
+    // One spawn for the whole family, not two per candidate name.
+    it('asks tmux exactly once', () => {
+        sessions({ 'hwip-foo': 'attached', 'hwip-foo-2': 'attached', 'hwip-foo-3': 'detached' });
+        findAvailableSession('hwip-foo');
+        expect(calls).toHaveLength(1);
+        expect(calls[0][0]).toBe('list-sessions');
+    });
+});
+
+/**
+ * Which AGENT the slot is running.
+ *
+ * `tmux new -A` attaches to an existing session and drops the command it was
+ * handed, so reusing a detached claude session for `hwip pi` put the user in
+ * front of claude with pi never started — and the registry row for the slot
+ * then said claude, which is how an ended pi run stopped being findable at all.
+ */
+describe('findAvailableSession — agent of the detached slot', () => {
+    /** The registry as this machine wrote it: session name → agent kind. */
+    const recorded = (spec: Record<string, string>) => (name: string) =>
+        spec[name] ? { agentKind: spec[name] } : null;
+
+    it('skips a detached session running a different agent', () => {
+        sessions({ 'hwip-api': 'detached' });
+
+        expect(findAvailableSession('hwip-api', 'pi', recorded({ 'hwip-api': 'claude' })))
+            .toBe('hwip-api-2');
+    });
+
+    it('reuses a detached session running the same agent', () => {
+        sessions({ 'hwip-api': 'detached' });
+
+        expect(findAvailableSession('hwip-api', 'pi', recorded({ 'hwip-api': 'pi' })))
+            .toBe('hwip-api');
+    });
+
+    it('takes the highest detached slot that runs this agent', () => {
+        sessions({ 'hwip-api': 'detached', 'hwip-api-2': 'detached', 'hwip-api-3': 'detached' });
+
+        expect(
+            findAvailableSession(
+                'hwip-api',
+                'pi',
+                recorded({ 'hwip-api': 'pi', 'hwip-api-2': 'pi', 'hwip-api-3': 'claude' }),
+            ),
+        ).toBe('hwip-api-2');
+    });
+
+    it('reuses a slot this machine has no record of', () => {
+        // No listener ever swept it, so nothing knows what runs there. Refusing
+        // these would break the ordinary reattach for anyone not running the
+        // daemon — the pre-existing behaviour is the safe answer.
+        sessions({ 'hwip-api': 'detached' });
+
+        expect(findAvailableSession('hwip-api', 'pi', recorded({}))).toBe('hwip-api');
+    });
+
+    it('reuses any detached slot when the caller names no agent', () => {
+        sessions({ 'hwip-api': 'detached' });
+
+        expect(findAvailableSession('hwip-api', undefined, recorded({ 'hwip-api': 'claude' })))
+            .toBe('hwip-api');
+    });
+});
+
+describe('findAvailableSession — the family is full', () => {
+    const recorded = (spec: Record<string, string>) => (name: string) =>
+        spec[name] ? { agentKind: spec[name] } : null;
+
+    const fullFamily = (kind: string) => {
+        const all: Record<string, 'attached' | 'detached'> = { 'hwip-api': 'attached' };
+        for (let i = 2; i <= 20; i++) all[`hwip-api-${i}`] = 'attached';
+        sessions(all);
+        return recorded(
+            Object.fromEntries(Object.keys(all).map((n) => [n, kind])),
+        );
+    };
+
+    it('starts a name past the family rather than attaching to another agent', () => {
+        // `tmux new -A` on a taken name attaches and drops the command, so the
+        // historical `base` answer would put the user in claude with pi never
+        // started — the failure this whole path exists to prevent.
+        expect(findAvailableSession('hwip-api', 'pi', fullFamily('claude'))).toBe('hwip-api-21');
+    });
+
+    it('still falls back to the base name when it runs this agent', () => {
+        expect(findAvailableSession('hwip-api', 'pi', fullFamily('pi'))).toBe('hwip-api');
+    });
+});

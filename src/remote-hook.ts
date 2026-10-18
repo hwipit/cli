@@ -1,0 +1,239 @@
+/**
+ * `hwip remote-hook <agent>` — prompt-submit hook handler for agents whose
+ * hooks the cli installs directly: Gemini CLI (BeforeAgent), Codex CLI
+ * (UserPromptSubmit), and Pi (before_agent_start, consumed by the hwip
+ * extension itself). TS twin of the Claude Code plugin's
+ * hooks/hwip-remote.sh (ADR-0002).
+ *
+ * The listener records every phone→pane text injection as a one-shot
+ * marker (`remote-<hash>` in the hwip state dir) holding the epoch second
+ * and sha256 of the injected text. When the submitted prompt matches that
+ * record — same project (cksum of the cwd), fresh (≤15 min), and
+ * byte-identical trimmed text — the hook emits additionalContext telling
+ * the model the user is driving the session from their phone, which enters
+ * sticky REMOTE mode.
+ *
+ * Detection is exact: a terminal keystroke racing a phone message can
+ * never false-match. Parity with the writer (listener.ts writeRemoteMarker)
+ * is by construction — both sides share gate.ts remoteDigest/remoteMarkerPath.
+ *
+ * The marker is one-shot, but REMOTE is not: entry records the mode (gate.ts
+ * touchRemoteActive) so it outlives the entry turn and survives compaction.
+ * A prompt that reaches this hook without a marker was typed at the terminal —
+ * the only way text becomes a prompt without one is the user's own keyboard,
+ * since a phone answer to a hwip_ask comes back as a tool_result and never
+ * reaches a prompt hook. The user is back, so the mode ends here (gate.ts
+ * clearRemoteActive) and the hook says so once.
+ *
+ * No marker and no live state → null (silent no-op); this hook only ever adds
+ * context and must never block a prompt.
+ */
+import { readFileSync, unlinkSync } from 'fs';
+import { resolveHookId } from './config.js';
+import { coreSection } from './core-sections.js';
+import { HWIP_CORE_HOOK_DRIVEN } from './hwip-core.generated.js';
+import {
+  clearRemoteActive,
+  isMuted,
+  isRemoteActive,
+  projectHash,
+  remoteDigest,
+  remoteMarkerPath,
+  touchRemoteActive,
+} from './gate.js';
+
+/** Agents whose prompt-submit hooks this command serves. Claude Code is
+ *  NOT here — its hook ships with the plugin (hooks/hwip-remote.sh). */
+export const REMOTE_HOOK_AGENTS = ['gemini', 'codex', 'pi'] as const;
+export type RemoteHookAgent = (typeof REMOTE_HOOK_AGENTS)[number];
+
+/** Per-agent hookEventName echoed back in hookSpecificOutput — each CLI
+ *  validates it against the event that invoked the hook. */
+const HOOK_EVENT_NAME: Record<RemoteHookAgent, string> = {
+  gemini: 'BeforeAgent',
+  codex: 'UserPromptSubmit',
+  pi: 'before_agent_start',
+};
+
+/**
+ * Freshness window (seconds), same as the bash reader: deliberately
+ * generous — false positives are already impossible without an exact hash
+ * match; its only job is to stop the SAME text typed at the terminal much
+ * later from re-flagging. It must survive the real gap between injection
+ * and prompt submit (a message sent mid-turn queues until the turn ends).
+ */
+const FRESH_WINDOW_SEC = 900;
+
+const TWO_WAY_CONTEXT = `# System note (Hwip remote-origin detect)
+
+This user message arrived from the user's phone via Hwip agent chat (verified by the listener — exact text match). The user is driving this session remotely and is NOT at the terminal. Enter sticky REMOTE mode now (the "Sticky REMOTE mode" rule in your Hwip rules): end EVERY response with \`hwip_ask\` (buttons + free-text) until the user exits — an exit signal (done/stop/exit), or a prompt they type at the terminal, which this hook will tell you about. Plain-text questions are invisible to them.`;
+
+// The static rule file of these agents carries the NORMAL branch only
+// (templates.ts PROMPT_HOOK_CORE), so the turn that enters REMOTE is where the
+// contract has to arrive in full — the twin of plugin/hooks/hwip-remote.sh
+// reading CORE_RULES.md on entry. Read from the generated core rather than
+// restated here: a copy would be one more place for the rule to drift. The
+// four sections together cite only rules they carry (1–4, 7–9), so no
+// cross-reference dangles; remote-hook.test.ts checks that.
+//
+// Where it goes depends on what the agent's hook can carry:
+// - gemini/codex: additionalContext, once per entry — a later phone prompt on
+//   a session already in REMOTE gets the note alone, since the contract is
+//   already in its context.
+// - pi: `systemPrompt`, on every phone prompt. pi's before_agent_start can
+//   replace the system prompt for that run, and a system-prompt change is not
+//   persisted — so the contract costs nothing after REMOTE ends, whereas an
+//   injected message rides every later turn of the session (2026-09-13: a
+//   "hello" from the phone left 7.5K chars in a 300-turn implement session
+//   until compaction, and the compaction summary then restated the rules).
+//   The additionalContext note stays short on every phone prompt.
+// Sliced on that turn only — this command runs on every prompt submit, and
+// the common path is a silent no-op. Exported for the tests.
+export const remoteEntrySections = (): string =>
+  ['When hwip_ask is MANDATORY', 'When hwip_ask is the DEFAULT', 'Sticky REMOTE mode', 'When to use AskUserQuestion vs hwip_ask']
+    .map((heading) => coreSection(HWIP_CORE_HOOK_DRIVEN, heading))
+    .join('\n\n');
+
+const ONE_WAY_CONTEXT = `# System note (Hwip remote-origin detect)
+
+This user message arrived from the user's phone via Hwip agent chat (verified by the listener — exact text match), but no hook id is configured (neither \`HWIP_HOOK_ID\` nor \`hookId\` in ~/.hwip/config.json), so the two-way tool (hwip_ask) is unavailable. Make your final message self-contained — the completion push is the user's only feedback channel. If you have not already mentioned it this session, tell the user once that running \`npx @hwip/cli setup\` upgrades this into a two-way remote session (buttons + text replies from the phone).`;
+
+/**
+ * The first prompt a remote session's user types at the terminal. Emitted
+ * once — the state is cleared with it, so every later terminal turn is a
+ * silent no-op. Kept in step with the wording in
+ * plugin/hooks/hwip-remote.sh.
+ */
+const EXIT_CONTEXT = `# System note (Hwip)
+
+The user typed this prompt at the terminal, so this session has LEFT sticky REMOTE mode — answer normally (the NORMAL branch of your Hwip rules) and do not end this response with \`hwip_ask\` just to keep the loop alive. One rule still holds: if you actually ask the user something, ask it with \`hwip_ask\`. Re-entry is automatic the moment they send another message from their phone.`;
+
+export const isRemoteHookAgent = (raw: string): raw is RemoteHookAgent =>
+  (REMOTE_HOOK_AGENTS as readonly string[]).includes(raw);
+
+/**
+ * Core of the hook: match the stdin payload against the marker and return
+ * the JSON to print, or null for a silent no-op. Never throws.
+ */
+export const runRemoteHook = (
+  agent: RemoteHookAgent,
+  stdin: string,
+  env: NodeJS.ProcessEnv = process.env,
+  now: () => number = Date.now,
+): string | null => {
+  let prompt: string;
+  let cwd: string;
+  try {
+    const input = JSON.parse(stdin) as { prompt?: unknown; cwd?: unknown };
+    prompt = typeof input.prompt === 'string' ? input.prompt : '';
+    cwd = typeof input.cwd === 'string' ? input.cwd : '';
+  } catch {
+    return null;
+  }
+  // `cwd` keys every state file, so without it there is nothing to look up.
+  if (!cwd) return null;
+
+  // Mute outranks everything (the mute rule) — stay silent and leave both the marker
+  // and the state untouched (the next inject overwrites the marker anyway).
+  if (isMuted(cwd)) return null;
+
+  const emit = (additionalContext: string, systemPrompt?: string): string =>
+    JSON.stringify({
+      hookSpecificOutput: { hookEventName: HOOK_EVENT_NAME[agent], additionalContext, ...(systemPrompt ? { systemPrompt } : {}) },
+    });
+
+  // Exactly one additionalContext per invocation, and the verdict decides
+  // which: 'phone' enters, 'keyboard' leaves, 'unclear' says nothing and
+  // leaves the mode as it was.
+  const origin = remoteOrigin(prompt, cwd, now);
+
+  if (origin === 'phone') {
+    // Resolved on the two branches that need it, not up front — the common
+    // no-marker path never reads the config file.
+    if (!resolveHookId(env)) return emit(ONE_WAY_CONTEXT);
+    // Only a two-way session has a mode to stay in — without hwip_ask there is
+    // nothing for a later turn to be reminded of, so no state is recorded.
+    const entering = !isRemoteActive(cwd, now);
+    touchRemoteActive(cwd, now);
+    if (agent === 'pi') return emit(TWO_WAY_CONTEXT, remoteEntrySections());
+    return emit(entering ? `${TWO_WAY_CONTEXT}\n\n${remoteEntrySections()}` : TWO_WAY_CONTEXT);
+  }
+
+  if (origin === 'keyboard' && isRemoteActive(cwd, now) && resolveHookId(env)) {
+    clearRemoteActive(cwd);
+    return emit(EXIT_CONTEXT);
+  }
+  return null;
+};
+
+/**
+ * Where this prompt came from. Three verdicts, because "not a phone message"
+ * and "typed at the terminal" are not the same claim and only the second may
+ * end REMOTE:
+ *
+ * - `phone` — verified injection; the marker is consumed.
+ * - `keyboard` — no marker this prompt could ever have matched, so the text
+ *   came from the user. An empty prompt lands here too when nothing is
+ *   pending: the listener never injects empty text.
+ * - `unclear` — a fresh marker is sitting here unmatched, so a phone message
+ *   is in flight (queued behind a long turn, or a digest the two sides compute
+ *   differently). Reading that as "the user is back" would drop them out of
+ *   REMOTE while they are still holding the phone, with no answerable push
+ *   left — the quiet failure the core calls worse than light spam.
+ *
+ * A stale marker is deleted on sight and reads as `keyboard`; junk in the file
+ * can never match anything, so it says nothing about who typed and reads the
+ * same way. The bash twin returns these as rc 0/1/2 (hwip-remote.sh
+ * remote_origin_match).
+ */
+type RemoteOrigin = 'phone' | 'keyboard' | 'unclear';
+
+const remoteOrigin = (prompt: string, cwd: string, now: () => number): RemoteOrigin => {
+  const hash = projectHash(cwd);
+  const marker = remoteMarkerPath(hash);
+
+  let content: string;
+  try {
+    content = readFileSync(marker, 'utf-8');
+  } catch {
+    return 'keyboard';
+  }
+
+  if (!prompt) return 'unclear';
+
+  // Marker format: "<epochSec> <sha256hex>\n" (listener.ts writeRemoteMarker).
+  // At most 12 digits, like the REMOTE state's time (gate.ts isRemoteActive; bash `hwip_age_sec`): a longer one is not a time.
+  const record = content.match(/^(\d{1,12}) ([0-9a-f]{64})\n?$/);
+  if (!record) {
+    // Junk can only ever be re-read and re-rejected — same housekeeping a
+    // stale marker gets. Twin: hwip-remote.sh's `rm -f` on the parse branches.
+    try {
+      unlinkSync(marker);
+    } catch {
+      /* best-effort housekeeping */
+    }
+    return 'keyboard';
+  }
+
+  if (Math.floor(now() / 1000) - Number(record[1]) > FRESH_WINDOW_SEC) {
+    // Stale markers are dead weight (can never flag) — delete on sight.
+    try {
+      unlinkSync(marker);
+    } catch {
+      /* best-effort housekeeping */
+    }
+    return 'keyboard';
+  }
+
+  if (remoteDigest(prompt) !== record[2]) return 'unclear';
+
+  // Matched — consume the marker so an identical later prompt (e.g. typed
+  // at the terminal) can't re-flag. Housekeeping is not the verdict: the
+  // match is valid whether or not the delete lands.
+  try {
+    unlinkSync(marker);
+  } catch {
+    /* emit anyway — the match itself is valid */
+  }
+  return 'phone';
+};

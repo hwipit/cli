@@ -1,0 +1,22 @@
+{
+  // Gemini CLI settings — this machine
+  "general": {
+    "preferredEditor": "vscode", // used by /editor
+  },
+  "security": {
+    "auth": { "selectedType": "gemini-api-key" }
+  },
+  "mcpServers": {
+    // my own server
+    "docs": { "command": "npx", "args": ["-y", "docs-mcp"] },
+  },
+  "hooks": {
+    "BeforeTool": [
+      // run my linter before any shell tool
+      { "matcher": "run_shell_command", "hooks": [{ "type": "command", "command": "echo mine" }] },
+    ],
+    "AfterAgent": [
+      { "hooks": [{ "name": "my-own", "type": "command", "command": "echo user" }] },
+    ],
+  },
+}

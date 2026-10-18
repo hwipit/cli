@@ -1,0 +1,62 @@
+name: test
+
+# PRs only: publish.yml runs build + test again before it releases.
+#
+# @hwip/mcp-server comes from npm; plugin-sync checks out the public
+# hwipit/plugin repo.
+on:
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly drift check against hwipit/plugin main — catches CORE_RULES /
+    # gate-vector changes that land in the plugin repo between cli PRs.
+    - cron: '0 3 * * 1'
+
+# A new push to the same PR makes the older run moot.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  vitest:
+    runs-on: ubuntu-latest
+    # The lowest of each supported line the test tooling can run on (src/node-support.ts
+    # is the supported range): vite 8 needs 20.19 / 22.12, so 20.17 itself is
+    # claimed by the dependencies' engines but not exercised here. A floor that
+    # is only claimed is the thing that silently stops being true.
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20.19.0', '22.13.0', '24']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: 'npm'
+
+      - run: npm ci
+
+      # Type-check (tsc), on every Node of the matrix.
+      - run: npm run build
+
+      - run: npm test
+
+  plugin-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: hwipit/plugin
+          path: plugin
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Check generated artifacts against plugin main
+        run: node scripts/sync-from-plugin.mjs --check --plugin ./plugin

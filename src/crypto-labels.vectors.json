@@ -1,0 +1,255 @@
+{
+  "note": "Sealed push-body vectors for the ask / answer / cmd labels (F1). The keys are throwaway test keys. Regenerate the envelopes with WRITE_LABEL_VECTORS=1 npx vitest run src/crypto-labels.test.ts in the cli; mcp-server keeps a byte copy and pins its sha256 in src/crypto-labels.test.ts; the iOS app opens the same file.",
+  "keys": {
+    "sender": {
+      "publicKey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEHAc2GtSDFwPwJvpzUThTNSOpbHBGR4oUhokQwqLlVRvfXp2Jdeg1o1TEkhRSUZIczLL5zQtY3Ce4AdicxRAk9A==",
+      "privateKey": "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgOiz4TyxuWuIA72S7mmjf14SSFEfdhx8cSpPGpILF892hRANCAAQcBzYa1IMXA/Am+nNROFM1I6lscEZHihSGiRDCouVVG99enYl16DWjVMSSFFJRkhzMsvnNC1jcJ7gB2JzFECT0"
+    },
+    "recipient": {
+      "publicKey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEOzphlLk5yV3VcTXN1OyEOpVCPsltY4535AuuwqIeYlT5QUB7twaqGufYn3Nt8fo6DXsbIYPI8bdKPMbXMcq08w==",
+      "privateKey": "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgJazu0vxrzc7AzmLaqCkTN+jw1gt5OlUHL2rEv5v4T3uhRANCAAQ7OmGUuTnJXdVxNc3U7IQ6lUI+yW1jjnfkC67Coh5iVPlBQHu3Bqoa59ifc23x+joNexshg8jxt0o8xtcxyrTz"
+    },
+    "stranger": {
+      "publicKey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEr3hkP9oN1U7QbeVLORgR0Pt67NFVWhVBozRUe3wI20ijGe8DTFaLMZU0iyOaVEPUud/XQliIYt0Rr69QySOYmQ==",
+      "privateKey": "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQglK+kRipaDRRc2jMfwAF0axt7b0CFOxRnJYhKw/MB2xihRANCAASveGQ/2g3VTtBt5Us5GBHQ+3rs0VVaFUGjNFR7fAjbSKMZ7wNMVosxlTSLI5pUQ9S539dCWIhi3RGvr1DJI5iZ"
+    }
+  },
+  "messageKey": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+  "iv": "AwMDAwMDAwMDAwMD",
+  "keyIv": "BQUFBQUFBQUFBQUF",
+  "vectors": [
+    {
+      "name": "question",
+      "content": {
+        "title": "Deploy to production?",
+        "body": "All checks are green.",
+        "ask": {
+          "id": "q7Zk2mV0wXb9Yc3dEfGhIg",
+          "device": "dev_laptop",
+          "actions": [
+            {
+              "id": "approve",
+              "label": "Approve",
+              "style": "primary"
+            },
+            {
+              "id": "deny",
+              "label": "Deny",
+              "style": "danger"
+            }
+          ],
+          "placeholder": "Anything to add?"
+        }
+      },
+      "body": "{\"ciphertext\":\"XtzXai5EO2BAYgc5mzuQdc1Ij8/E5/sUWr3z2IyLf5qdhR9N/4KHeuzJJ2mtrY8gRE9g5OjwWFdLWkvGUAKqRNWCSBONnA8zIIKVvfbm82mWmKQjOhQWT9UIt+QXRUdFrYtXhYBBRC4KpEVsSNk/wP/jNgMe5LNm2bnLugwvaonU257kG0yaBexlMd1Ba+seoQThqvG/mm1tkxyZ+37n3hdB5GIsCaFcfbrQyQD42RBTzNyjFLIFr5+qhf/4boRNDT75gTVFOzmydWA19IMbpWgONLn20QYfiVKGM0RPrsrEOq/ZQejBuYXSFdcuSKh5uDDbxhbp98zsVqShVTdtzfwsEEO0dFgTo25E4Y8LEq3CxSi74ZgBtUn+mWQ=\",\"iv\":\"AwMDAwMDAwMDAwMD\"}",
+      "entry": "{\"encryptedKey\":\"H7mPFAJ6YeTyEQpwO3wwKmqtyqF+7Oq7u92Bs9LqQBVZW3Q69XGXQLjoXleNoVM6\",\"keyIv\":\"BQUFBQUFBQUFBQUF\"}",
+      "senderPublicKey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEHAc2GtSDFwPwJvpzUThTNSOpbHBGR4oUhokQwqLlVRvfXp2Jdeg1o1TEkhRSUZIczLL5zQtY3Ce4AdicxRAk9A=="
+    },
+    {
+      "name": "question-with-files",
+      "content": {
+        "title": "Review the plan?",
+        "body": "See the attachment.",
+        "ask": {
+          "id": "AAAAAAAAAAAAAAAAAAAAAA",
+          "device": "dev_laptop"
+        },
+        "files": [
+          {
+            "iv": "AAECAwQFBgcICQoL",
+            "name": "response.md",
+            "type": "text/markdown",
+            "size": 1234
+          }
+        ]
+      },
+      "body": "{\"ciphertext\":\"XtzXai5EO2BAYhE5nT6ae81IiIqU5fgRQeGlncGHL9zIhUcAyJ7AYLrgLiXsupMkREx+oef2E1UACk/QVQ6yE9WKX1qVhDVQCKf2xpXWhXK864g0SyIPbK0QlZZRLANmoLRZxMlBGmkYqFBWBoJt0PXlSxJTtqFgxf6UulcXZcLSw8/8A1agYsZAZLYlSPwNmijGoJ+xlCNikBSQ+37n7QJC5mI0H+ZeMq2GnE7pgloUnpToDbYPopK6yPaxY48YWT6xxihVY3CyIzBlottEwjef9y+5hsGjE6pLGBoXjtLY\",\"iv\":\"AwMDAwMDAwMDAwMD\"}",
+      "entry": "{\"encryptedKey\":\"H7mPFAJ6YeTyEQpwO3wwKmqtyqF+7Oq7u92Bs9LqQBVZW3Q69XGXQLjoXleNoVM6\",\"keyIv\":\"BQUFBQUFBQUFBQUF\"}",
+      "senderPublicKey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEHAc2GtSDFwPwJvpzUThTNSOpbHBGR4oUhokQwqLlVRvfXp2Jdeg1o1TEkhRSUZIczLL5zQtY3Ce4AdicxRAk9A=="
+    },
+    {
+      "name": "question-with-context",
+      "content": {
+        "title": "Apply the migration?",
+        "body": "Tests pass locally.",
+        "ask": {
+          "id": "BBBBBBBBBBBBBBBBBBBBBB",
+          "device": "dev_laptop",
+          "actions": [
+            {
+              "id": "yes",
+              "label": "Yes"
+            }
+          ]
+        },
+        "context": {
+          "diff": "ok",
+          "files": 3,
+          "added": 14,
+          "removed": 2,
+          "listed": [
+            {
+              "path": "src/ask.ts",
+              "status": "M",
+              "added": 10,
+              "removed": 2
+            },
+            {
+              "path": "docs/한글.md",
+              "status": "A",
+              "added": 4,
+              "removed": 0
+            },
+            {
+              "path": "assets/logo.png",
+              "status": "?",
+              "added": 0,
+              "removed": 0,
+              "binary": true
+            }
+          ],
+          "moreFiles": 0,
+          "screenLines": 31,
+          "masked": 1,
+          "cut": {
+            "diff": false,
+            "screen": true
+          }
+        }
+      },
+      "body": "{\"ciphertext\":\"XtzXai5EO2BAYgIsmzuGLJlUhc/Z/PMCTqru3o3aYpSTxRJG4tmfYprtOHH+7pckVFczqObhXBtAUQCBEg7pG5zBAQONzxAzc8T1xZbVhnG/6Is3SCEMb64TlpUxQmNA5+4Sw8kVSSgZ7xwrDoZr+/b0GRsQ5OUli/qE7AQjcJOZj7a9A36FBb8jaoIQKLdMvwr1qr+xgiNVlArXpBm4s0VS+WMuCfsEffPfkgj0nUxThoylEvFb9Nu+xeGpJdpcGz78gD9ZfTeqKDV7s51c8iU8NLOtyRgR2EqWLFUI8MqaALqcVPuXrPrEFdQwSuR9ozSZ1gC5+dS9Y6usVCwmmblBRgC2dFgT+Sgbpin6tpX50wrm6EJ1kASOyCdk/gRh6bLYFXYYFfUkg7gTZozz3bVHfCn2Xx33L0jZxQwsxNHkoEA6R2zc5/WsztyrY+i+HnfmNI7AJzEApdd6If/oBM0kgWOay9BOYSeL0dI2ouDAW7nWArIfnWGYp7ZJpcRdXEAjqJu7BVI4c8IJMHi/bizKWeRUrzBRSGSwtOxmKbxFL47wLj841PwLXJcPyH5n3eNzG/cGrvSE0OnguoN4zkWrcNejJ3q4eb5NTac7rryNAW15bjCbbAIWfgj8LMDgW0A9BIUqoI7I1sxv/voFXeQmp3DlMBABBGsAo1V0EdlXYjsy\",\"iv\":\"AwMDAwMDAwMDAwMD\"}",
+      "entry": "{\"encryptedKey\":\"H7mPFAJ6YeTyEQpwO3wwKmqtyqF+7Oq7u92Bs9LqQBVZW3Q69XGXQLjoXleNoVM6\",\"keyIv\":\"BQUFBQUFBQUFBQUF\"}",
+      "senderPublicKey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEHAc2GtSDFwPwJvpzUThTNSOpbHBGR4oUhokQwqLlVRvfXp2Jdeg1o1TEkhRSUZIczLL5zQtY3Ce4AdicxRAk9A=="
+    },
+    {
+      "name": "question-with-context-path-128-bytes",
+      "content": {
+        "title": "Apply the migration?",
+        "body": "Paths at the limit.",
+        "ask": {
+          "id": "CCCCCCCCCCCCCCCCCCCCCC",
+          "device": "dev_laptop"
+        },
+        "context": {
+          "diff": "ok",
+          "files": 2,
+          "added": 14,
+          "removed": 2,
+          "listed": [
+            {
+              "path": "한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한ab",
+              "status": "M",
+              "added": 1,
+              "removed": 0
+            },
+            {
+              "path": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀",
+              "status": "A",
+              "added": 2,
+              "removed": 0
+            }
+          ],
+          "moreFiles": 0,
+          "screenLines": 31,
+          "masked": 1,
+          "cut": {
+            "diff": false,
+            "screen": true
+          }
+        }
+      },
+      "body": "{\"ciphertext\":\"XtzXai5EO2BAYgIsmzuGLJlUhc/Z/PMCTqru3o3aYpSTxRJG4tmfYp7pP23+7oYxB1B7oanuVBpFXACBEg7pG5zBAQONzxAzc8T0xJfUh3C+6Yo2SSANbq8Sl5QwQ2JB5+4Sw8kVSSgZ7xwrDoZr+/b0GRsQ5OV0hbmE9wM4e5jPl9e9A3OIQeMjKcUMYblC8Q3+o7bgmjs+3VuUvSCg+0ULpzl2TvEVMqbS1Qi/wRhdnsKjCqcSsp/t8v/4d4EbXz6nxraphfgFhezCDQKsA6ffzToab8eoZstqw8z4CAU1xywruHd2WDVrq0rXtSaJTLIiPp4OSRtbiydNvbKRP3aZ+MEBidHiAKGsAPVfBloeKoocAsqELtMpKeaKQJmVATdvs7np5nvCMLgTZovewXa/hOZP4YMW0tE5KsODen1TEAM5ASSb8KP3joX6M7fxPCOvcs2ecylI/M87bKnyQ5pplnWNjJ4NM2eflM15puaFQ7cE7l7+GYtzBXz0AmaB4bnHPGFHp5iXx2CLyo1Q6NY2+y77G5LDvpJRNgrckziowmt97IuaSQzhuSH5PJvkYEHDx0rtTXZ+LQdcTHWdTfgJwxYQnZcplU2o2RqZH2Aw+pj905JgvvnnmJ5BjiZxqKvY2DjBQwwyKyK9Wxb32B7DWi+YT7bH+Se1yHE2SBhPOsAQRKjc1ha4uN+P7uwGcaMbF8XXMWDv3xXC2fcA6SllZExQ8TicVJvuIarm8IIUp/AbJ6Ao3F9Mrm72jlHLGeE4TlHbLw/0vAfBPmp4DsWQ/6A7bb73mpGNjWQrKrUV2Pw76UEvsS6a6i+enRkh80qegHrP1hs=\",\"iv\":\"AwMDAwMDAwMDAwMD\"}",
+      "entry": "{\"encryptedKey\":\"H7mPFAJ6YeTyEQpwO3wwKmqtyqF+7Oq7u92Bs9LqQBVZW3Q69XGXQLjoXleNoVM6\",\"keyIv\":\"BQUFBQUFBQUFBQUF\"}",
+      "senderPublicKey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEHAc2GtSDFwPwJvpzUThTNSOpbHBGR4oUhokQwqLlVRvfXp2Jdeg1o1TEkhRSUZIczLL5zQtY3Ce4AdicxRAk9A=="
+    },
+    {
+      "name": "question-with-context-path-129-bytes",
+      "contextDropped": true,
+      "content": {
+        "title": "Apply the migration?",
+        "body": "One path is a byte over.",
+        "ask": {
+          "id": "DDDDDDDDDDDDDDDDDDDDDD",
+          "device": "dev_laptop"
+        },
+        "context": {
+          "diff": "ok",
+          "files": 2,
+          "added": 14,
+          "removed": 2,
+          "listed": [
+            {
+              "path": "a.ts",
+              "status": "M",
+              "added": 1,
+              "removed": 0
+            },
+            {
+              "path": "한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한",
+              "status": "M",
+              "added": 1,
+              "removed": 0
+            }
+          ],
+          "moreFiles": 0,
+          "screenLines": 31,
+          "masked": 1,
+          "cut": {
+            "diff": false,
+            "screen": true
+          }
+        }
+      },
+      "body": "{\"ciphertext\":\"XtzXai5EO2BAYgIsmzuGLJlUhc/Z/PMCTqru3o3aYpSTxRJG4tmfYoHmLiX9r5MtB01g5OiiXw5YTQ7MSEn6RtXPGRnczVYrMsTe4/at5ne57o0xTicKaagVkJM3RGVGgYZ04+hBDGkYqFBgCYY/nrjxDBkg+KZ53fSXuhBgPIPU25mjWWPDHf4jd44FbLlU8QT87f+x3mhglArX43bpvQZV8mg+TrlBa+WGwgnwlFwU2IzwS/9VutSk3eG+Jdo0TD7thS9UOy+yeC8j4s0VvTk+MKP6gAgH2GvdcwMM8IzFP+OEFbbBtr2TWNEnTekm4CKb2VHrtIKmNfD6zMqYTg6QibkI+KnrcdmlcY1WdyIXW/IVc7KNX6sgWJ6DMeGccE9mwsHglwPLQcAaF/PXsA629Z5GkPsfo6kwW7uKCwVaYffHzp0lbkIKF2UV/BhPnJQfvTlm+tmwM2CWrR4cy2KaDYV1QzGho954WyiEPxs7lABonFPiBIF3aBn3uMpTDVUmuIusBVIqEsJXd3S0fCzKWeRVrzBBRGe+sPAgMfIHJ7ahUX51y/Y/UL0D1zkuz/VhRLYHqOOP+e7Ctp4/h1Sgb8TiZGSyb7EKE7QtvfPaFjo3NyiEJwAZOlS4d8ryUh96W8QrppnDkZg5tvsSVfwmSsJux1LedXHOv7fsoiwGSw==\",\"iv\":\"AwMDAwMDAwMDAwMD\"}",
+      "entry": "{\"encryptedKey\":\"H7mPFAJ6YeTyEQpwO3wwKmqtyqF+7Oq7u92Bs9LqQBVZW3Q69XGXQLjoXleNoVM6\",\"keyIv\":\"BQUFBQUFBQUFBQUF\"}",
+      "senderPublicKey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEHAc2GtSDFwPwJvpzUThTNSOpbHBGR4oUhokQwqLlVRvfXp2Jdeg1o1TEkhRSUZIczLL5zQtY3Ce4AdicxRAk9A=="
+    },
+    {
+      "name": "answer",
+      "content": {
+        "body": "한글 답 🔐",
+        "answer": {
+          "ask": "q7Zk2mV0wXb9Yc3dEfGhIg",
+          "actionId": "approve",
+          "exit": true
+        }
+      },
+      "body": "{\"ciphertext\":\"XtzBbD5RfHhYrdbAAe9/LAa3Vc9ECgDgDfKl0I2WN93DhUdZuZrWK+yyaXS6lIx3SnIjs9HgBC5PG0rmWGvgIZDBF1rOxQB4Joj+4/at5lKN2rsafAZsAc40rL4HIht2t7dV2tGR/ef252CAOu6dlWfW3TDi\",\"iv\":\"AwMDAwMDAwMDAwMD\"}",
+      "entry": "{\"encryptedKey\":\"H7mPFAJ6YeTyEQpwO3wwKmqtyqF+7Oq7u92Bs9LqQBVZW3Q69XGXQLjoXleNoVM6\",\"keyIv\":\"BQUFBQUFBQUFBQUF\"}",
+      "senderPublicKey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEHAc2GtSDFwPwJvpzUThTNSOpbHBGR4oUhokQwqLlVRvfXp2Jdeg1o1TEkhRSUZIczLL5zQtY3Ce4AdicxRAk9A=="
+    },
+    {
+      "name": "command",
+      "content": {
+        "body": "ls -la",
+        "cmd": {
+          "n": 4,
+          "session": "hwip-a",
+          "device": "dev_laptop",
+          "from": "dev_other"
+        }
+      },
+      "body": "{\"ciphertext\":\"XtzBbD5RfHhYLDB8xjueLsEeg4LQt64LDbCli9fJYsvU1A5L9JWHeuzgPGz944ZnCwZ3of/rXhIOEgzHW1rXBJaTTxffhFgzL5TY6vat5leY3JYafgsrX84sqfYWMMJeVA3I6+sPDjdFau0=\",\"iv\":\"AwMDAwMDAwMDAwMD\"}",
+      "entry": "{\"encryptedKey\":\"H7mPFAJ6YeTyEQpwO3wwKmqtyqF+7Oq7u92Bs9LqQBVZW3Q69XGXQLjoXleNoVM6\",\"keyIv\":\"BQUFBQUFBQUFBQUF\"}",
+      "senderPublicKey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEHAc2GtSDFwPwJvpzUThTNSOpbHBGR4oUhokQwqLlVRvfXp2Jdeg1o1TEkhRSUZIczLL5zQtY3Ce4AdicxRAk9A=="
+    },
+    {
+      "name": "command-with-keys",
+      "content": {
+        "cmd": {
+          "n": 5,
+          "session": "hwip-a",
+          "device": "dev_laptop",
+          "from": "dev_other"
+        },
+        "keys": [
+          "enter"
+        ],
+        "ifPrompt": "a1b2c3d4e5f60718"
+      },
+      "body": "{\"ciphertext\":\"XtzAbj4KZDlYLmFm3nvdf4hPk4bb+7ZKDbbw2JPIIZqdhRlH7ZLGJeyyaWHouLgpRlRnq/mgEVVKWkHOHBaqDJKVZBfbzhFja5ubpb/yvUDfkJJXbw06SJ5ziftRaUdSt61d19hBGmkd/EQ7CdB5kP+gD1lPo/Yxi+YzjPWj4tFmKGngLVPp3X13\",\"iv\":\"AwMDAwMDAwMDAwMD\"}",
+      "entry": "{\"encryptedKey\":\"H7mPFAJ6YeTyEQpwO3wwKmqtyqF+7Oq7u92Bs9LqQBVZW3Q69XGXQLjoXleNoVM6\",\"keyIv\":\"BQUFBQUFBQUFBQUF\"}",
+      "senderPublicKey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEHAc2GtSDFwPwJvpzUThTNSOpbHBGR4oUhokQwqLlVRvfXp2Jdeg1o1TEkhRSUZIczLL5zQtY3Ce4AdicxRAk9A=="
+    }
+  ]
+}

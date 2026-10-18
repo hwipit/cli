@@ -1,0 +1,14 @@
+title = "hwip cli gitleaks config"
+
+[extend]
+useDefault = true
+
+# Crypto test vectors and unit-test dummies (fake keys, masking fixtures).
+# Scoped to the rules that fire on them so every other rule still scans these paths.
+[[allowlists]]
+description = "test vectors and unit-test fixtures"
+targetRules = ["generic-api-key", "private-key", "gitlab-pat", "jwt", "curl-auth-header"]
+paths = [
+  '''^src/[^/]+\.vectors\.json$''',
+  '''^src/[^/]+\.test\.ts$''',
+]

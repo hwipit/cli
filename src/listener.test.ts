@@ -1,0 +1,1782 @@
+import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
+import { createHash } from 'crypto';
+import { mkdirSync, mkdtempSync, existsSync, readFileSync, rmSync, utimesSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { groupOf } from './config.js';
+import type { ShellAuditEntry } from './shell-audit.js';
+import { projectHash } from './gate.js';
+import {
+    parseSessionName,
+    writeRemoteMarker,
+    checkRateLimit,
+    handlePush,
+    resolveKeys,
+    sessionsFingerprint,
+    sessionsReportDue,
+    COMMAND_SCAN_INTERVAL_MS,
+    SESSION_REPORT_INTERVAL_MS,
+    commandsFingerprint,
+    commandsReportDue,
+    SESSION_REPORT_HEARTBEAT_MS,
+    gcAttachments,
+    computeBackoff,
+    AUTH_FAILURE_CODES,
+    computeListenerDeviceId,
+    resolveWsUrl,
+    deriveSessionState,
+    handleScreenRequest,
+    handleStreamControl,
+    isStreamCapReached,
+    MAX_CONCURRENT_STREAMS,
+    stopStream,
+    stopAllStreams,
+    resetSessionStates,
+    collectWatchHits,
+    setPatternWatches,
+    resetPatternWatches,
+    historyLinesIn,
+    displayFolder,
+} from './listener.js';
+
+/** A pane-guard probe answer: the foreground command, unmarked unless a test marks it (`@hwip_shell`). */
+const pane = (command: string | null, shellMarked = false) => (command === null ? null : { command, shellMarked });
+
+describe('checkRateLimit', () => {
+    beforeEach(() => {
+        // The bucket map is module-scope; use a fresh session per test
+        // so buckets don't leak between cases.
+    });
+
+    it('allows up to the bucket size, then drops', () => {
+        const s = `s-${Date.now()}-${Math.random()}`;
+        const now = 1_000_000;
+        // 120 keystrokes' worth: the bucket is sized for tapping, not for
+        // instructions — a submit costs four of these.
+        for (let i = 0; i < 120; i++) expect(checkRateLimit(s, now)).toBe(true);
+        expect(checkRateLimit(s, now)).toBe(false);
+    });
+
+    it('charges an expensive action more, and refuses it while a cheap one still fits', () => {
+        // Weighting is what keeps the command ceiling at its old 30/min while
+        // the key row gets room to be tapped.
+        const s = `s-${Date.now()}-${Math.random()}`;
+        const now = 1_000_000;
+        for (let i = 0; i < 30; i++) expect(checkRateLimit(s, now, 4)).toBe(true);
+        expect(checkRateLimit(s, now, 4)).toBe(false);
+        // Empty for submits is empty for everything — the two share one budget
+        // on purpose, so a flood of one cannot be laundered through the other.
+        expect(checkRateLimit(s, now, 1)).toBe(false);
+    });
+
+    it('refills proportionally over the window', () => {
+        const s = `s-${Date.now()}-${Math.random()}`;
+        const t0 = 1_000_000;
+        // Drain the bucket
+        for (let i = 0; i < 120; i++) checkRateLimit(s, t0);
+        expect(checkRateLimit(s, t0)).toBe(false);
+        // Half a window later → ~half the tokens back → many succeed before drop
+        const t1 = t0 + 30_000;
+        let succeeded = 0;
+        for (let i = 0; i < 120; i++) if (checkRateLimit(s, t1)) succeeded++;
+        expect(succeeded).toBeGreaterThanOrEqual(59);
+        expect(succeeded).toBeLessThanOrEqual(61);
+    });
+
+    it('tracks buckets per-session independently', () => {
+        const a = `a-${Date.now()}-${Math.random()}`;
+        const b = `b-${Date.now()}-${Math.random()}`;
+        const now = 1_000_000;
+        for (let i = 0; i < 120; i++) checkRateLimit(a, now);
+        expect(checkRateLimit(a, now)).toBe(false);
+        // Session b is untouched
+        expect(checkRateLimit(b, now)).toBe(true);
+    });
+});
+
+describe('handlePush', () => {
+    const baseDeps = (override: Parameters<typeof handlePush>[1] = {}) => ({
+        paneProbe: () => pane('claude'),
+        inject: () => true,
+        rateLimit: () => true,
+        // null cwd keeps the remote-marker write (and its tmux lookup) out
+        // of tests that don't assert on it.
+        paneCwd: () => null,
+        ...override,
+    });
+
+    const agentCmd = (overrides: Partial<Parameters<typeof handlePush>[0]> = {}) => ({
+        pushId: '1',
+        type: 'agent.command' as const,
+        agentSessionName: 'hwip-myapp',
+        body: 'do the thing',
+        ...overrides,
+    });
+
+    it('ignores pushes that are not agent.command', async () => {
+        let injected = false;
+        const ok = await handlePush(
+            { pushId: '1', type: 'note', body: 'Just a regular notification' },
+            baseDeps({ inject: () => { injected = true; return true; } }),
+        );
+        expect(ok).toBe(false);
+        expect(injected).toBe(false);
+    });
+
+    it('ignores agent.command without agentSessionName', async () => {
+        let injected = false;
+        const ok = await handlePush(
+            { pushId: '1', type: 'agent.command', body: 'hello' },
+            baseDeps({ inject: () => { injected = true; return true; } }),
+        );
+        expect(ok).toBe(false);
+        expect(injected).toBe(false);
+    });
+
+    it('ignores encrypted pushes (no key to decrypt body)', async () => {
+        let injected = false;
+        const ok = await handlePush(
+            agentCmd({ isEncrypted: true }),
+            baseDeps({ inject: () => { injected = true; return true; } }),
+        );
+        expect(ok).toBe(false);
+        expect(injected).toBe(false);
+    });
+
+    // Two of one user's machines routinely run a session with the same tmux
+    // name (same project checked out on both). push.new fans out to every
+    // listener, so a command addressed to the other machine must not be typed
+    // into this machine's same-named session.
+    it('ignores an agent.command addressed to another device', async () => {
+        let injected = false;
+        const ok = await handlePush(
+            agentCmd({ targetDeviceId: 'dev_listener_other' }),
+            baseDeps({
+                deviceId: () => 'dev_listener_me',
+                paneProbe: () => pane('claude'),
+                inject: () => { injected = true; return true; },
+            }),
+        );
+        expect(ok).toBe(false);
+        expect(injected).toBe(false);
+    });
+
+    it('injects when session exists and pane runs an agent', async () => {
+        let calledWith: { session: string; text: string } | null = null;
+        const ok = await handlePush(
+            agentCmd(),
+            baseDeps({
+                paneProbe: () => pane('claude'),
+                inject: (session, text) => { calledWith = { session, text }; return true; },
+            }),
+        );
+        expect(ok).toBe(true);
+        expect(calledWith).toEqual({ session: 'hwip-myapp', text: 'do the thing' });
+    });
+
+    it('refuses to inject when pane is at a shell (RCE guard)', async () => {
+        let injected = false;
+        const ok = await handlePush(
+            agentCmd({ body: 'rm -rf' }),
+            baseDeps({
+                paneProbe: () => pane('bash'),
+                inject: () => { injected = true; return true; },
+            }),
+        );
+        expect(ok).toBe(false);
+        expect(injected).toBe(false);
+    });
+
+    it('refuses when the tmux session does not exist', async () => {
+        let injected = false;
+        const ok = await handlePush(
+            agentCmd({ agentSessionName: 'ghost' }),
+            baseDeps({
+                paneProbe: () => pane(null),
+                inject: () => { injected = true; return true; },
+            }),
+        );
+        expect(ok).toBe(false);
+        expect(injected).toBe(false);
+    });
+
+    it('drops on rate-limit', async () => {
+        let injected = false;
+        const ok = await handlePush(
+            agentCmd(),
+            baseDeps({
+                rateLimit: () => false,
+                inject: () => { injected = true; return true; },
+            }),
+        );
+        expect(ok).toBe(false);
+        expect(injected).toBe(false);
+    });
+
+    it('accepts python/node/codex/gemini as non-shell commands', async () => {
+        for (const cmd of ['claude', 'codex', 'gemini', 'node', 'python3']) {
+            const ok = await handlePush(
+                agentCmd(),
+                baseDeps({ paneProbe: () => pane(cmd) }),
+            );
+            expect(ok, `expected ${cmd} to be allowed`).toBe(true);
+        }
+    });
+
+    it('refuses on every common shell name', async () => {
+        for (const shell of ['bash', 'zsh', 'fish', 'sh', 'dash', 'ksh', 'tcsh', 'csh', 'pwsh']) {
+            const ok = await handlePush(
+                agentCmd(),
+                baseDeps({ paneProbe: () => pane(shell) }),
+            );
+            expect(ok, `expected ${shell} to be refused`).toBe(false);
+        }
+    });
+
+    // `hwip sh` marks its session with the `@hwip_shell` tmux option. Only
+    // the desktop can set it, so it is the one exception to the RCE guard.
+    describe('marked shell session', () => {
+        const me = 'dev_listener_me';
+        const shellDeps = (override: Parameters<typeof handlePush>[1] = {}) => baseDeps({
+            deviceId: () => me,
+            paneProbe: () => pane('zsh', true),
+            shellAudit: () => true,
+            ...override,
+        });
+
+        it('types into a marked shell pane addressed to this device', async () => {
+            let calledWith: { session: string; text: string } | null = null;
+            const ok = await handlePush(
+                agentCmd({ agentSessionName: 'hwip-app-sh', body: 'ls', targetDeviceId: me }),
+                shellDeps({ inject: (session, text) => { calledWith = { session, text }; return true; } }),
+            );
+            expect(ok).toBe(true);
+            expect(calledWith).toEqual({ session: 'hwip-app-sh', text: 'ls' });
+        });
+
+        it('sends named keys and inserts into a marked shell pane, auditing each', async () => {
+            const entries: ShellAuditEntry[] = [];
+            const shellAudit = (e: ShellAuditEntry) => { entries.push(e); return true; };
+            const keys = await handlePush(
+                agentCmd({ agentSessionName: 'hwip-app-sh', body: undefined, keys: ['ctrl-c', 'enter'], targetDeviceId: me }),
+                shellDeps({ sendKeys: () => true, shellAudit }),
+            );
+            const insert = await handlePush(
+                agentCmd({ agentSessionName: 'hwip-app-sh', body: undefined, insert: 'git st', targetDeviceId: me }),
+                shellDeps({ insertText: () => true, shellAudit }),
+            );
+            expect([keys, insert]).toEqual([true, true]);
+            expect(entries).toEqual([
+                expect.objectContaining({ kind: 'keys', text: 'C-c Enter' }),
+                expect.objectContaining({ kind: 'insert', text: 'git st' }),
+            ]);
+        });
+
+        // The marker is a session option, so it outlives the shell prompt: an
+        // agent started inside `hwip sh` still needs the push addressed.
+        it('refuses an unaddressed push even when a program, not the shell, is in front', async () => {
+            let injected = false;
+            const ok = await handlePush(
+                agentCmd({ agentSessionName: 'hwip-app-sh', body: 'ls' }),
+                shellDeps({ paneProbe: () => pane('claude', true), inject: () => { injected = true; return true; } }),
+            );
+            expect(ok).toBe(false);
+            expect(injected).toBe(false);
+        });
+
+        // push.new fans out to every listener of the account. Two PCs with
+        // `hwip sh` in the same project share the tmux name, so an
+        // unaddressed command would run in both shells.
+        it('refuses a push that does not name this device', async () => {
+            for (const targetDeviceId of [undefined, '', 'dev_listener_other']) {
+                let injected = false;
+                const ok = await handlePush(
+                    agentCmd({ agentSessionName: 'hwip-app-sh', body: 'ls', targetDeviceId }),
+                    shellDeps({ inject: () => { injected = true; return true; } }),
+                );
+                expect(ok, `targetDeviceId=${JSON.stringify(targetDeviceId)}`).toBe(false);
+                expect(injected).toBe(false);
+            }
+        });
+
+        it('still applies the rate limit and the subagent view-only rule', async () => {
+            const limited = await handlePush(
+                agentCmd({ agentSessionName: 'hwip-app-sh', targetDeviceId: me }),
+                shellDeps({ rateLimit: () => false }),
+            );
+            const subagent = await handlePush(
+                agentCmd({ agentSessionName: 'hwip-app-sh.12', targetDeviceId: me }),
+                shellDeps(),
+            );
+            expect([limited, subagent]).toEqual([false, false]);
+        });
+
+        it('audits each inject once, with the foreground command', async () => {
+            const entries: ShellAuditEntry[] = [];
+            await handlePush(
+                agentCmd({ agentSessionName: 'hwip-app-sh', body: 'ls -la', targetDeviceId: me }),
+                shellDeps({ shellAudit: (e) => { entries.push(e); return true; } }),
+            );
+            await handlePush(
+                agentCmd({ agentSessionName: 'hwip-app-sh', body: 'hunter2', targetDeviceId: me }),
+                shellDeps({ paneProbe: () => pane('sudo', true), shellAudit: (e) => { entries.push(e); return true; } }),
+            );
+            expect(entries).toEqual([
+                expect.objectContaining({ session: 'hwip-app-sh', kind: 'body', foreground: 'zsh', atShell: true, text: 'ls -la' }),
+                expect.objectContaining({ session: 'hwip-app-sh', kind: 'body', foreground: 'sudo', atShell: false, text: 'hunter2' }),
+            ]);
+        });
+
+        it('injects even when the audit write fails', async () => {
+            const ok = await handlePush(
+                agentCmd({ agentSessionName: 'hwip-app-sh', targetDeviceId: me }),
+                shellDeps({ shellAudit: () => false }),
+            );
+            expect(ok).toBe(true);
+        });
+
+        // A shell runs what it reads: attachment paths would each be a command
+        // line, ESC can leave a bracketed paste, and an insert must not run.
+        it('refuses attachments, control bytes, and a newline in an insert', async () => {
+            const cases = [
+                agentCmd({ agentSessionName: 'hwip-app-sh', body: 'cat', files: [{ fileKey: 'fk1', fileName: 'a.txt' }], targetDeviceId: me }),
+                agentCmd({ agentSessionName: 'hwip-app-sh', body: 'echo \x1b[201~ hi', targetDeviceId: me }),
+                agentCmd({ agentSessionName: 'hwip-app-sh', body: 'echo \u009b201~ hi', targetDeviceId: me }),
+                agentCmd({ agentSessionName: 'hwip-app-sh', body: undefined, insert: 'rm -rf x\n', targetDeviceId: me }),
+            ];
+            for (const push of cases) {
+                let typed = false;
+                const ok = await handlePush(push, shellDeps({
+                    downloadAttachments: async () => ['/tmp/a.txt'],
+                    inject: () => { typed = true; return true; },
+                    insertText: () => { typed = true; return true; },
+                }));
+                expect(ok, JSON.stringify(push)).toBe(false);
+                expect(typed).toBe(false);
+            }
+        });
+
+        it('refuses attachments before downloading them', async () => {
+            let downloaded = false;
+            const ok = await handlePush(
+                agentCmd({ agentSessionName: 'hwip-app-sh', body: 'cat', files: [{ fileKey: 'fk1', fileName: 'a.txt' }], targetDeviceId: me }),
+                shellDeps({ downloadAttachments: async () => { downloaded = true; return ['/tmp/a.txt']; } }),
+            );
+            expect(ok).toBe(false);
+            expect(downloaded).toBe(false);
+        });
+
+        it('still takes a multi-line body — each line is a command the user meant', async () => {
+            const ok = await handlePush(
+                agentCmd({ agentSessionName: 'hwip-app-sh', body: 'cd /tmp\nls', targetDeviceId: me }),
+                shellDeps(),
+            );
+            expect(ok).toBe(true);
+        });
+
+        // listener.log is world-readable; what the shell got lives in the 0600 audit log.
+        it('logs only the length of what a shell received', async () => {
+            const lines: string[] = [];
+            const spy = vi.spyOn(console, 'log').mockImplementation((m: string) => { lines.push(m); });
+            try {
+                await handlePush(
+                    agentCmd({ agentSessionName: 'hwip-app-sh', body: 'hunter2', targetDeviceId: me }),
+                    shellDeps(),
+                );
+            } finally {
+                spy.mockRestore();
+            }
+            expect(lines.join('\n')).not.toContain('hunter2');
+            expect(lines.join('\n')).toContain('hwip-app-sh: [7 chars]');
+        });
+
+        it('does not audit an agent session', async () => {
+            let audited = false;
+            await handlePush(
+                agentCmd({ targetDeviceId: me }),
+                shellDeps({ paneProbe: () => pane('claude'), shellAudit: () => { audited = true; return true; } }),
+            );
+            expect(audited).toBe(false);
+        });
+    });
+
+    it('drops empty body (no spurious Enter)', async () => {
+        let injected = false;
+        const ok = await handlePush(
+            agentCmd({ body: '' }),
+            baseDeps({ inject: () => { injected = true; return true; } }),
+        );
+        expect(ok).toBe(false);
+        expect(injected).toBe(false);
+    });
+
+    it('downloads attachments then injects body + paths', async () => {
+        let calledWith: { session: string; text: string } | null = null;
+        const ok = await handlePush(
+            agentCmd({ files: [{ fileKey: 'fk1', fileName: 'shot.png' }] }),
+            baseDeps({
+                inject: (session, text) => { calledWith = { session, text }; return true; },
+                downloadAttachments: async () => ['/tmp/hwip/shot.png'],
+            }),
+        );
+        expect(ok).toBe(true);
+        expect(calledWith).toEqual({ session: 'hwip-myapp', text: 'do the thing\n/tmp/hwip/shot.png' });
+    });
+
+    it('injects paths only when body is empty', async () => {
+        let text: string | null = null;
+        const ok = await handlePush(
+            agentCmd({ body: '', files: [{ fileKey: 'fk1', fileName: 'a.png' }] }),
+            baseDeps({
+                inject: (_s, t) => { text = t; return true; },
+                downloadAttachments: async () => ['/tmp/a.png'],
+            }),
+        );
+        expect(ok).toBe(true);
+        expect(text).toBe('/tmp/a.png');
+    });
+
+    it('isolates download failure — still injects the body', async () => {
+        let text: string | null = null;
+        const ok = await handlePush(
+            agentCmd({ files: [{ fileKey: 'fk1', fileName: 'a.png' }] }),
+            baseDeps({
+                inject: (_s, t) => { text = t; return true; },
+                downloadAttachments: async () => { throw new Error('network down'); },
+            }),
+        );
+        expect(ok).toBe(true);
+        expect(text).toBe('do the thing');
+    });
+
+    it('drops when body empty and all attachments failed (no paths)', async () => {
+        let injected = false;
+        const ok = await handlePush(
+            agentCmd({ body: '', files: [{ fileKey: 'fk1', fileName: 'a.png' }] }),
+            baseDeps({
+                inject: () => { injected = true; return true; },
+                downloadAttachments: async () => [],
+            }),
+        );
+        expect(ok).toBe(false);
+        expect(injected).toBe(false);
+    });
+});
+
+describe('handlePush — type: file (ADR-0013 receive half)', () => {
+    const ME = 'dev_listener_me';
+    type Deps = NonNullable<Parameters<typeof handlePush>[1]>;
+    const recorder = () => {
+        const saved: string[] = [];
+        const notes: { title: string; body: string; reveal?: string }[] = [];
+        let injected = 0;
+        const deps: Deps = {
+            deviceId: () => ME,
+            saveFile: async (_push, file) => { saved.push(file.fileName); return `/home/u/Downloads/Hwip/${file.fileName}`; },
+            notify: async (n) => { notes.push(n); return true; },
+            inject: () => { injected++; return true; },
+            paneProbe: () => pane('claude'),
+            rateLimit: () => true,
+            paneCwd: () => null,
+        };
+        return { deps, saved, notes, injectedCount: () => injected };
+    };
+    const filePush = (overrides: Partial<Parameters<typeof handlePush>[0]> = {}) => ({
+        pushId: 'p1',
+        type: 'file',
+        title: '[myapp] shot.png',
+        senderDeviceId: 'dev_mcp_other_host',
+        targetDeviceId: ME,
+        files: [{ fileKey: 'fk1', fileName: 'shot.png', fileType: 'image/png', fileSize: 3 }],
+        ...overrides,
+    });
+
+    // The folder the recorder's saver writes to, as the banner body shows it.
+    const FOLDER = displayFolder('/home/u/Downloads/Hwip/shot.png');
+
+    it('saves a file push addressed to this device and shows a banner naming the sender', async () => {
+        const r = recorder();
+        expect(await handlePush(filePush(), r.deps)).toBe(true);
+        expect(r.saved).toEqual(['shot.png']);
+        expect(r.notes).toEqual([{ title: 'Hwip · shot.png', body: `from [myapp] shot.png · ${FOLDER}`, reveal: '/home/u/Downloads/Hwip/shot.png' }]);
+        expect(r.injectedCount()).toBe(0);
+    });
+
+    it('saves a push with no targetDeviceId (sent to every device)', async () => {
+        const r = recorder();
+        expect(await handlePush(filePush({ targetDeviceId: undefined }), r.deps)).toBe(true);
+        expect(r.saved).toEqual(['shot.png']);
+    });
+
+    it('leaves a push for another device alone', async () => {
+        const r = recorder();
+        expect(await handlePush(filePush({ targetDeviceId: 'dev_phone' }), r.deps)).toBe(false);
+        expect(r.saved).toEqual([]);
+        expect(r.notes).toEqual([]);
+    });
+
+    it("leaves this device's own send alone — it was never wrapped for the sender", async () => {
+        const r = recorder();
+        expect(await handlePush(filePush({ senderDeviceId: ME }), r.deps)).toBe(false);
+        expect(r.saved).toEqual([]);
+    });
+
+    it('an encrypted file push is not dropped (unlike agent.command) — the saver opens our slot', async () => {
+        const r = recorder();
+        expect(await handlePush(filePush({ isEncrypted: true, title: undefined, body: 'not-an-envelope', senderPublicKey: 'pk', deviceKeyMap: { [ME]: '{}' } }), r.deps)).toBe(true);
+        expect(r.saved).toEqual(['shot.png']);
+        // The title could not be opened: the banner falls back to the sender id, the file still lands.
+        expect(r.notes[0]).toEqual({ title: 'Hwip · shot.png', body: `from dev_mcp_other_host · ${FOLDER}`, reveal: '/home/u/Downloads/Hwip/shot.png' });
+    });
+
+    it('a failed save is logged, no banner, returns false; other files in the push still land', async () => {
+        const r = recorder();
+        r.deps.saveFile = async (_push, file) => {
+            if (file.fileName === 'bad.bin') throw new Error('download 403');
+            return `/home/u/Downloads/Hwip/${file.fileName}`;
+        };
+        const push = filePush({ files: [{ fileKey: 'a', fileName: 'bad.bin' }, { fileKey: 'b', fileName: 'ok.txt' }] });
+        expect(await handlePush(push, r.deps)).toBe(true);
+        expect(r.notes.map((n) => n.title)).toEqual(['Hwip · ok.txt']);
+        r.notes.length = 0;
+        expect(await handlePush(filePush({ files: [{ fileKey: 'a', fileName: 'bad.bin' }] }), r.deps)).toBe(false);
+        expect(r.notes).toEqual([]);
+    });
+
+    it('a LAN-delivered attachment (lanDeliveredTo, no fileKey) is skipped in this build, not fetched', async () => {
+        const r = recorder();
+        expect(await handlePush(filePush({ files: [{ fileName: 'big.mov', lanDeliveredTo: ME, transferId: 't1' }] }), r.deps)).toBe(false);
+        expect(r.saved).toEqual([]);
+    });
+
+    it('a file not wrapped for this device (saver returns null) is a quiet skip: no banner, false', async () => {
+        const r = recorder();
+        r.deps.saveFile = async () => null;
+        expect(await handlePush(filePush(), r.deps)).toBe(false);
+        expect(r.notes).toEqual([]);
+    });
+
+    it('a banner that rejects does not fail the save', async () => {
+        const r = recorder();
+        r.deps.notify = async () => { throw new Error('osascript exploded'); };
+        expect(await handlePush(filePush(), r.deps)).toBe(true);
+        await new Promise((res) => setTimeout(res, 0));   // let the rejection settle — an unhandled one fails the run
+        expect(r.saved).toEqual(['shot.png']);
+    });
+
+    it('a file push with no files does nothing', async () => {
+        const r = recorder();
+        expect(await handlePush(filePush({ files: [] }), r.deps)).toBe(false);
+    });
+
+    it('the banner name falls back to the sender device id when there is no title', async () => {
+        const r = recorder();
+        await handlePush(filePush({ title: undefined }), r.deps);
+        expect(r.notes[0].body).toBe(`from dev_mcp_other_host · ${FOLDER}`);
+    });
+
+    // Regression: the gate change for file pushes must not move agent.command.
+    it('agent.command is unchanged: encrypted still dropped, plaintext still injects, never saved', async () => {
+        const r = recorder();
+        const cmd = { pushId: 'c1', type: 'agent.command', agentSessionName: 'hwip-myapp', body: 'do it' };
+        expect(await handlePush({ ...cmd, isEncrypted: true }, r.deps)).toBe(false);
+        expect(r.injectedCount()).toBe(0);
+        expect(await handlePush(cmd, r.deps)).toBe(true);
+        expect(r.injectedCount()).toBe(1);
+        expect(r.saved).toEqual([]);
+        expect(r.notes).toEqual([]);
+    });
+
+    it('a type: file push never injects, even with an agentSessionName and body on it', async () => {
+        const r = recorder();
+        await handlePush(filePush({ agentSessionName: 'hwip-myapp', body: 'rm -rf /' }), r.deps);
+        expect(r.injectedCount()).toBe(0);
+    });
+});
+
+describe('resolveKeys', () => {
+    it('maps whitelisted names (case/space-insensitive) to tmux tokens', () => {
+        expect(resolveKeys(['Escape', 'up', ' Down ', 'LEFT', 'right', 'enter'])).toEqual([
+            'Escape', 'Up', 'Down', 'Left', 'Right', 'Enter',
+        ]);
+    });
+
+    it('maps tab, backspace, and the extended editing keys to tmux tokens', () => {
+        expect(resolveKeys(['tab', 'BackSpace'])).toEqual(['Tab', 'BSpace']);
+        expect(resolveKeys(['backtab', 'delete', 'Space'])).toEqual(['BTab', 'DC', 'Space']);
+    });
+
+    it('rejects the whole batch if any key is unknown', () => {
+        expect(resolveKeys(['escape', 'C-c'])).toBeNull();
+        expect(resolveKeys(['pageup'])).toBeNull();
+    });
+
+    it('maps the three control keys a phone needs against a running agent', () => {
+        // Interrupt, toggle verbose output, clear the screen.
+        expect(resolveKeys(['ctrl-c'])).toEqual(['C-c']);
+        expect(resolveKeys(['CTRL-R', ' ctrl-l '])).toEqual(['C-r', 'C-l']);
+    });
+
+    it('maps the one letter key a phone needs: r to retry after a permission prompt', () => {
+        expect(resolveKeys(['r'])).toEqual(['r']);
+        expect(resolveKeys([' R '])).toEqual(['r']);
+        // Naming one letter does not open the rest of the keyboard.
+        expect(resolveKeys(['y'])).toBeNull();
+        expect(resolveKeys(['n'])).toBeNull();
+    });
+
+    it('still refuses every control key that was not named', () => {
+        // Naming three does not open the send-keys key-name syntax: the map
+        // knows only what was put in it. `ctrl-d` is left out deliberately —
+        // one EOF at an empty prompt ends the agent, and the phone has no way
+        // to start it again.
+        expect(resolveKeys(['ctrl-d'])).toBeNull();
+        expect(resolveKeys(['ctrl-x'])).toBeNull();
+        expect(resolveKeys(['ctrl-z'])).toBeNull();
+        // The tmux spelling is not a wire name — only the lowercase one is.
+        expect(resolveKeys(['C-r'])).toBeNull();
+    });
+
+    it('rejects an empty list', () => {
+        expect(resolveKeys([])).toBeNull();
+    });
+});
+
+describe('handlePush key events', () => {
+    const keysDeps = (override: Parameters<typeof handlePush>[1] = {}) => ({
+        paneProbe: () => pane('claude'),
+        sendKeys: () => true,
+        rateLimit: () => true,
+        ...override,
+    });
+
+    const keyCmd = (keys: string[]) => ({
+        pushId: '1',
+        type: 'agent.command' as const,
+        agentSessionName: 'hwip-myapp',
+        keys,
+    });
+
+    it('sends resolved key tokens (Esc escapes a /usage modal)', async () => {
+        let calledWith: { session: string; tokens: string[] } | null = null;
+        const ok = await handlePush(
+            keyCmd(['escape']),
+            keysDeps({ sendKeys: (session, tokens) => { calledWith = { session, tokens }; return true; } }),
+        );
+        expect(ok).toBe(true);
+        expect(calledWith).toEqual({ session: 'hwip-myapp', tokens: ['Escape'] });
+    });
+
+    it('sends an arrow + Enter sequence in order', async () => {
+        let tokens: string[] | null = null;
+        const ok = await handlePush(
+            keyCmd(['down', 'enter']),
+            keysDeps({ sendKeys: (_s, t) => { tokens = t; return true; } }),
+        );
+        expect(ok).toBe(true);
+        expect(tokens).toEqual(['Down', 'Enter']);
+    });
+
+    it('fires onKeysInjected after a successful key injection', async () => {
+        let snapshotSession: string | null = null;
+        const ok = await handlePush(
+            keyCmd(['down']),
+            keysDeps({ onKeysInjected: (session) => { snapshotSession = session; } }),
+        );
+        expect(ok).toBe(true);
+        expect(snapshotSession).toBe('hwip-myapp');
+    });
+
+    it('does NOT fire onKeysInjected when injection is refused', async () => {
+        let fired = false;
+        const ok = await handlePush(
+            keyCmd(['down']),
+            keysDeps({ sendKeys: () => false, onKeysInjected: () => { fired = true; } }),
+        );
+        expect(ok).toBe(false);
+        expect(fired).toBe(false);
+    });
+
+    it('drops (no send) when any key is unknown', async () => {
+        let sent = false;
+        const ok = await handlePush(
+            keyCmd(['escape', 'C-c']),
+            keysDeps({ sendKeys: () => { sent = true; return true; } }),
+        );
+        expect(ok).toBe(false);
+        expect(sent).toBe(false);
+    });
+
+    it('honours the shell-pane RCE guard for keys too', async () => {
+        let sent = false;
+        const ok = await handlePush(
+            keyCmd(['enter']),
+            keysDeps({ paneProbe: () => pane('bash'), sendKeys: () => { sent = true; return true; } }),
+        );
+        expect(ok).toBe(false);
+        expect(sent).toBe(false);
+    });
+
+    it('honours rate-limit for keys too', async () => {
+        let sent = false;
+        const ok = await handlePush(
+            keyCmd(['escape']),
+            keysDeps({ rateLimit: () => false, sendKeys: () => { sent = true; return true; } }),
+        );
+        expect(ok).toBe(false);
+        expect(sent).toBe(false);
+    });
+
+    it('prefers keys over body when both are present', async () => {
+        let injectedText = false;
+        let sentKeys = false;
+        const ok = await handlePush(
+            { pushId: '1', type: 'agent.command', agentSessionName: 'hwip-myapp', keys: ['escape'], body: 'ignored' },
+            keysDeps({ inject: () => { injectedText = true; return true; }, sendKeys: () => { sentKeys = true; return true; } }),
+        );
+        expect(ok).toBe(true);
+        expect(sentKeys).toBe(true);
+        expect(injectedText).toBe(false);
+    });
+});
+
+describe('handlePush insert (text without the submitting Enter)', () => {
+    const insertDeps = (override: Parameters<typeof handlePush>[1] = {}) => ({
+        paneProbe: () => pane('claude'),
+        insertText: () => true,
+        rateLimit: () => true,
+        paneCwd: () => null,
+        ...override,
+    });
+
+    const insertCmd = (overrides: Partial<Parameters<typeof handlePush>[0]> = {}) => ({
+        pushId: '1',
+        type: 'agent.command' as const,
+        agentSessionName: 'hwip-myapp',
+        insert: 'y',
+        ...overrides,
+    });
+
+    it('routes an insert to the paste-only injector, never the submitting one', async () => {
+        let inserted: { session: string; text: string } | null = null;
+        let submitted = false;
+        const ok = await handlePush(
+            insertCmd(),
+            insertDeps({
+                insertText: (session, text) => { inserted = { session, text }; return true; },
+                inject: () => { submitted = true; return true; },
+            }),
+        );
+        expect(ok).toBe(true);
+        expect(inserted).toEqual({ session: 'hwip-myapp', text: 'y' });
+        expect(submitted).toBe(false);
+    });
+
+    it('honours the shell-pane RCE guard', async () => {
+        let inserted = false;
+        const ok = await handlePush(
+            insertCmd(),
+            insertDeps({ paneProbe: () => pane('bash'), insertText: () => { inserted = true; return true; } }),
+        );
+        expect(ok).toBe(false);
+        expect(inserted).toBe(false);
+    });
+
+    it('honours the rate limit', async () => {
+        let inserted = false;
+        const ok = await handlePush(
+            insertCmd(),
+            insertDeps({ rateLimit: () => false, insertText: () => { inserted = true; return true; } }),
+        );
+        expect(ok).toBe(false);
+        expect(inserted).toBe(false);
+    });
+
+    it('drops a push carrying both insert and body', async () => {
+        // Submitting and not-submitting the same text are opposite
+        // instructions; a message meaning both means nothing.
+        let touched = false;
+        const ok = await handlePush(
+            insertCmd({ body: 'do the thing' }),
+            insertDeps({
+                insertText: () => { touched = true; return true; },
+                inject: () => { touched = true; return true; },
+            }),
+        );
+        expect(ok).toBe(false);
+        expect(touched).toBe(false);
+    });
+
+    it('prefers keys over insert when both are present', async () => {
+        let inserted = false;
+        let sentKeys = false;
+        const ok = await handlePush(
+            insertCmd({ keys: ['escape'] }),
+            insertDeps({
+                sendKeys: () => { sentKeys = true; return true; },
+                insertText: () => { inserted = true; return true; },
+            }),
+        );
+        expect(ok).toBe(true);
+        expect(sentKeys).toBe(true);
+        expect(inserted).toBe(false);
+    });
+
+});
+
+describe('gcAttachments', () => {
+    it('removes dirs older than the TTL and keeps fresh ones', () => {
+        const root = mkdtempSync(join(tmpdir(), 'hwip-gc-'));
+        const now = 1_000_000_000_000;
+        const ttl = 60_000;
+        const old = join(root, 'old');
+        const fresh = join(root, 'fresh');
+        mkdirSync(old);
+        mkdirSync(fresh);
+        // mtime in seconds for utimes; old is well past the TTL.
+        utimesSync(old, new Date(now - ttl - 10_000), new Date(now - ttl - 10_000));
+        utimesSync(fresh, new Date(now - 1_000), new Date(now - 1_000));
+
+        const removed = gcAttachments(now, root, ttl);
+        expect(removed).toBe(1);
+        expect(existsSync(old)).toBe(false);
+        expect(existsSync(fresh)).toBe(true);
+    });
+
+    it('returns 0 when the attachments dir does not exist', () => {
+        expect(gcAttachments(Date.now(), join(tmpdir(), 'hwip-gc-missing-xyz'))).toBe(0);
+    });
+});
+
+describe('parseSessionName', () => {
+    it('strips the hwip- prefix into the project field', () => {
+        expect(parseSessionName('hwip-encl')).toEqual({ project: 'encl', label: null });
+    });
+
+    it('keeps dashes inside the project name when no session options say otherwise', () => {
+        expect(parseSessionName('hwip-my-cool-app')).toEqual({ project: 'my-cool-app', label: null });
+    });
+
+    // wrapper `sessionSidecarArgs`: a label or worktree tail would otherwise open a card of its own.
+    it('prefers the session options the wrapper set over the name', () => {
+        expect(parseSessionName('hwip-ko-qmd-20260924-PLAN-1-pi', { project: 'ko-qmd', label: '20260924-PLAN-1-pi' }))
+            .toEqual({ project: 'ko-qmd', label: '20260924-PLAN-1-pi' });
+        // tmux prints an unset option as empty — that is "no sidecar".
+        expect(parseSessionName('hwip-encl', { project: '', label: '' })).toEqual({ project: 'encl', label: null });
+    });
+
+    it('returns null for non-hwip-prefixed names', () => {
+        expect(parseSessionName('main')).toBeNull();
+        expect(parseSessionName('hwip')).toBeNull();   // no dash, no project
+        expect(parseSessionName('hwip-')).toBeNull();  // empty project
+        expect(parseSessionName('')).toBeNull();
+    });
+});
+
+// The one rule both the wrapper's session options and the listener's
+// correction of sessions started without them follow (config `groupOf`).
+describe('groupOf', () => {
+    const main = { key: 'ko-qmd', linked: false, root: '/w/ko-qmd' };
+    const linked = { key: 'ko-qmd', linked: true, root: '/w/ko-qmd' };
+
+    it('splits a tail that starts with the repo name into project and label', () => {
+        expect(groupOf('ko-qmd-20260924-PLAN-1-pi', main)).toEqual({ project: 'ko-qmd', label: '20260924-PLAN-1-pi' });
+        expect(groupOf('ko-qmd-wt-x', linked)).toEqual({ project: 'ko-qmd', label: 'wt-x' });
+        // A dotted repo's session name carries `_`, as tmux stores it.
+        expect(groupOf('foo_bar-wt-x', { key: 'foo.bar', linked: true, root: '/w/foo.bar' })).toEqual({ project: 'foo.bar', label: 'wt-x' });
+    });
+
+    // `-2`, `-3` is the wrapper's family counter — the phone shows it as `#2`.
+    it('leaves the project name and its family counter alone in the main checkout', () => {
+        expect(groupOf('ko-qmd', main)).toBeNull();
+        expect(groupOf('ko-qmd-2', main)).toBeNull();
+    });
+
+    it('groups a linked worktree under its repo whatever the session is called', () => {
+        expect(groupOf('feature-y', linked)).toEqual({ project: 'ko-qmd', label: 'feature-y' });
+        expect(groupOf('ko-qmd-wt-x-2', linked)).toEqual({ project: 'ko-qmd', label: 'wt-x-2' });
+    });
+
+    it('leaves a main-checkout session named for some other directory alone', () => {
+        expect(groupOf('hwipit', main)).toBeNull();
+    });
+
+    it('leaves a session outside git alone', () => {
+        expect(groupOf('ko-qmd-plan-pi', null)).toBeNull();
+    });
+});
+
+describe('computeBackoff', () => {
+    // base(attempt) = min(RECONNECT_BASE_MS * 2^attempt, RECONNECT_MAX_MS)
+    //   = min(1000 * 2^attempt, 30000): 1000, 2000, 4000, 8000, 16000, then
+    //   capped at 30000 from attempt 5 onward.
+    // jitter = base * 0.15 * (random*2 - 1) → result ∈ [0.85·base, 1.15·base].
+    const BASE: Record<number, number> = { 0: 1000, 1: 2000, 2: 4000, 3: 8000, 4: 16000 };
+
+    afterEach(() => {
+        vi.restoreAllMocks();
+    });
+
+    it('returns the exact exponential base at the jitter midpoint', () => {
+        // random=0.5 → (0.5*2-1)=0 → zero jitter → result equals base.
+        vi.spyOn(Math, 'random').mockReturnValue(0.5);
+        for (const attempt of [0, 1, 2, 3, 4]) {
+            expect(computeBackoff(attempt)).toBe(BASE[attempt]);
+        }
+    });
+
+    it('grows monotonically (at the jitter midpoint) until the cap', () => {
+        vi.spyOn(Math, 'random').mockReturnValue(0.5);
+        let prev = -1;
+        for (const attempt of [0, 1, 2, 3, 4]) {
+            const cur = computeBackoff(attempt);
+            expect(cur).toBeGreaterThan(prev);
+            prev = cur;
+        }
+    });
+
+    it('jitter floor (random=0) sits at 0.85·base', () => {
+        vi.spyOn(Math, 'random').mockReturnValue(0);
+        for (const attempt of [0, 1, 2, 3, 4]) {
+            expect(computeBackoff(attempt)).toBeCloseTo(BASE[attempt] * 0.85, 6);
+        }
+    });
+
+    it('jitter ceiling (random just under 1) sits near 1.15·base', () => {
+        // random→1 gives factor→+1; use a value extremely close so the band
+        // edge is exercised without relying on Math.random ever returning 1.
+        vi.spyOn(Math, 'random').mockReturnValue(0.999999);
+        for (const attempt of [0, 1, 2, 3, 4]) {
+            const v = computeBackoff(attempt);
+            expect(v).toBeGreaterThan(BASE[attempt] * 1.149);
+            expect(v).toBeLessThanOrEqual(BASE[attempt] * 1.15);
+        }
+    });
+
+    it('caps the base at RECONNECT_MAX_MS for high attempt counts', () => {
+        vi.spyOn(Math, 'random').mockReturnValue(0.5); // zero jitter → exact cap
+        // 1000*2^5 = 32000 > 30000, so attempt 5+ is pinned to the 30000 cap.
+        for (const attempt of [5, 6, 10, 50, 1000]) {
+            expect(computeBackoff(attempt)).toBe(30000);
+        }
+    });
+
+    it('keeps the jittered result inside the ±15% band at the cap', () => {
+        vi.spyOn(Math, 'random').mockReturnValue(0);   // floor
+        expect(computeBackoff(10)).toBeCloseTo(30000 * 0.85, 6);
+        vi.spyOn(Math, 'random').mockReturnValue(0.999999); // ceiling
+        expect(computeBackoff(10)).toBeLessThanOrEqual(30000 * 1.15);
+    });
+
+    it('keeps every jittered delay inside the ±15% band across the full random range (fuzz)', () => {
+        // Real Math.random. The ±15% band is the invariant computeBackoff
+        // actually guarantees; assert it directly (the old ">= 0" bound was
+        // always true since the floor 0.85·base is strictly positive).
+        const EPSILON = 1e-9; // absorb float rounding at the exact band edges
+        for (let i = 0; i < 5000; i++) {
+            const attempt = i % 12; // spans pre-cap and capped regions
+            const base = Math.min(1000 * 2 ** attempt, 30000);
+            const v = computeBackoff(attempt);
+            expect(v).toBeGreaterThanOrEqual(base * 0.85 - EPSILON);
+            expect(v).toBeLessThanOrEqual(base * 1.15 + EPSILON);
+        }
+    });
+});
+
+describe('AUTH_FAILURE_CODES', () => {
+    it('contains exactly the three auth-failure close codes', () => {
+        expect([...AUTH_FAILURE_CODES].sort()).toEqual([4001, 4002, 4003]);
+    });
+
+    it('matches the codes the reconnect loop must give up on', () => {
+        for (const code of [4001, 4002, 4003]) {
+            expect(AUTH_FAILURE_CODES.has(code)).toBe(true);
+        }
+    });
+
+    it('does not include transient/normal close codes (those reconnect)', () => {
+        // 1000 normal, 1001 going away, 1006 abnormal, 1011 server error,
+        // 1012 service restart, 4000 generic app close — all retryable.
+        for (const code of [1000, 1001, 1006, 1011, 1012, 4000, -1]) {
+            expect(AUTH_FAILURE_CODES.has(code)).toBe(false);
+        }
+    });
+});
+
+describe('computeListenerDeviceId', () => {
+    it('is deterministic for the same hostname', () => {
+        expect(computeListenerDeviceId('my-host')).toBe(computeListenerDeviceId('my-host'));
+    });
+
+    it('differs across hostnames', () => {
+        expect(computeListenerDeviceId('host-a')).not.toBe(computeListenerDeviceId('host-b'));
+    });
+
+    it('emits the dev_listener_<sha8> shape (8 lowercase hex chars)', () => {
+        expect(computeListenerDeviceId('my-host')).toMatch(/^dev_listener_[0-9a-f]{8}$/);
+    });
+
+    it('matches the mcp-server device-id contract for a shared seed', () => {
+        // Cross-repo lock: mcp-server config.ts `listenerDeviceId` must derive
+        // this exact id from the same machine seed, or `hwip_ask` hooks land in
+        // the feed but never thread into the agent chat. The golden constant is
+        // hardcoded in BOTH repos (mcp-server src/listener-device-id.test.ts),
+        // so any change to the hash formula breaks the test on both sides.
+        expect(computeListenerDeviceId('HWIP-TEST-MACHINE-ID-0001')).toBe('dev_listener_ffd86de0');
+    });
+
+    it('pins the no-arg id for the process lifetime (hostname drift immunity)', () => {
+        // macOS renames the hostname with network changes; the id used to
+        // connect and the id checked on screen requests must never diverge.
+        expect(computeListenerDeviceId()).toBe(computeListenerDeviceId());
+        expect(computeListenerDeviceId()).toMatch(/^dev_listener_[0-9a-f]{8}$/);
+    });
+});
+
+describe('resolveWsUrl', () => {
+    const PROD_BASE = 'https://api.hwip.app/v1';
+
+    it('defaults to the prod socket when nothing is configured and base URL is prod', () => {
+        expect(resolveWsUrl({}, {}, PROD_BASE)).toBe('wss://ws.hwip.app');
+    });
+
+    it('refuses to default when a custom base URL is set (env-split guard)', () => {
+        expect(resolveWsUrl({}, {}, 'https://api.hwip.app/d1')).toBeNull();
+    });
+
+    it('explicit config wins over the default', () => {
+        expect(resolveWsUrl({}, { wsUrl: 'wss://ws-dev.hwip.app' }, PROD_BASE)).toBe('wss://ws-dev.hwip.app');
+    });
+
+    it('--ws-url arg wins over everything', () => {
+        expect(resolveWsUrl({ 'ws-url': 'wss://custom' }, { wsUrl: 'wss://cfg' }, PROD_BASE)).toBe('wss://custom');
+    });
+});
+
+describe('deriveSessionState', () => {
+    beforeEach(() => {
+        resetSessionStates();
+    });
+
+    const WORKING_PANE = '✻ Churning… (12s · esc to interrupt)';
+    const BLOCKED_PANE = 'Do you want to proceed?\n❯ 1. Yes\nEnter to select · esc to cancel';
+
+    it('reports state fields from the first capture (baseline)', () => {
+        const r = deriveSessionState('hwip-proj', 'claude', WORKING_PANE, 1000);
+        expect(r.state).toBe('working');
+        expect(r.stateChangedAt).toBe(new Date(1000).toISOString());
+        expect(r.stateRuleId).toBe('claude-working-interrupt-hint');
+    });
+
+    it('debounces a transition across two cycles', () => {
+        deriveSessionState('hwip-proj', 'claude', WORKING_PANE, 0);
+        const mid = deriveSessionState('hwip-proj', 'claude', BLOCKED_PANE, 5000);
+        expect(mid.state).toBe('working'); // candidate only
+        const done = deriveSessionState('hwip-proj', 'claude', BLOCKED_PANE, 10000);
+        expect(done.state).toBe('blocked');
+        expect(done.stateChangedAt).toBe(new Date(10000).toISOString());
+    });
+
+    it('promotes a pending candidate on a hash-identical cycle', () => {
+        // Screen froze on the blocked dialog: cycle 2 evaluates it,
+        // cycle 3 sees identical bytes. The replayed observation must
+        // still count as the second sighting.
+        deriveSessionState('hwip-proj', 'claude', WORKING_PANE, 0);
+        deriveSessionState('hwip-proj', 'claude', BLOCKED_PANE, 5000);
+        const r = deriveSessionState('hwip-proj', 'claude', BLOCKED_PANE, 10000);
+        expect(r.state).toBe('blocked');
+    });
+
+    it('returns no fields and forgets the session when the pane is unreadable', () => {
+        deriveSessionState('hwip-proj', 'claude', WORKING_PANE, 0);
+        expect(deriveSessionState('hwip-proj', 'claude', null, 5000)).toEqual({});
+        // Next readable capture is a fresh baseline, confirmed immediately.
+        const r = deriveSessionState('hwip-proj', 'claude', BLOCKED_PANE, 10000);
+        expect(r.state).toBe('blocked');
+    });
+
+    it('tracks sessions independently', () => {
+        const a = deriveSessionState('hwip-a', 'claude', WORKING_PANE, 0);
+        const b = deriveSessionState('hwip-b', 'claude', BLOCKED_PANE, 0);
+        expect(a.state).toBe('working');
+        expect(b.state).toBe('blocked');
+    });
+});
+
+describe('handleScreenRequest', () => {
+    const myDevice = computeListenerDeviceId();
+
+    it('ignores non-screen ephemeral traffic', async () => {
+        expect(await handleScreenRequest({ subtype: 'clipboard', targetDeviceId: myDevice })).toBeNull();
+        expect(await handleScreenRequest({})).toBeNull();
+    });
+
+    it('ignores requests addressed to another device', async () => {
+        expect(await handleScreenRequest({
+            subtype: 'agent.screen.request',
+            targetDeviceId: 'dev_someone_else',
+            sessionName: 'hwip-proj',
+            requestId: 'r1',
+        })).toBeNull();
+    });
+
+    it('ignores requests missing requestId or sessionName', async () => {
+        expect(await handleScreenRequest({
+            subtype: 'agent.screen.request',
+            targetDeviceId: myDevice,
+            requestId: 'r1',
+        })).toBeNull();
+        expect(await handleScreenRequest({
+            subtype: 'agent.screen.request',
+            targetDeviceId: myDevice,
+            sessionName: 'hwip-proj',
+        })).toBeNull();
+    });
+
+    it('answers unknown sessions with an error snapshot (no tmux access attempted)', async () => {
+        // No hwip-* tmux sessions exist in the test environment, so any
+        // name fails the inventory guard — the pane is never read.
+        const reply = await handleScreenRequest({
+            subtype: 'agent.screen.request',
+            targetDeviceId: myDevice,
+            sessionName: 'hwip-not-there',
+            requestId: 'r42',
+        });
+        expect(reply).not.toBeNull();
+        expect(reply?.subtype).toBe('agent.screen.snapshot');
+        expect(reply?.requestId).toBe('r42');
+        expect(['unknown_session', 'rate_limited']).toContain(reply?.error);
+        expect(reply?.content).toBeUndefined();
+    });
+});
+
+describe('handleStreamControl (live mirror PoC)', () => {
+    const myDevice = computeListenerDeviceId();
+    afterEach(() => stopAllStreams());
+
+    it('does not claim non-stream ephemeral traffic (falls through to screen-peek)', () => {
+        const sent: object[] = [];
+        expect(handleStreamControl({ subtype: 'clipboard' }, (d) => sent.push(d))).toBe(false);
+        expect(handleStreamControl({ subtype: 'agent.screen.request' }, (d) => sent.push(d))).toBe(false);
+        expect(sent).toEqual([]);
+    });
+
+    it('ignores a start addressed to another device', () => {
+        const sent: object[] = [];
+        expect(handleStreamControl(
+            { subtype: 'agent.stream.start', targetDeviceId: 'dev_someone_else', sessionName: 'hwip-proj' },
+            (d) => sent.push(d),
+        )).toBe(false);
+        expect(sent).toEqual([]);
+    });
+
+    it('claims a start for an unknown session with an error frame and starts no timer', () => {
+        // No hwip-* tmux sessions exist in the test env → inventory guard
+        // rejects before any interval is scheduled (no leak to clean up).
+        const sent: Array<Record<string, unknown>> = [];
+        expect(handleStreamControl(
+            { subtype: 'agent.stream.start', targetDeviceId: myDevice, sessionName: 'hwip-not-there' },
+            (d) => sent.push(d as Record<string, unknown>),
+        )).toBe(true);
+        expect(sent).toHaveLength(1);
+        expect(sent[0]).toMatchObject({ subtype: 'agent.stream.frame', error: 'unknown_session' });
+    });
+
+    it('claims a stop message and is a no-op for an unknown session', () => {
+        // targetDeviceId is required now: the relay fans stream-control out to
+        // every connection, so an unaddressed stop must not reach into another
+        // machine's stream of the same tmux name.
+        expect(handleStreamControl({ subtype: 'agent.stream.stop', targetDeviceId: myDevice, sessionName: 'hwip-proj' }, () => {})).toBe(true);
+        expect(() => stopStream('hwip-proj')).not.toThrow();
+        expect(() => stopAllStreams()).not.toThrow();
+    });
+});
+
+describe('isStreamCapReached (per-listener concurrency guard)', () => {
+    it('allows counts below the cap and refuses at or above it', () => {
+        expect(isStreamCapReached(0)).toBe(false);
+        expect(isStreamCapReached(MAX_CONCURRENT_STREAMS - 1)).toBe(false);
+        expect(isStreamCapReached(MAX_CONCURRENT_STREAMS)).toBe(true);
+        expect(isStreamCapReached(MAX_CONCURRENT_STREAMS + 1)).toBe(true);
+    });
+});
+
+describe('buildStreamFrame (stream E2EE)', () => {
+    // Fresh HOME per test so device-keys.json lands in a tmp dir, and fresh
+    // modules so crypto.ts re-resolves its paths against it (same pattern as
+    // crypto.test.ts).
+    let TMP: string;
+    const originalHome = process.env.HOME;
+
+    beforeEach(() => {
+        TMP = mkdtempSync(join(tmpdir(), 'listener-stream-e2ee-'));
+        process.env.HOME = TMP;
+        vi.resetModules();
+    });
+
+    afterEach(() => {
+        rmSync(TMP, { recursive: true, force: true });
+        if (originalHome === undefined) delete process.env.HOME;
+        else process.env.HOME = originalHome;
+    });
+
+    const makeRecipientKey = async (): Promise<string> => {
+        const { webcrypto } = await import('node:crypto');
+        const wc = webcrypto as unknown as Crypto;
+        const pair = await wc.subtle.generateKey(
+            { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits'],
+        ) as CryptoKeyPair;
+        const spki = new Uint8Array(await wc.subtle.exportKey('spki', pair.publicKey));
+        let bin = '';
+        for (let i = 0; i < spki.length; i++) bin += String.fromCharCode(spki[i]);
+        return btoa(bin);
+    };
+
+    it('emits plaintext content when no subscriber key is given', async () => {
+        const { buildStreamFrame } = await import('./listener.js');
+        const frame = await buildStreamFrame({ content: 'hello pane', truncated: false }, 'hwip-a');
+        expect(frame).toMatchObject({ subtype: 'agent.stream.frame', sessionName: 'hwip-a', content: 'hello pane' });
+        expect(frame).not.toHaveProperty('encrypted');
+    });
+
+    it('wraps content in an E2EE envelope when a subscriber key is given — no plaintext field', async () => {
+        const { buildStreamFrame } = await import('./listener.js');
+        const { initDeviceCrypto, getDevicePublicKey } = await import('./crypto.js');
+        await initDeviceCrypto();
+        const frame = await buildStreamFrame(
+            { content: 'secret pane', truncated: true }, 'hwip-a', await makeRecipientKey(), undefined, STAMP,
+        );
+        expect(frame).not.toBeNull();
+        expect(frame).not.toHaveProperty('content');
+        expect(frame).not.toHaveProperty('kind');
+        expect(frame).toMatchObject({ subtype: 'agent.stream.frame', sessionName: 'hwip-a', truncated: true });
+        const encrypted = frame?.encrypted;
+        expect(encrypted?.senderPublicKey).toBe(getDevicePublicKey());
+        // Envelope v2: one layer, no wrapped key.
+        expect(encrypted?.v).toBe(2);
+        for (const field of ['salt', 'iv', 'ciphertext'] as const) {
+            expect(encrypted?.[field]).toMatch(/^[A-Za-z0-9+/=]+$/);
+        }
+        expect(encrypted).not.toHaveProperty('encryptedKey');
+        expect(encrypted?.ciphertext).not.toContain('secret pane');
+    });
+
+    // A relay can swap sealed frames between two streams to the same phone or
+    // replay an older subscription's frames; only what is sealed can tell. So
+    // the stamps ride inside the envelope with the pane, and the viewer checks
+    // them against the cleartext ones and its own subscription nonce.
+    const STAMP = { seq: 1, epoch: 100 };
+
+    /** A frame sealed for this device itself, opened as its subscriber would. */
+    const openOwnFrame = async (encrypted: unknown, sessionName: string) => {
+        const { openV2, getDevicePublicKey, isSealedV2 } = await import('./crypto.js');
+        const self = getDevicePublicKey();
+        if (!isSealedV2(encrypted) || !self) throw new Error('not a v2 frame');
+        return JSON.parse(await openV2('stream.frame', encrypted, self, sessionName));
+    };
+
+    it('seals the frame to its session, stamp and subscription', async () => {
+        const { buildStreamFrame } = await import('./listener.js');
+        const { initDeviceCrypto, getDevicePublicKey } = await import('./crypto.js');
+        await initDeviceCrypto();
+        const frame = await buildStreamFrame(
+            { content: 'secret pane', truncated: true }, 'hwip-a', getDevicePublicKey() ?? undefined,
+            { cursor: { line: 2, col: 5 }, historyLines: 7, historySize: 40 },
+            { seq: 4, epoch: 1234, nonce: 'bm9uY2U=' },
+        );
+        expect(frame?.encrypted).toBeDefined();
+        const opened = await openOwnFrame(frame?.encrypted, 'hwip-a');
+        expect(opened).toEqual({
+            sessionName: 'hwip-a', seq: 4, epoch: 1234, nonce: 'bm9uY2U=',
+            content: 'secret pane', truncated: true, cursorLine: 2, cursorCol: 5, historyLines: 7, historySize: 40,
+        });
+    });
+
+    it('leaves the nonce out of the seal when the subscriber sent none', async () => {
+        const { buildStreamFrame } = await import('./listener.js');
+        const { initDeviceCrypto, getDevicePublicKey } = await import('./crypto.js');
+        await initDeviceCrypto();
+        const frame = await buildStreamFrame(
+            { content: 'pane', truncated: false }, 'hwip-a', getDevicePublicKey() ?? undefined, undefined, { seq: 1, epoch: 9 },
+        );
+        const opened = await openOwnFrame(frame?.encrypted, 'hwip-a');
+        expect(opened).toEqual({ sessionName: 'hwip-a', seq: 1, epoch: 9, content: 'pane', truncated: false });
+    });
+
+    it('drops the frame (null) on a bad subscriber key — never leaks plaintext', async () => {
+        const { buildStreamFrame } = await import('./listener.js');
+        const { initDeviceCrypto } = await import('./crypto.js');
+        await initDeviceCrypto();
+        const frame = await buildStreamFrame({ content: 'secret pane', truncated: false }, 'hwip-a', 'not-a-key', undefined, STAMP);
+        expect(frame).toBeNull();
+    });
+
+    it('drops the frame (null) when device crypto is not initialized', async () => {
+        const { buildStreamFrame } = await import('./listener.js');
+        const frame = await buildStreamFrame(
+            { content: 'secret pane', truncated: false }, 'hwip-a', await makeRecipientKey(), undefined, STAMP,
+        );
+        expect(frame).toBeNull();
+    });
+
+    it('drops a sealed frame that has no stamp — the viewer could not check it', async () => {
+        const { buildStreamFrame } = await import('./listener.js');
+        const { initDeviceCrypto } = await import('./crypto.js');
+        await initDeviceCrypto();
+        const frame = await buildStreamFrame({ content: 'secret pane', truncated: false }, 'hwip-a', await makeRecipientKey());
+        expect(frame).toBeNull();
+    });
+
+    // A `-e` capture at the content cap grows by half as JSON (each ESC becomes
+    // `\u001b`), and sealing base64-expands it again: past the relay's 32KB WS
+    // frame unless the sealed frame is trimmed on its own budget.
+    it('keeps a full coloured capture under the WS frame limit once sealed', async () => {
+        const { buildStreamFrame, SEALED_FRAME_MAX_BYTES } = await import('./listener.js');
+        const { initDeviceCrypto, getDevicePublicKey } = await import('./crypto.js');
+        await initDeviceCrypto();
+        const row = '\u001b[38;2;255;120;0mx\u001b[0m'.repeat(20) + '\n';
+        const content = row.repeat(Math.ceil(24 * 1024 / row.length)).slice(0, 24 * 1024);
+        const frame = await buildStreamFrame(
+            { content, truncated: false }, 'hwip-a', getDevicePublicKey() ?? undefined,
+            { cursor: { line: 30, col: 1 }, historyLines: 20 }, STAMP,
+        );
+        expect(Buffer.byteLength(JSON.stringify(frame), 'utf-8')).toBeLessThan(30 * 1024);
+        const opened = await openOwnFrame(frame?.encrypted, 'hwip-a');
+        expect(Buffer.byteLength(JSON.stringify(opened), 'utf-8')).toBeLessThanOrEqual(SEALED_FRAME_MAX_BYTES);
+        expect(content.endsWith(opened.content)).toBe(true);
+        expect(opened.truncated).toBe(true);
+        // The cleartext copies say what the envelope says.
+        expect(frame).toMatchObject({ truncated: true, historyLines: opened.historyLines });
+    });
+
+    // The viewer sends this number back as `before` when it pulls history, so a
+    // frame that omits it silently costs the reader the lines between what it
+    // holds and where the daemon would guess the page starts.
+    it('tells the viewer how much scrollback the frame carries', async () => {
+        const { buildStreamFrame } = await import('./listener.js');
+        const frame = await buildStreamFrame(
+            { content: 'pane', truncated: true }, 'hwip-a', undefined, { historyLines: 137 },
+        );
+        expect(frame).toMatchObject({ historyLines: 137 });
+    });
+
+    it('leaves it out when the pane geometry could not be read', async () => {
+        const { buildStreamFrame } = await import('./listener.js');
+        const frame = await buildStreamFrame({ content: 'pane', truncated: false }, 'hwip-a');
+        expect(frame).not.toHaveProperty('historyLines');
+    });
+
+    // The viewer needs the pane's total scrollback depth to know where this
+    // frame's window sits in the buffer — without it, working out which lines
+    // scrolled away is a text-matching guess that a redrawing TUI defeats.
+    it('tells the viewer how deep the pane scrollback is', async () => {
+        const { buildStreamFrame } = await import('./listener.js');
+        const frame = await buildStreamFrame(
+            { content: 'pane', truncated: false }, 'hwip-a', undefined, { historySize: 842 },
+        );
+        expect(frame).toMatchObject({ historySize: 842 });
+    });
+
+    it('leaves the depth out when tmux would not say', async () => {
+        const { buildStreamFrame } = await import('./listener.js');
+        const frame = await buildStreamFrame(
+            { content: 'pane', truncated: false }, 'hwip-a', undefined, { historyLines: 3 },
+        );
+        expect(frame).not.toHaveProperty('historySize');
+    });
+});
+
+/**
+ * The one tmux read the frame path already makes per tick carries the cursor,
+ * the pane height and — now — the scrollback depth. Parsing is its own function
+ * because the failure that matters is a partial answer: a tmux that does not
+ * report one field must not cost the viewer the cursor as well.
+ */
+describe('parsePaneGeometry', () => {
+    it('reads cursor, pane height and scrollback depth', async () => {
+        const { parsePaneGeometry } = await import('./listener.js');
+        expect(parsePaneGeometry('12,3,62,842\n')).toEqual({ x: 12, y: 3, height: 62, historySize: 842 });
+    });
+
+    it('keeps the cursor when the depth is missing', async () => {
+        const { parsePaneGeometry } = await import('./listener.js');
+        expect(parsePaneGeometry('12,3,62\n')).toEqual({ x: 12, y: 3, height: 62 });
+    });
+
+    it('keeps the cursor when the depth is not a number', async () => {
+        const { parsePaneGeometry } = await import('./listener.js');
+        expect(parsePaneGeometry('12,3,62,#{history_size}')).toEqual({ x: 12, y: 3, height: 62 });
+    });
+
+    it('reports a pane with no scrollback as a depth of zero, not as missing', async () => {
+        const { parsePaneGeometry } = await import('./listener.js');
+        expect(parsePaneGeometry('0,0,62,0')).toEqual({ x: 0, y: 0, height: 62, historySize: 0 });
+    });
+
+    // A depth of zero is how a just-cleared pane answers, and the viewer treats
+    // the drop to zero as that clear. An empty field must not arrive as one:
+    // `Number('')` is 0, so an unchecked convert would fake a clear on every
+    // frame tmux answered thinly.
+    it('does not read an empty depth field as a depth of zero', async () => {
+        const { parsePaneGeometry } = await import('./listener.js');
+        expect(parsePaneGeometry('12,3,62,')).toEqual({ x: 12, y: 3, height: 62 });
+    });
+
+    it('refuses an answer with no usable geometry', async () => {
+        const { parsePaneGeometry } = await import('./listener.js');
+        expect(parsePaneGeometry('')).toBeNull();
+        expect(parsePaneGeometry('12,3')).toBeNull();
+        expect(parsePaneGeometry('a,b,c,d')).toBeNull();
+    });
+});
+
+describe('historyLinesIn', () => {
+    // 24 rows captured, 10 of them the visible pane.
+    const capture = (rows: number) => Array.from({ length: rows }, (_, i) => `l${i}`).join('\n') + '\n';
+
+    it('counts the rows above the visible pane', () => {
+        expect(historyLinesIn(capture(24), 10)).toBe(14);
+    });
+
+    it('reports what a trimmed frame actually holds, not what was asked for', () => {
+        // The byte cap cut the capture down to 12 rows; only 2 are scrollback.
+        expect(historyLinesIn(capture(12), 10)).toBe(2);
+    });
+
+    it('never goes negative when the pane is taller than the capture', () => {
+        expect(historyLinesIn(capture(4), 10)).toBe(0);
+    });
+
+    it('counts a capture with no trailing newline the same way', () => {
+        expect(historyLinesIn('l0\nl1\nl2', 1)).toBe(2);
+    });
+});
+
+describe('pattern watches (§S5 v2)', () => {
+    beforeEach(() => {
+        resetPatternWatches();
+    });
+
+    it('reports a hit with the matched line and fires only once', () => {
+        setPatternWatches([{ sessionName: 'hwip-a', pattern: 'ready on port \\d+' }]);
+        const capture = () => 'building…\nServer ready on port 3000\n❯';
+        const first = collectWatchHits(new Set(['hwip-a']), capture);
+        expect(first).toEqual([{
+            sessionName: 'hwip-a',
+            pattern: 'ready on port \\d+',
+            matchedLine: 'Server ready on port 3000',
+        }]);
+        expect(collectWatchHits(new Set(['hwip-a']), capture)).toEqual([]);
+    });
+
+    it('skips watches whose session is not live', () => {
+        setPatternWatches([{ sessionName: 'hwip-gone', pattern: 'x' }]);
+        expect(collectWatchHits(new Set(['hwip-a']), () => 'x marks the spot')).toEqual([]);
+    });
+
+    it('does not fire without a match and stays armed', () => {
+        setPatternWatches([{ sessionName: 'hwip-a', pattern: 'DONE' }]);
+        expect(collectWatchHits(new Set(['hwip-a']), () => 'still working')).toEqual([]);
+        expect(collectWatchHits(new Set(['hwip-a']), () => 'all DONE here')).toHaveLength(1);
+    });
+
+    it('re-arms when the server re-sends a previously fired watch', () => {
+        setPatternWatches([{ sessionName: 'hwip-a', pattern: 'hit' }]);
+        expect(collectWatchHits(new Set(['hwip-a']), () => 'hit!')).toHaveLength(1);
+        // Ack without the watch → pruned. A later ack re-adds it fresh.
+        setPatternWatches([]);
+        setPatternWatches([{ sessionName: 'hwip-a', pattern: 'hit' }]);
+        expect(collectWatchHits(new Set(['hwip-a']), () => 'hit again')).toHaveLength(1);
+    });
+
+    it('ignores malformed watch payloads', () => {
+        setPatternWatches([{ nope: true }, 'garbage', null]);
+        expect(collectWatchHits(new Set(['hwip-a']), () => 'anything')).toEqual([]);
+    });
+
+    it('handles unreadable panes gracefully', () => {
+        setPatternWatches([{ sessionName: 'hwip-a', pattern: 'x' }]);
+        expect(collectWatchHits(new Set(['hwip-a']), () => null)).toEqual([]);
+    });
+});
+
+describe('writeRemoteMarker (ADR-0002)', () => {
+    let stateHome: string;
+    let savedXdg: string | undefined;
+
+    beforeEach(() => {
+        stateHome = mkdtempSync(join(tmpdir(), 'hwip-remote-'));
+        savedXdg = process.env.XDG_STATE_HOME;
+        process.env.XDG_STATE_HOME = stateHome;
+    });
+
+    afterEach(() => {
+        if (savedXdg === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = savedXdg;
+        rmSync(stateHome, { recursive: true, force: true });
+    });
+
+    const markerPath = (cwd: string): string =>
+        join(stateHome, 'hwip', `remote-${projectHash(cwd)!}`);
+
+    it('writes "<epochSec> <sha256(trimmed text)>\\n" keyed by cksum of the cwd', () => {
+        const ok = writeRemoteMarker('/some/project', 'fix the bug\n', () => 1_700_000_000_000);
+        expect(ok).toBe(true);
+        const expected = createHash('sha256').update('fix the bug').digest('hex');
+        expect(readFileSync(markerPath('/some/project'), 'utf-8')).toBe(`1700000000 ${expected}\n`);
+    });
+
+    it('overwrites the previous marker for the same cwd', () => {
+        writeRemoteMarker('/some/project', 'first', () => 1_000_000);
+        writeRemoteMarker('/some/project', 'second', () => 2_000_000);
+        const digest = createHash('sha256').update('second').digest('hex');
+        expect(readFileSync(markerPath('/some/project'), 'utf-8')).toBe(`2000 ${digest}\n`);
+    });
+
+    it('trims ASCII whitespace only — a trailing NBSP stays in the digest (bash parity)', () => {
+        writeRemoteMarker('/some/project', 'hello  \n', () => 1_000_000);
+        const digest = createHash('sha256').update('hello ').digest('hex');
+        expect(readFileSync(markerPath('/some/project'), 'utf-8')).toBe(`1000 ${digest}\n`);
+    });
+
+    it('is written by handlePush after a successful text inject', async () => {
+        const ok = await handlePush(
+            { pushId: '1', type: 'agent.command', agentSessionName: 'hwip-app', body: 'hello' },
+            { paneProbe: () => pane('claude'), inject: () => true, rateLimit: () => true, paneCwd: () => '/proj/app' },
+        );
+        expect(ok).toBe(true);
+        expect(existsSync(markerPath('/proj/app'))).toBe(true);
+    });
+
+    // No prompt hook reads a marker in a shell, and one left behind in that
+    // cwd could flag a later identical CC prompt as sent from the phone.
+    it('is not written for a marked shell session', async () => {
+        const ok = await handlePush(
+            { pushId: '1', type: 'agent.command', agentSessionName: 'hwip-app-sh', body: 'hello', targetDeviceId: 'dev_me' },
+            {
+                paneProbe: () => pane('zsh', true), inject: () => true, rateLimit: () => true,
+                paneCwd: () => '/proj/shell', deviceId: () => 'dev_me', shellAudit: () => true,
+            },
+        );
+        expect(ok).toBe(true);
+        expect(existsSync(markerPath('/proj/shell'))).toBe(false);
+    });
+
+    it('is on disk before the keys reach the pane — the prompt hook fires on that Enter', async () => {
+        // An idle agent submits the instant the Enter lands, and its
+        // UserPromptSubmit hook checks for the marker right then. Written
+        // after the inject, the marker lost that race: the phone message read
+        // as typed at the keyboard and sticky REMOTE never started.
+        let markerAtInject = false;
+        await handlePush(
+            { pushId: '1', type: 'agent.command', agentSessionName: 'hwip-app', body: 'hello' },
+            {
+                paneProbe: () => pane('claude'),
+                inject: () => { markerAtInject = existsSync(markerPath('/proj/order')); return true; },
+                rateLimit: () => true,
+                paneCwd: () => '/proj/order',
+            },
+        );
+        expect(markerAtInject).toBe(true);
+    });
+
+    it('is written for an insert too, so a later manual Enter still reads as remote', async () => {
+        // The prompt-submit hook matches the submitted text against this
+        // digest. After an insert the user presses Enter themselves, so
+        // without a marker here that submit looks locally typed.
+        const ok = await handlePush(
+            { pushId: '1', type: 'agent.command', agentSessionName: 'hwip-app', insert: 'hello' },
+            { paneProbe: () => pane('claude'), insertText: () => true, rateLimit: () => true, paneCwd: () => '/proj/inserted' },
+        );
+        expect(ok).toBe(true);
+        expect(existsSync(markerPath('/proj/inserted'))).toBe(true);
+    });
+
+    it('is NOT written when the inject fails', async () => {
+        await handlePush(
+            { pushId: '1', type: 'agent.command', agentSessionName: 'hwip-app', body: 'hello' },
+            { paneProbe: () => pane('claude'), inject: () => false, rateLimit: () => true, paneCwd: () => '/proj/failed' },
+        );
+        expect(existsSync(markerPath('/proj/failed'))).toBe(false);
+    });
+
+    it('is NOT written for key-event injections (no prompt to match)', async () => {
+        const ok = await handlePush(
+            { pushId: '1', type: 'agent.command', agentSessionName: 'hwip-app', keys: ['Enter'] },
+            { paneProbe: () => pane('claude'), sendKeys: () => true, rateLimit: () => true, paneCwd: () => '/proj/keys' },
+        );
+        expect(ok).toBe(true);
+        expect(existsSync(markerPath('/proj/keys'))).toBe(false);
+    });
+
+    it('skips silently when the pane cwd is unknown', async () => {
+        const ok = await handlePush(
+            { pushId: '1', type: 'agent.command', agentSessionName: 'hwip-app', body: 'hello' },
+            { paneProbe: () => pane('claude'), inject: () => true, rateLimit: () => true, paneCwd: () => null },
+        );
+        expect(ok).toBe(true);
+    });
+});
+
+describe('sessions report gate (idle-cost throttle)', () => {
+    const base = {
+        name: 'hwip-app',
+        attached: false,
+        agentKind: 'claude',
+        project: 'app',
+    };
+
+    it('order-independent, undefined/null collapsed — mirrors server sameReportedSessions', () => {
+        const a = sessionsFingerprint([
+            { ...base, label: undefined } as never,
+            { ...base, name: 'hwip-api' } as never,
+        ]);
+        const b = sessionsFingerprint([
+            { ...base, name: 'hwip-api' } as never,
+            { ...base, label: null } as never,
+        ]);
+        expect(a).toBe(b);
+    });
+
+    // The provider's own session name is a display value the phone shows, so a
+    // rename in Claude Code has to reach the server on the next cycle rather
+    // than wait out the heartbeat. Both this gate and the server's
+    // REPORTED_SESSION_FIELDS must carry the field; either one omitting it
+    // swallows the rename.
+    it('a provider session-name change changes the fingerprint', () => {
+        const before = sessionsFingerprint([{ ...base, providerSessionName: 'app-1e' } as never]);
+        const after = sessionsFingerprint([{ ...base, providerSessionName: 'app-95' } as never]);
+        expect(before).not.toBe(after);
+    });
+
+    it('an absent provider session name (older cli) does not force a report', () => {
+        const absent = sessionsFingerprint([{ ...base } as never]);
+        const explicitNull = sessionsFingerprint([{ ...base, providerSessionName: null } as never]);
+        expect(absent).toBe(explicitNull);
+    });
+
+    it('state transition changes the fingerprint', () => {
+        const idle = sessionsFingerprint([{ ...base, state: 'idle' } as never]);
+        const working = sessionsFingerprint([{ ...base, state: 'working' } as never]);
+        expect(idle).not.toBe(working);
+    });
+
+    it('changed inventory is due immediately', () => {
+        expect(sessionsReportDue('fp-new', 'fp-old', 1_000, 2_000)).toBe(true);
+    });
+
+    it('unchanged inventory inside the heartbeat window is skipped', () => {
+        expect(sessionsReportDue('fp', 'fp', 0, SESSION_REPORT_HEARTBEAT_MS - 1)).toBe(false);
+    });
+
+    it('unchanged inventory is re-sent once the heartbeat is due', () => {
+        expect(sessionsReportDue('fp', 'fp', 0, SESSION_REPORT_HEARTBEAT_MS)).toBe(true);
+    });
+
+    it('first report of a connection (no fingerprint yet) always sends', () => {
+        expect(sessionsReportDue('fp', null, 0, 1)).toBe(true);
+    });
+});
+
+describe('commandsReportDue', () => {
+    it('first catalog of a connection always sends', () => {
+        expect(commandsReportDue('fp', null)).toBe(true);
+    });
+    it('unchanged catalog is not re-sent', () => {
+        expect(commandsReportDue('fp', 'fp')).toBe(false);
+    });
+    it('changed catalog sends', () => {
+        expect(commandsReportDue('fp-new', 'fp-old')).toBe(true);
+    });
+    it('catalog fingerprint reflects skill changes', () => {
+        const before = commandsFingerprint({ claude: [{ name: 'a' }] });
+        const after = commandsFingerprint({ claude: [{ name: 'a' }, { name: 'b' }] });
+        expect(before).not.toBe(after);
+        expect(commandsFingerprint({ claude: [{ name: 'a' }] })).toBe(before);
+    });
+    it('a lost frame is re-sent on the next connection', () => {
+        // The gate is per connection: a new socket starts at null, so the
+        // catalog goes out again even when the machine has not changed. A
+        // fingerprint that outlived the socket would strand the server on a
+        // frame that never arrived.
+        const fingerprint = commandsFingerprint({ claude: [{ name: 'a' }] });
+        let gate: string | null = fingerprint; // as it stood when the frame was lost
+        expect(commandsReportDue(fingerprint, gate)).toBe(false);
+        gate = null; // reconnect
+        expect(commandsReportDue(fingerprint, gate)).toBe(true);
+    });
+});
+
+describe('command scan cadence', () => {
+    it('the session report never triggers a skill scan', () => {
+        // The 5 s session loop must stay free of the scan's stat sweep. The old
+        // assertion compared our constant to our constant and stayed green
+        // through any change to either; this reads the wiring instead.
+        const source = readFileSync(new URL('./listener.ts', import.meta.url), 'utf-8');
+        expect(source).toContain('commandsTimer = setInterval(reportCommands, COMMAND_SCAN_INTERVAL_MS)');
+    });
+});
+
+describe('fitSealedFrame (sealed frame budget)', () => {
+    const frame = (content: string) => ({ sessionName: 'hwip-a', seq: 1, epoch: 1, content, truncated: false });
+
+    it('leaves a frame that fits alone', async () => {
+        const { fitSealedFrame } = await import('./listener.js');
+        const small = { ...frame('a\nb\n'), cursorLine: 1, cursorCol: 0, historyLines: 1 };
+        expect(fitSealedFrame(small, 1024)).toEqual(small);
+    });
+
+    it('cuts whole lines from the top and moves the cursor and scrollback count with them', async () => {
+        const { fitSealedFrame } = await import('./listener.js');
+        const lines = Array.from({ length: 40 }, (_, i) => `line ${String(i).padStart(2, '0')}`);
+        const fitted = fitSealedFrame({ ...frame(lines.join('\n') + '\n'), cursorLine: 39, cursorCol: 3, historyLines: 30 }, 300);
+        expect(Buffer.byteLength(JSON.stringify(fitted), 'utf-8')).toBeLessThanOrEqual(300);
+        expect(fitted.truncated).toBe(true);
+        const kept = fitted.content.split('\n').length - 1;
+        const removed = 40 - kept;
+        expect(fitted.content.startsWith(`line ${String(removed).padStart(2, '0')}`)).toBe(true);
+        expect(fitted.cursorLine).toBe(39 - removed);
+        expect(fitted.cursorCol).toBe(3);
+        expect(fitted.historyLines).toBe(Math.max(0, 30 - removed));
+    });
+
+    it('cuts about as much as is over, keeping a coloured pane close to the budget', async () => {
+        const { fitSealedFrame } = await import('./listener.js');
+        // Each ESC grows six-fold in JSON, as in a `-e` capture.
+        const rows = Array.from({ length: 300 }, (_, i) => `\u001b[3${i % 7}mrow ${i}\u001b[0m`).join('\n');
+        const size = (f: object) => Buffer.byteLength(JSON.stringify(f), 'utf-8');
+        for (const over of [2, 6]) {
+            const budget = Math.floor(size(frame(rows)) / over);
+            const fitted = fitSealedFrame(frame(rows), budget);
+            expect(size(fitted)).toBeLessThanOrEqual(budget);
+            expect(size(fitted)).toBeGreaterThanOrEqual(budget * 0.95);
+        }
+    });
+
+    it('cuts just the top row of a frame barely over, blank or not', async () => {
+        const { fitSealedFrame } = await import('./listener.js');
+        const pane = { ...frame('\nsecond\nthird\n'), cursorLine: 2, cursorCol: 0 };
+        const budget = Buffer.byteLength(JSON.stringify(pane), 'utf-8') - 1;
+        expect(fitSealedFrame(pane, budget)).toMatchObject({
+            content: 'second\nthird\n',
+            cursorLine: 1,
+        });
+    });
+
+    it('counts the rows it cuts when one runaway row leaves no break to cut at', async () => {
+        const { fitSealedFrame } = await import('./listener.js');
+        const fitted = fitSealedFrame({ ...frame('top\n' + 'x'.repeat(4000)), cursorLine: 1, cursorCol: 0, historyLines: 1 }, 1000);
+        expect(Buffer.byteLength(JSON.stringify(fitted), 'utf-8')).toBeLessThanOrEqual(1000);
+        expect(fitted.content.startsWith('x')).toBe(true);
+        expect(fitted.cursorLine).toBe(0);
+        expect(fitted.historyLines).toBe(0);
+    });
+
+    it('drops a cursor whose line was cut', async () => {
+        const { fitSealedFrame } = await import('./listener.js');
+        const lines = Array.from({ length: 40 }, (_, i) => `line ${i}`).join('\n');
+        const fitted = fitSealedFrame({ ...frame(lines), cursorLine: 0, cursorCol: 0 }, 200);
+        expect(fitted).not.toHaveProperty('cursorLine');
+        expect(fitted).not.toHaveProperty('cursorCol');
+    });
+});

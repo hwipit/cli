@@ -1,0 +1,19 @@
+{
+  "body" : "{\"ciphertext\":\"Rh2YirIzeFNrUz8MZjtkywy4Y2qBqbpxD\\/sRspZLTyH8zyuf18vSmTwR5XA8qwANEPA6hbTTNpp01FIPZayQXhCf4XbIbuMh4Wa6An3GKhC7uu7KGskG\\/JZJhV5kEdHsP\\/5JlWhyvEpNrJgUXM3hGbR9E12q\",\"iv\":\"Iz2SHpFh0X32+HOv\"}",
+  "deviceId" : "dev_asker",
+  "deviceKeys" : {
+    "privateKey" : "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgqZdcd3KppaarThK2gmzjdPQXAk9JcWkxeArz3mexSgihRANCAARXrt1fljP5qAgVP5AvkDAdR9H8jtOFR1R8ZsgmVU2leTkhCsyUeUGIV9Tu+QggxYAmzqzKoxcaiRfJRg0MVuJb",
+    "publicKey" : "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEV67dX5Yz+agIFT+QL5AwHUfR/I7ThUdUfGbIJlVNpXk5IQrMlHlBiFfU7vkIIMWAJs6syqMXGokXyUYNDFbiWw=="
+  },
+  "entry" : "{\"keyIv\":\"6FUCw7OfOvKJxGm8\",\"encryptedKey\":\"vfF9N4NOc+HHblj7SYjBSsiKjNy9UwKWdfgV4zPPXlF9Wb\\/akk7j3wxOXyonM7lM\"}",
+  "expected" : {
+    "answer" : {
+      "actionId" : "approve",
+      "ask" : "q7Zk2mV0wXb9Yc3dEfGhIg",
+      "exit" : true
+    },
+    "body" : "한글 답 🔐"
+  },
+  "note" : "Sealed by the iOS app's Envelope.seal (CryptoKit) for a synthetic asker key. Regenerate with EnvelopeLabelTests.writesTheCliAnswerVector in the Hwip iOS app (HwipKit).",
+  "senderPublicKey" : "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEj1H/9mE6OorTyBs4YNiUgK9MLpgtAVSlz6/MFsBhRJlQ2F694NYh/ZKQFHuHuOmH7+cj2NNaXBClqAg14VxlVg=="
+}

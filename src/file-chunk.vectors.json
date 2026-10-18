@@ -1,0 +1,145 @@
+{
+  "info": "file-chunk-v1: plaintext cut into `chunk`-byte pieces, each AES-256-GCM sealed alone; nonce = prefix[7] || index u32 big-endian || last flag; file = every ciphertext||tag in order",
+  "generatedBy": "scripts/gen-file-chunk-vectors.py \u2014 python cryptography AESGCM + hashlib (independent of every consumer)",
+  "plain": "byte i of the plaintext is (i * 31 + 7) & 0xff",
+  "cases": [
+    {
+      "name": "one short piece",
+      "key": "fee1acf0ec27a6a89adca0754504e0946db6382f00573676d71c132bd7d10a63",
+      "prefix": "7b9227cc39be33",
+      "chunk": 16,
+      "plainLength": 5,
+      "plainSha256": "a7fed79902b79407088f9cc6584f7506f82d8be43dc419ff5ab1969dfdd245f5",
+      "sealedLength": 21,
+      "sealedSha256": "974b294a74e4382dc850cedd19805603a3c6c7517b8fdb1191f01ab8b844745b",
+      "sealed": "1368bebe0662021ec7b8e98bca6c0e4c0f50912a13"
+    },
+    {
+      "name": "one full piece",
+      "key": "45e481d2647e3735aecadfe5d216a79d1b4cee1e8bff24ecd246137364f8e889",
+      "prefix": "84fda66ccc4135",
+      "chunk": 16,
+      "plainLength": 16,
+      "plainSha256": "f087c7ff57988205ab8885ecbfca8a77c96e91b213bdaba91143fbcd62997713",
+      "sealedLength": 32,
+      "sealedSha256": "b4506c029e44237a162cf06ea45aeedea3022b0dd46333f1421e620ef4ae1b16",
+      "sealed": "c54d761c890c404acc338892e1ddb1e19cee5df28efa0d11e70c6fbfe70a0759"
+    },
+    {
+      "name": "a full piece and one byte",
+      "key": "9db2f032e7b26f5e387c55160cf6ef29fe9250c3e82a3bc38e418f51c41a08b9",
+      "prefix": "7d8fb244ec0d84",
+      "chunk": 16,
+      "plainLength": 17,
+      "plainSha256": "b6ff0191041cc77b1ef514adaed53fdd247fd43221a629d3d7c91d14e21038a3",
+      "sealedLength": 49,
+      "sealedSha256": "cb59e22e84062c1f32a010f4ad4277c7242297b95ee0cdba82307573fe9be889",
+      "sealed": "374d7065cc74c7af5fa08e70f95a6a4c328ff59844969c97f865648280155046f0d5bf4fc3dd275c4b592e2d8734e6917e"
+    },
+    {
+      "name": "three pieces, the last short",
+      "key": "0d05695440e4ab655978bed63b38a44793b1a2aba4b653a132beb29bb68410ce",
+      "prefix": "c754df67bb29e1",
+      "chunk": 16,
+      "plainLength": 40,
+      "plainSha256": "0069ba1486c68c9d9b6696145417e15d575490572a589cb90295d1d646ab168d",
+      "sealedLength": 88,
+      "sealedSha256": "7df06e2f2b5c5d9fee4465122c1ceaf65adf94e014ab81ca89e5e7f4e381189d",
+      "sealed": "39384c140f618326277a313ee3da9f1c86f8cf2554bb9240999196f398339cb4d06141766427b56650f1e65ea35c4da4e9cc11588d795fe9c775935a4e79a6b7455dcaa340129dd07ca5665e005c4cb222438648b9eeab08"
+    },
+    {
+      "name": "three full pieces",
+      "key": "d2ad76905520475aa2b65a8fc9267a7514f6ec77348c6d8a7ad987925e923ce1",
+      "prefix": "04780f81babcae",
+      "chunk": 16,
+      "plainLength": 48,
+      "plainSha256": "dfdea792658d9e37734453208d20a69207f91e45b38ba9fb35d6a855cbcaa859",
+      "sealedLength": 96,
+      "sealedSha256": "d0f2a6a40e5a38d8ef33dd6a029d10af35f52a479f5ee872cb364c3b37408160",
+      "sealed": "845e6fd90cb9bdc3704cf5032a66a78a3a7997c0f5ccc9aba50229bb8c27166889deebc021976dba24ac036203c1df5e76256b87ca3596441364992285b4c7b977aa4888ff76ce179b4a095817f843686359aac1f75dacdf0422b9d03aaa1e90"
+    },
+    {
+      "name": "1 MiB pieces: under one",
+      "key": "262f5cb904fdb7a92614d35f40c05ad655951cfd802e4cf5903196d20ab206d2",
+      "prefix": "05572a1eeb6c95",
+      "chunk": 1048576,
+      "plainLength": 1048575,
+      "plainSha256": "4ddf525d0f1482ae9ed8ff016e61988dfab2707743585ac310be210689ddb8d6",
+      "sealedLength": 1048591,
+      "sealedSha256": "1d5c23935c59ed87dde9f3f2cd05510f233e245a63ee0fca1c16f8ba01cfb012"
+    },
+    {
+      "name": "1 MiB pieces: exactly one",
+      "key": "788f8f5540ec119d756c704cb0c455e25729f54e249f0cd622700809c8e33990",
+      "prefix": "430505d9f71d38",
+      "chunk": 1048576,
+      "plainLength": 1048576,
+      "plainSha256": "06b7bbfb7824aa03382051691630eb26de85102d1b08a81e907ec0744cd8a286",
+      "sealedLength": 1048592,
+      "sealedSha256": "03d55225f6b4369524843c91048863919137a1edc163bc30ec045caed93e16ac"
+    },
+    {
+      "name": "1 MiB pieces: one and a byte",
+      "key": "22194c9cefa0ff93c11f6e714941b34aa65f95cdc628177233a1453df256a0c9",
+      "prefix": "f687b76aee8a04",
+      "chunk": 1048576,
+      "plainLength": 1048577,
+      "plainSha256": "0d09f3eabb5c78e5d435c41e3b3755f1c4d038657f739d0be0083c24e71235df",
+      "sealedLength": 1048609,
+      "sealedSha256": "533c31d7dab10f537fac4d7237140319f9116c436b3a3c6cb13429c4e9d08052"
+    },
+    {
+      "name": "1 MiB pieces: three and a bit",
+      "key": "7546854804942cc0744ef52ba56abaa656482d0a0a91543bee8af3c9ac34d0c4",
+      "prefix": "872b0b8c4df7f3",
+      "chunk": 1048576,
+      "plainLength": 3158073,
+      "plainSha256": "5484bbdbfa09aaf96421d09d2c57be9d4fdbffe2ef1d33964a754591a0ac11ba",
+      "sealedLength": 3158137,
+      "sealedSha256": "17907e32b9592862f3b7c1a9e2543f148196f2b2dd4a439e0618007f058852ac"
+    }
+  ],
+  "refused": {
+    "key": "0d05695440e4ab655978bed63b38a44793b1a2aba4b653a132beb29bb68410ce",
+    "prefix": "c754df67bb29e1",
+    "chunk": 16,
+    "cases": [
+      {
+        "name": "two pieces swapped",
+        "sealed": "d06141766427b56650f1e65ea35c4da4e9cc11588d795fe9c775935a4e79a6b739384c140f618326277a313ee3da9f1c86f8cf2554bb9240999196f398339cb4455dcaa340129dd07ca5665e005c4cb222438648b9eeab08"
+      },
+      {
+        "name": "the last piece cut off",
+        "sealed": "39384c140f618326277a313ee3da9f1c86f8cf2554bb9240999196f398339cb4d06141766427b56650f1e65ea35c4da4e9cc11588d795fe9c775935a4e79a6b7"
+      },
+      {
+        "name": "the last piece cut short by a byte",
+        "sealed": "39384c140f618326277a313ee3da9f1c86f8cf2554bb9240999196f398339cb4d06141766427b56650f1e65ea35c4da4e9cc11588d795fe9c775935a4e79a6b7455dcaa340129dd07ca5665e005c4cb222438648b9eeab"
+      },
+      {
+        "name": "a piece repeated",
+        "sealed": "39384c140f618326277a313ee3da9f1c86f8cf2554bb9240999196f398339cb439384c140f618326277a313ee3da9f1c86f8cf2554bb9240999196f398339cb4d06141766427b56650f1e65ea35c4da4e9cc11588d795fe9c775935a4e79a6b7455dcaa340129dd07ca5665e005c4cb222438648b9eeab08"
+      },
+      {
+        "name": "bytes after the last piece",
+        "sealed": "39384c140f618326277a313ee3da9f1c86f8cf2554bb9240999196f398339cb4d06141766427b56650f1e65ea35c4da4e9cc11588d795fe9c775935a4e79a6b7455dcaa340129dd07ca5665e005c4cb222438648b9eeab08455dcaa340129dd07ca5665e005c4cb222438648b9eeab08"
+      },
+      {
+        "name": "one more byte after the last piece",
+        "sealed": "39384c140f618326277a313ee3da9f1c86f8cf2554bb9240999196f398339cb4d06141766427b56650f1e65ea35c4da4e9cc11588d795fe9c775935a4e79a6b7455dcaa340129dd07ca5665e005c4cb222438648b9eeab0800"
+      },
+      {
+        "name": "a bit flipped",
+        "sealed": "39384c140f618326277a313ee3da9f1c86f8cf2555bb9240999196f398339cb4d06141766427b56650f1e65ea35c4da4e9cc11588d795fe9c775935a4e79a6b7455dcaa340129dd07ca5665e005c4cb222438648b9eeab08"
+      },
+      {
+        "name": "nothing at all",
+        "sealed": ""
+      },
+      {
+        "name": "only a tag (an empty piece)",
+        "sealed": "db968a54d554683bd837c022556b7fca"
+      }
+    ]
+  }
+}

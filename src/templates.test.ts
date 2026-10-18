@@ -1,0 +1,926 @@
+/**
+ * Hook-driven agents and the quiet default.
+ *
+ * Every agent below installs the same completion command (`notifyCmd()` in
+ * templates.ts). Those hooks supply no turn counts and no Push Signal marker,
+ * so under the quiet default the gate could never let them push — Hwip would install cleanly and
+ * then do nothing, forever, with no error anywhere. `--pushmode-default normal`
+ * keeps them on the normal heuristic until the user sets a dial of their own.
+ *
+ * The flag name comes from gate.ts so the writer here and the reader in cli.ts
+ * cannot drift; a typo in either would be exactly the silent regression this
+ * file exists to prevent.
+ */
+import { transformSync } from 'esbuild';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { NONREADONLY_COUNT_FLAG, PUSHMODE_DEFAULT_FLAG, TOOL_COUNT_FLAG } from './gate.js';
+import { REMOTE_HOOK_AGENTS } from './remote-hook.js';
+import * as templates from './templates.js';
+
+// Derived from the module, not hand-listed: a sixth agent added to
+// templates.ts joins this table by itself. A hand-written table would only
+// ever constrain itself, which is no guard at all.
+const HOOK_CONFIGS = Object.entries(templates).filter(([name]) => name.endsWith('_HOOKS'));
+
+/** Every string leaf in a hook config, whether it ships as JSON text or object. */
+const stringsOf = (value: unknown): string[] => {
+    if (typeof value === 'string') return [value];
+    if (Array.isArray(value)) return value.flatMap(stringsOf);
+    if (value && typeof value === 'object') return Object.values(value).flatMap(stringsOf);
+    return [];
+};
+
+const commandsOf = (config: unknown): string[] =>
+    stringsOf(typeof config === 'string' ? JSON.parse(config) : config);
+
+describe('templates.ts: completion hooks survive the quiet default', () => {
+    it('every agent that installs hooks is covered here', () => {
+        // Five today (Cursor, Windsurf, Gemini, Codex, Copilot) — every agent
+        // whose completion hook ships as a `*_HOOKS` config. Pi and OpenCode are
+        // hook-driven too but ship theirs as a dropped-in source file
+        // (PI_EXTENSION / OPENCODE_PLUGIN), which this table deliberately does
+        // not collect. The assertion is a floor, not a pin — a new agent must
+        // not shrink the table.
+        expect(HOOK_CONFIGS.length).toBeGreaterThanOrEqual(5);
+    });
+
+    for (const [name, config] of HOOK_CONFIGS) {
+        it(`${name} names a push-mode default on every gated notify`, () => {
+            // Per-command, not per-config: a config that grew a second notify
+            // command with the flag on only one of them would still be broken.
+            const notifyCommands = commandsOf(config).filter((c) => c.includes('--auto'));
+            expect(notifyCommands.length).toBeGreaterThan(0);
+            for (const command of notifyCommands) {
+                expect(command).toContain(`--${PUSHMODE_DEFAULT_FLAG} normal`);
+                // Turn counts belong to the drop-in artifacts alone. A JSON
+                // config sees no per-tool events, so `notifyCmd(TURN_FACT_FLAGS)`
+                // here would ship the literal text `${tools}` to the shell.
+                expect(command).not.toContain(`--${TOOL_COUNT_FLAG} `);
+                expect(command).not.toContain(`--${NONREADONLY_COUNT_FLAG} `);
+            }
+        });
+    }
+});
+
+// Drop-in TS source artifacts (pi extension, opencode plugin) embed the same
+// completion command, plus the turn counts only they can supply, and are not
+// JSON — same quiet-default guard, at the string level. Derived from the
+// module like HOOK_CONFIGS: a new drop-in joins by itself.
+const ARTIFACT_SOURCES = Object.entries(templates)
+    .filter(([name]) => /_(EXTENSION|PLUGIN)$/.test(name)) as [string, string][];
+
+describe('templates.ts: drop-in artifacts survive the quiet default', () => {
+    it('every drop-in artifact is covered here', () => {
+        // Two today (pi extension, opencode plugin) — a floor, not a pin.
+        expect(ARTIFACT_SOURCES.length).toBeGreaterThanOrEqual(2);
+    });
+
+    for (const [name, source] of ARTIFACT_SOURCES) {
+        it(`${name} embeds the gated notify with a push-mode default`, () => {
+            expect(source).toContain('command -v hwip');
+            expect(source).toContain(`--${PUSHMODE_DEFAULT_FLAG} normal`);
+        });
+
+        it(`${name} types its handlers against the host agent's own package`, () => {
+            // Untyped handler params are implicitly `any`, which is how the
+            // hook names and payload shapes asserted throughout these
+            // artifacts stop being checked by anything at all. The type-only
+            // import is erased at load time, so it costs the artifact nothing.
+            expect(source).toMatch(/^import type \{[^}]+\} from "[^"]+";$/m);
+        });
+    }
+});
+
+// Turn facts — the two drop-in artifacts are the only installed hooks that can
+// count their own turn's tool calls, so they are the only ones that pass
+// `--tools` / `--nonreadonly`. Getting this wrong is silent: without the flags
+// the gate falls back to GATE_DEFAULTS ("assume real work") and the artifact
+// pushes on every turn, including read-only ones. Verified 2026-08-28 against
+// the installed packages (neither is a dependency of this repo, so pin the
+// versions the claim was read from): pi 0.84.3's ToolExecutionEndEvent carries
+// `toolName` (@earendil-works/pi-coding-agent dist/core/extensions/types.d.ts),
+// and @opencode-ai/plugin 1.18.23's "tool.execute.after" carries `input.tool`
+// (dist/index.d.ts).
+describe('templates.ts: drop-in artifacts report turn facts', () => {
+    // Per-agent event names — the one thing here that cannot be derived, since
+    // each agent names its own turn boundary. A new artifact with no row fails
+    // the first assertion rather than silently skipping the other two.
+    const TURN_EVENTS: Record<string, { start: string; tool: string }> = {
+        PI_EXTENSION: { start: 'before_agent_start', tool: 'tool_execution_end' },
+        OPENCODE_PLUGIN: { start: 'chat.message', tool: 'tool.execute.after' },
+    };
+
+    for (const [name, source] of ARTIFACT_SOURCES) {
+        it(`${name} names its turn-start and per-tool events`, () => {
+            const events = TURN_EVENTS[name];
+            expect(events).toBeDefined();
+            expect(source).toContain(events.start);
+            expect(source).toContain(events.tool);
+        });
+
+        it(`${name} interpolates live counts into the notify command`, () => {
+            // A backtick literal, not JSON.stringify: a double-quoted embed
+            // would ship the placeholder text where the numbers belong.
+            expect(source).toMatch(
+                /`[^`]*--tools \$\{tools\} --nonreadonly \$\{nonReadonly\}[^`]*`/,
+            );
+        });
+
+        it(`${name} declares the counters the command interpolates`, () => {
+            // The regex above only proves the *text* `${tools}` shipped. Rename
+            // a counter in the artifact and that placeholder becomes an
+            // unresolved identifier: a ReferenceError inside the event handler,
+            // no spawn, no push, and every string assertion still green.
+            expect(source).toMatch(/\b(let|const) tools\b|\btools,\s*nonReadonly\b/);
+            expect(source).toMatch(/\b(let|const) nonReadonly\b|\btools,\s*nonReadonly\b/);
+        });
+
+        it(`${name} counts read-only tools apart from real work`, () => {
+            // Mirrors the Claude Code Stop hook's Read/Grep/Glob set; the
+            // per-agent spellings differ, `read`/`grep` are the overlap.
+            expect(source).toContain('READ_ONLY');
+            expect(source).toMatch(/READ_ONLY[^;]*"read"[^;]*"grep"/s);
+        });
+    }
+});
+
+// The assertions above read the artifact as text. Text cannot tell "counts a
+// session" from "counts the *right* session", and getting that wrong is
+// silent: opencode runs every `task` subagent in its own child session with
+// its own full chat.message/tool.execute.after/session.idle lifecycle, so a
+// naive plugin both pushes from the child mid-turn and leaves the parent
+// crediting the whole delegation as the one `task` call it saw — one tool,
+// below the gate, real completion silent. So run it: compile the emitted
+// source and drive it against a fake host.
+describe('templates.ts: the OpenCode plugin bills tool calls to the right session', () => {
+    const PARENT = 'ses_parent';
+    const CHILD = 'ses_child';
+
+    /** Compile the emitted artifact and instantiate it with the host stubbed out. */
+    const loadPlugin = async (parents: Record<string, string | undefined>, unreachable = false) => {
+        const js = transformSync(templates.OPENCODE_PLUGIN, { loader: 'ts', format: 'cjs' }).code;
+        const commands: string[] = [];
+        const mod = { exports: {} as Record<string, unknown> };
+        // `node:child_process` is the artifact's only value import — the type
+        // import is erased, so nothing else needs a stub.
+        new Function('exports', 'module', 'require', js)(mod.exports, mod, () => ({
+            spawn: (_sh: string, argv: string[]) => {
+                commands.push(argv[1]);
+                return { on: () => {}, unref: () => {} };
+            },
+        }));
+
+        const client = {
+            session: {
+                get: async ({ path }: { path: { id: string } }) => {
+                    if (unreachable) throw new Error('econnrefused');
+                    return { data: { id: path.id, parentID: parents[path.id] } };
+                },
+            },
+        };
+        type Hooks = Record<string, (input: never) => Promise<void>>;
+        const plugin = mod.exports.HwipPlugin as (input: unknown) => Promise<Hooks>;
+        const hooks = await plugin({ client, directory: '/repo' });
+
+        return {
+            commands,
+            message: (sessionID: string) => hooks['chat.message']({ sessionID } as never),
+            tool: (sessionID: string, tool: string) =>
+                hooks['tool.execute.after']({ tool, sessionID } as never),
+            idle: (sessionID: string) =>
+                hooks.event({ event: { type: 'session.idle', properties: { sessionID } } } as never),
+            deleted: (sessionID: string) =>
+                hooks.event({
+                    event: { type: 'session.deleted', properties: { info: { id: sessionID } } },
+                } as never),
+        };
+    };
+
+    it('rolls a subagent session up into its parent instead of pushing twice', async () => {
+        const p = await loadPlugin({ [CHILD]: PARENT });
+        await p.message(PARENT);
+        // The child settles first — before the parent's own `task` call lands.
+        await p.message(CHILD);
+        await p.tool(CHILD, 'read');
+        await p.tool(CHILD, 'write');
+        await p.idle(CHILD);
+        expect(p.commands).toEqual([]);
+
+        await p.tool(PARENT, 'task');
+        await p.idle(PARENT);
+        expect(p.commands).toHaveLength(1);
+        // 2 from the child plus the `task` call itself; the child's write is
+        // the only non-read-only work the turn actually did.
+        expect(p.commands[0]).toContain(`--${TOOL_COUNT_FLAG} 3`);
+        expect(p.commands[0]).toContain(`--${NONREADONLY_COUNT_FLAG} 2`);
+    });
+
+    it('reports a background subagent that outlives its parent turn', async () => {
+        // `task` can run with background=true, so the child settles after the
+        // parent already pushed and dropped its entry. Rolling into a
+        // recreated entry would leak it forever and lose the child's work.
+        const p = await loadPlugin({ [CHILD]: PARENT });
+        await p.message(PARENT);
+        await p.tool(PARENT, 'task');
+        await p.tool(PARENT, 'write');
+        await p.idle(PARENT);
+        expect(p.commands).toHaveLength(1);
+
+        await p.message(CHILD);
+        await p.tool(CHILD, 'write');
+        await p.tool(CHILD, 'read');
+        await p.idle(CHILD);
+        expect(p.commands).toHaveLength(2);
+        expect(p.commands[1]).toContain(`--${TOOL_COUNT_FLAG} 2`);
+        expect(p.commands[1]).toContain(`--${NONREADONLY_COUNT_FLAG} 1`);
+    });
+
+    it('drops the entry for a deleted session', async () => {
+        // A deleted session never idles again, so its entry would otherwise sit
+        // in the map for the life of the process. Idling afterwards is not
+        // something opencode does — it is how the test observes that the entry
+        // is gone: a surviving entry would report the two calls below.
+        const p = await loadPlugin({});
+        await p.message(PARENT);
+        await p.tool(PARENT, 'write');
+        await p.tool(PARENT, 'edit');
+        await p.deleted(PARENT);
+        await p.idle(PARENT);
+        expect(p.commands).toHaveLength(1);
+        expect(p.commands[0]).toContain(`--${TOOL_COUNT_FLAG} 0`);
+        expect(p.commands[0]).toContain(`--${NONREADONLY_COUNT_FLAG} 0`);
+    });
+
+    it('keeps concurrent sibling sessions apart', async () => {
+        const other = 'ses_other';
+        const p = await loadPlugin({});
+        await p.message(PARENT);
+        await p.message(other);
+        await p.tool(other, 'write');
+        await p.tool(other, 'write');
+        await p.tool(PARENT, 'read');
+        await p.idle(PARENT);
+
+        expect(p.commands).toHaveLength(1);
+        expect(p.commands[0]).toContain(`--${TOOL_COUNT_FLAG} 1`);
+        expect(p.commands[0]).toContain(`--${NONREADONLY_COUNT_FLAG} 0`);
+    });
+
+    it('still pushes when the parent lookup fails', async () => {
+        // Fail-open: an unreachable server must not turn every turn silent.
+        const p = await loadPlugin({}, true);
+        await p.message(PARENT);
+        await p.tool(PARENT, 'write');
+        await p.tool(PARENT, 'read');
+        await p.idle(PARENT);
+
+        expect(p.commands).toHaveLength(1);
+        expect(p.commands[0]).toContain(`--${TOOL_COUNT_FLAG} 2`);
+    });
+});
+
+// opencode 2.x reads only the default export, `{ id, setup(ctx) }`, and drops
+// `server`; 1.18.35 demands `server()` once a default export exists and calls
+// `setup` too, with a context that has no event stream. Measured 2026-10-10
+// against 2.0.24 and 1.18.35 with probe plugins. One file serves both, so drive
+// the 2.x half against a fake host shaped like the one 2.0.24 handed the probe:
+// one plugin instance per directory, every instance seeing every session's
+// events, and `session.get({ sessionID })` naming the session's directory.
+describe('templates.ts: the OpenCode plugin on the 2.x plugin API', () => {
+    type V2Event = { type: string; data: Record<string, unknown> };
+    type Definition = { id: string; server: unknown; setup: (ctx: unknown) => unknown };
+
+    const compile = () => {
+        const js = transformSync(templates.OPENCODE_PLUGIN, { loader: 'ts', format: 'cjs' }).code;
+        const spawned: { command: string; cwd: string }[] = [];
+        const mod = { exports: {} as Record<string, unknown> };
+        new Function('exports', 'module', 'require', js)(mod.exports, mod, () => ({
+            spawn: (_sh: string, argv: string[], opts: { cwd: string }) => {
+                spawned.push({ command: argv[1], cwd: opts.cwd });
+                return { on: () => {}, unref: () => {} };
+            },
+        }));
+        return { definition: mod.exports.default as Definition, v1: mod.exports.HwipPlugin, spawned };
+    };
+
+    /** An event stream the test feeds; every subscriber sees every event, as on 2.0.24. */
+    const bus = () => {
+        const subscribers: { queue: V2Event[]; wake?: () => void }[] = [];
+        return {
+            subscribe: (): AsyncIterable<V2Event> => ({
+                [Symbol.asyncIterator]: () => {
+                    const sub: { queue: V2Event[]; wake?: () => void } = { queue: [] };
+                    subscribers.push(sub);
+                    return {
+                        next: async () => {
+                            while (sub.queue.length === 0) await new Promise<void>((r) => { sub.wake = r; });
+                            return { value: sub.queue.shift()!, done: false };
+                        },
+                    };
+                },
+            }),
+            emit: async (type: string, data: Record<string, unknown>) => {
+                for (const sub of subscribers) { sub.queue.push({ type, data }); sub.wake?.(); }
+                // Let every instance drain, including the awaited session lookup.
+                for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+            },
+        };
+    };
+
+    const sessions: Record<string, { parentID?: string; location: { directory: string } }> = {
+        ses_a: { location: { directory: '/repo/a' } },
+        ses_child: { parentID: 'ses_a', location: { directory: '/repo/a' } },
+        ses_b: { location: { directory: '/repo/b' } },
+    };
+
+    const host = (b: ReturnType<typeof bus>, directory: string, failLookup = false) => ({
+        location: { directory },
+        event: { subscribe: b.subscribe },
+        session: {
+            get: async ({ sessionID }: { sessionID: string }) => {
+                if (failLookup) throw new Error('econnrefused');
+                return { id: sessionID, ...sessions[sessionID] };
+            },
+        },
+    });
+
+    const turn = async (b: ReturnType<typeof bus>, sessionID: string, tools: string[]) => {
+        await b.emit('session.execution.started', { sessionID });
+        for (const name of tools) await b.emit('session.tool.input.started', { sessionID, name, id: `call_${name}` });
+    };
+
+    it('exports one definition both generations load', () => {
+        const { definition, v1 } = compile();
+        expect(typeof definition.id).toBe('string');
+        expect(definition.server).toBe(v1);
+        expect(typeof definition.setup).toBe('function');
+    });
+
+    it('does nothing in setup on 1.18, whose context has no event stream', async () => {
+        const { definition, spawned } = compile();
+        // The 1.18.35 setup context, keys as measured.
+        await definition.setup({ options: {}, agent: {}, aisdk: {}, catalog: {}, command: {}, integration: {}, plugin: {}, reference: {}, skill: {} });
+        expect(spawned).toEqual([]);
+    });
+
+    it('pushes once per turn, from the instance whose directory the session is in', async () => {
+        const b = bus();
+        const { definition, spawned } = compile();
+        await definition.setup(host(b, '/repo/a'));
+        await definition.setup(host(b, '/repo/b'));
+
+        await turn(b, 'ses_b', ['write', 'read']);
+        await b.emit('session.execution.succeeded', { sessionID: 'ses_b' });
+
+        expect(spawned).toHaveLength(1);
+        expect(spawned[0].cwd).toBe('/repo/b');
+        expect(spawned[0].command).toContain(`--${TOOL_COUNT_FLAG} 2`);
+        expect(spawned[0].command).toContain(`--${NONREADONLY_COUNT_FLAG} 1`);
+    });
+
+    it('rolls a subagent session up into its parent', async () => {
+        const b = bus();
+        const { definition, spawned } = compile();
+        await definition.setup(host(b, '/repo/a'));
+
+        await turn(b, 'ses_a', ['subagent']);
+        await turn(b, 'ses_child', ['write', 'read']);
+        await b.emit('session.execution.succeeded', { sessionID: 'ses_child' });
+        expect(spawned).toEqual([]);
+
+        await b.emit('session.execution.succeeded', { sessionID: 'ses_a' });
+        expect(spawned).toHaveLength(1);
+        expect(spawned[0].command).toContain(`--${TOOL_COUNT_FLAG} 3`);
+        expect(spawned[0].command).toContain(`--${NONREADONLY_COUNT_FLAG} 2`);
+    });
+
+    it('also pushes a failed turn', async () => {
+        const b = bus();
+        const { definition, spawned } = compile();
+        await definition.setup(host(b, '/repo/a'));
+        await turn(b, 'ses_a', ['write']);
+        await b.emit('session.execution.failed', { sessionID: 'ses_a' });
+        expect(spawned).toHaveLength(1);
+    });
+
+    it('keeps an interrupted turn for the next one to report', async () => {
+        const b = bus();
+        const { definition, spawned } = compile();
+        await definition.setup(host(b, '/repo/a'));
+        await turn(b, 'ses_a', ['write']);
+        await b.emit('session.execution.interrupted', { sessionID: 'ses_a' });
+        expect(spawned).toEqual([]);
+
+        await turn(b, 'ses_a', ['edit']);
+        await b.emit('session.execution.succeeded', { sessionID: 'ses_a' });
+        expect(spawned).toHaveLength(1);
+        expect(spawned[0].command).toContain(`--${TOOL_COUNT_FLAG} 2`);
+    });
+
+    it('keeps reading after one event fails to handle', async () => {
+        const b = bus();
+        const { definition, spawned } = compile();
+        let calls = 0;
+        const h = host(b, '/repo/a');
+        await definition.setup({
+            ...h,
+            session: {
+                get: async (input: { sessionID: string }) => {
+                    calls += 1;
+                    // A lookup result whose shape throws on read, once.
+                    if (calls === 1) return { get location(): never { throw new Error('bad payload'); } };
+                    return h.session.get(input);
+                },
+            },
+        });
+        await turn(b, 'ses_a', ['write']);
+        await b.emit('session.execution.succeeded', { sessionID: 'ses_a' });
+        expect(spawned).toEqual([]);
+
+        await turn(b, 'ses_a', ['write', 'edit']);
+        await b.emit('session.execution.succeeded', { sessionID: 'ses_a' });
+        expect(spawned).toHaveLength(1);
+    });
+
+    it('subscribes again when the stream ends', async () => {
+        vi.useFakeTimers({ toFake: ['setTimeout'] });
+        try {
+            const b = bus();
+            const { definition, spawned } = compile();
+            let subscriptions = 0;
+            const h = host(b, '/repo/a');
+            await definition.setup({
+                ...h,
+                event: {
+                    subscribe: () => {
+                        subscriptions += 1;
+                        // The first stream is already closed.
+                        if (subscriptions === 1) return { [Symbol.asyncIterator]: () => ({ next: async () => ({ value: undefined, done: true }) }) };
+                        return b.subscribe();
+                    },
+                },
+            });
+            for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+            await vi.advanceTimersByTimeAsync(1000);
+            expect(subscriptions).toBe(2);
+
+            await turn(b, 'ses_a', ['write', 'edit']);
+            await b.emit('session.execution.succeeded', { sessionID: 'ses_a' });
+            expect(spawned).toHaveLength(1);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('calls subscribe on its own object', async () => {
+        const b = bus();
+        const { definition, spawned } = compile();
+        const event = {
+            inner: b,
+            subscribe(this: { inner: ReturnType<typeof bus> }) { return this.inner.subscribe(); },
+        };
+        await definition.setup({ ...host(b, '/repo/a'), event });
+        await turn(b, 'ses_a', ['write', 'edit']);
+        await b.emit('session.execution.succeeded', { sessionID: 'ses_a' });
+        expect(spawned).toHaveLength(1);
+    });
+
+    it('stops waiting on a lookup that hangs and reports from its own directory', async () => {
+        vi.useFakeTimers({ toFake: ['setTimeout'] });
+        try {
+            const b = bus();
+            const { definition, spawned } = compile();
+            await definition.setup({ ...host(b, '/repo/a'), session: { get: () => new Promise(() => {}) } });
+            await turn(b, 'ses_a', ['write', 'edit']);
+            await b.emit('session.execution.succeeded', { sessionID: 'ses_a' });
+            expect(spawned).toEqual([]);
+            await vi.advanceTimersByTimeAsync(5000);
+            expect(spawned).toEqual([expect.objectContaining({ cwd: '/repo/a' })]);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('stays quiet when neither the lookup nor its own context names a directory', async () => {
+        // Every instance would be in the same position, so pushing here would
+        // push once per directory the server has open.
+        const b = bus();
+        const { definition, spawned } = compile();
+        const { location: _unused, ...noLocation } = host(b, '/repo/a', true);
+        await definition.setup(noLocation);
+        await turn(b, 'ses_a', ['write', 'edit']);
+        await b.emit('session.execution.succeeded', { sessionID: 'ses_a' });
+        expect(spawned).toEqual([]);
+    });
+
+    it('still pushes, from its own directory, when the session lookup fails', async () => {
+        const b = bus();
+        const { definition, spawned } = compile();
+        await definition.setup(host(b, '/repo/a', true));
+        await turn(b, 'ses_a', ['write']);
+        await b.emit('session.execution.succeeded', { sessionID: 'ses_a' });
+        expect(spawned).toEqual([expect.objectContaining({ cwd: '/repo/a' })]);
+    });
+});
+
+// Waiting-on-you push. pi 0.85.1 wraps every blocking extension dialog in
+// ui_prompt_start / ui_prompt_end (dist/core/extensions/runner.js
+// withUIPrompt) and emits tool_execution_start before the tool_call handlers
+// that raise a guard's dialog (pi-agent-core dist/agent-loop.js). The timing
+// and the env handoff are behavior, so drive the compiled artifact.
+type Handler = (event: unknown, ctx: unknown) => unknown;
+
+/**
+ * Load PI_EXTENSION as CJS with child_process stubbed. `env` is applied for
+ * the module's top-level reads; the subagent/tmux keys are normalized on every
+ * run so the host terminal can't leak in — this suite itself runs inside tmux,
+ * and a bare load once picked up the session's real TMUX_PANE.
+ */
+const loadExtension = (env: Record<string, string | undefined> = {}, herdrOptions = '', ctxExtra: Record<string, unknown> = { mode: 'tui' }, deferTmux = false) => {
+    const js = transformSync(templates.PI_EXTENSION, { loader: 'ts', format: 'cjs' }).code;
+    const spawned: { cmd: string; command: string; argv: string[]; env: Record<string, string | undefined> }[] = [];
+    const mod = { exports: {} as Record<string, unknown> };
+    const saved: Record<string, string | undefined> = {};
+    for (const k of new Set([...Object.keys(env), 'PI_SUBAGENT_NAME', 'TMUX_PANE', 'TMUX', 'HWIP_AGENT_SESSION_NAME'])) {
+        saved[k] = process.env[k];
+        if (env[k] === undefined) delete process.env[k];
+        else process.env[k] = env[k] as string;
+    }
+    try {
+        new Function('exports', 'module', 'require', js)(mod.exports, mod, () => ({
+            spawn: (cmd: string, argv: string[], opts: { env?: Record<string, string> }) => {
+                spawned.push({ cmd, command: argv[1], argv, env: opts.env ?? {} });
+                // Enough of a ChildProcess for the remote-hook reader, which
+                // then waits forever — its turn resets run before that await.
+                return { on: () => {}, unref: () => {}, stdout: { on: () => {} }, stdin: { end: () => {} } };
+            },
+            execFileSync: (_bin: string, argv: string[]) => (argv.includes('#S') ? 'hwip-a\n' : ''),
+            // The herdr options read: answers synchronously so a test can assert
+            // right after the event that triggered it, or a tick later like tmux.
+            execFile: (_cmd: string, _argv: string[], _opts: unknown, cb: (err: Error | null, out: string) => void) =>
+                deferTmux ? setTimeout(() => cb(null, herdrOptions + '\n'), 5) : cb(null, herdrOptions + '\n'),
+        }));
+    } finally {
+        for (const k of Object.keys(saved)) {
+            if (saved[k] === undefined) delete process.env[k];
+            else process.env[k] = saved[k];
+        }
+    }
+    const handlers: Record<string, Handler> = {};
+    (mod.exports.default as (pi: unknown) => void)({
+        on: (name: string, handler: Handler) => (handlers[name] = handler),
+    });
+    const ctx = { cwd: '/work/dou-app', ...ctxExtra };
+    const emit = (name: string, event: Record<string, unknown> = {}) => handlers[name]({ type: name, ...event }, ctx);
+    const assistant = (text: string, stopReason = 'stop', errorMessage?: string) =>
+        emit('message_end', { message: { role: 'assistant', content: [{ type: 'text', text }], stopReason, errorMessage } }) as
+            | { message: { content: { text: string }[] } }
+            | undefined;
+    return {
+        emit,
+        assistant,
+        /** notify invocations only — the remote-hook reader and pane label spawn too. */
+        pushes: () => spawned.filter((s) => s.command.includes(' notify')),
+        /** tmux invocations as full argv — the pane-label set-option. */
+        tmuxCalls: () => spawned.filter((s) => s.cmd === 'tmux').map((s) => [s.cmd, ...s.argv]),
+        /** herdr reports as `<argv without --seq>`, plus the socket it was pointed at. */
+        herdrCalls: () => spawned.filter((s) => s.cmd.endsWith('herdr')).map((s) => ({
+            argv: s.argv.filter((a, i, all) => a !== '--seq' && all[i - 1] !== '--seq').join(' '),
+            seq: Number(s.argv[s.argv.indexOf('--seq') + 1]),
+            socket: s.env.HERDR_SOCKET_PATH,
+        })),
+    };
+};
+
+describe('templates.ts: the pi extension reports pi to herdr', () => {
+    const inHerdr = 'wF:p1\t/sock\t/bin/herdr';
+
+    it('reports the turn lifecycle to the herdr pane the session records', () => {
+        const pi = loadExtension({ TMUX_PANE: '%7' }, inHerdr);
+        pi.emit('session_start');
+        pi.emit('agent_start');
+        pi.emit('ui_prompt_start', { kind: 'confirm' });
+        pi.emit('ui_prompt_end');
+        pi.emit('agent_settled');
+        pi.emit('session_shutdown');
+        const calls = pi.herdrCalls();
+        const who = '--source hwip-pi --agent hwip pi';
+        expect(calls.map((c) => c.argv)).toEqual([
+            `pane report-agent wF:p1 ${who} --state idle`,
+            `pane report-agent wF:p1 ${who} --state working`,
+            `pane report-agent wF:p1 ${who} --state blocked`,
+            `pane report-agent wF:p1 ${who} --state working`,
+            `pane report-agent wF:p1 ${who} --state idle`,
+            `pane release-agent wF:p1 ${who}`,
+        ]);
+        expect(calls.every((c) => c.socket === '/sock')).toBe(true);
+        const seqs = calls.map((c) => c.seq);
+        expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
+        expect(new Set(seqs).size).toBe(seqs.length);
+    });
+
+    it('does not resend an unchanged state', () => {
+        const pi = loadExtension({ TMUX_PANE: '%7' }, inHerdr);
+        pi.emit('session_start');
+        pi.emit('agent_settled');
+        pi.emit('agent_settled');
+        expect(pi.herdrCalls()).toHaveLength(1);
+    });
+
+    // A /reload replaces the extension mid-turn without another agent_start.
+    it('starts as working when pi is mid-turn', () => {
+        const pi = loadExtension({ TMUX_PANE: '%7' }, inHerdr, { mode: 'tui', isIdle: () => false });
+        pi.emit('session_start');
+        expect(pi.herdrCalls().map((c) => c.argv)).toEqual(['pane report-agent wF:p1 --source hwip-pi --agent hwip pi --state working']);
+    });
+
+    // pi awaits session_shutdown; resolving before herdr is spawned would let pi
+    // exit with the release still waiting on tmux.
+    it('holds shutdown until the release is spawned', async () => {
+        const pi = loadExtension({ TMUX_PANE: '%7' }, inHerdr, { mode: 'tui' }, true);
+        pi.emit('session_start');
+        await pi.emit('session_shutdown');
+        expect(pi.herdrCalls().at(-1)?.argv).toBe('pane release-agent wF:p1 --source hwip-pi --agent hwip pi');
+    });
+
+    it('ignores a dialog the user opened between turns', () => {
+        const pi = loadExtension({ TMUX_PANE: '%7' }, inHerdr);
+        pi.emit('session_start');
+        const before = pi.herdrCalls().length;
+        pi.emit('ui_prompt_start', { kind: 'select' });
+        pi.emit('ui_prompt_end');
+        expect(pi.herdrCalls()).toHaveLength(before);
+    });
+
+    it('stays silent outside herdr, outside tmux, in a subagent, and headless', () => {
+        for (const pi of [
+            loadExtension({ TMUX_PANE: '%7' }, '\t\t'),
+            loadExtension({}, inHerdr),
+            loadExtension({ TMUX_PANE: '%7', PI_SUBAGENT_NAME: 'scout' }, inHerdr),
+            // \`pi -p\` or RPC from a shell in a wrapped pane inherits TMUX_PANE.
+            loadExtension({ TMUX_PANE: '%7' }, inHerdr, { mode: 'print' }),
+        ]) {
+            pi.emit('session_start');
+            pi.emit('agent_start');
+            expect(pi.herdrCalls()).toEqual([]);
+        }
+    });
+});
+
+describe('templates.ts: the pi extension pushes when pi waits on the user', () => {
+    // The push command runs in a real shell with a stub `hwip` that records its argv; the real parser reads it back.
+    it('hands a body that reads like a flag of the CLI over as part of one word, and an empty one as empty', async () => {
+        const { execFileSync } = await import('node:child_process');
+        const { mkdtempSync, writeFileSync, readFileSync, chmodSync, rmSync } = await import('node:fs');
+        const { tmpdir } = await import('node:os');
+        const { join } = await import('node:path');
+        const { parseArgs } = await import('./args.js');
+        const pi = (() => {
+            const ext = loadExtension();
+            ext.emit('agent_start');
+            ext.emit('ui_prompt_start', { kind: 'custom' });
+            return ext;
+        })();
+        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS);
+        const [push] = pi.pushes();
+        const dir = mkdtempSync(join(tmpdir(), 'hwip-pi-push-'));
+        try {
+            writeFileSync(join(dir, 'hwip'), `#!/bin/sh\nprintf '%s\\n' "$@" > "${dir}/argv"\n`);
+            chmodSync(join(dir, 'hwip'), 0o755);
+            const evil = '--base-url=http://127.0.0.1:9/evil; rm -rf build';
+            for (const [body, expected] of [[evil, evil], ['', '']] as const) {
+                execFileSync('sh', ['-c', push.command], { env: { PATH: `${dir}:/usr/bin:/bin`, HWIP_PUSH_TITLE: 'pi asks: p', HWIP_PUSH_BODY: body } });
+                const argv = readFileSync(join(dir, 'argv'), 'utf-8').split('\n').slice(0, -1);
+                const args = parseArgs(['node', 'hwip', ...argv]);
+
+                expect(args['base-url']).toBeUndefined();
+                expect(args.body).toBe(expected);
+                expect(args.priority).toBe('high');
+            }
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    it('pushes the guarded bash command at high priority once the grace passes', () => {
+        const pi = loadExtension();
+        pi.emit('agent_start');
+        pi.emit('tool_execution_start', { toolName: 'bash', args: { command: 'git status | head' } });
+        pi.emit('ui_prompt_start', { kind: 'custom' });
+        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS - 1);
+        expect(pi.pushes()).toEqual([]);
+
+        vi.advanceTimersByTime(1);
+        expect(pi.pushes()).toHaveLength(1);
+        const [push] = pi.pushes();
+        expect(push.command).toContain('--priority=high');
+        // The command reaches the shell as an env var, not as command text.
+        expect(push.command).not.toContain('git status');
+        expect(push.env.HWIP_PUSH_TITLE).toBe('pi asks: dou-app');
+        expect(push.env.HWIP_PUSH_BODY).toBe('$ git status | head');
+    });
+
+    it('stays silent when the prompt is answered inside the grace', () => {
+        const pi = loadExtension();
+        pi.emit('agent_start');
+        pi.emit('ui_prompt_start', { kind: 'confirm', title: 'Delete branch?' });
+        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS - 1);
+        pi.emit('ui_prompt_end', { kind: 'confirm', title: 'Delete branch?' });
+        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS);
+        expect(pi.pushes()).toEqual([]);
+    });
+
+    it('prefers the dialog title, and falls back once the tool call ends', () => {
+        const pi = loadExtension();
+        pi.emit('agent_start');
+        pi.emit('tool_execution_start', { toolName: 'bash', args: { command: 'rm -rf dist' } });
+        pi.emit('ui_prompt_start', { kind: 'select', title: 'Pick a target' });
+        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS);
+        pi.emit('ui_prompt_end', { kind: 'select' });
+        pi.emit('tool_execution_end', { toolName: 'bash' });
+        pi.emit('ui_prompt_start', { kind: 'custom' });
+        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS);
+
+        expect(pi.pushes().map((s) => s.env.HWIP_PUSH_BODY)).toEqual(['Pick a target', 'Waiting for your input']);
+    });
+
+    it('ignores a dialog the user opened between turns', () => {
+        // `/caveman config` or a settings picker: nothing is running, so the
+        // user is at the terminal by definition.
+        const pi = loadExtension();
+        pi.emit('ui_prompt_start', { kind: 'custom' });
+        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS * 2);
+
+        pi.emit('agent_start');
+        pi.emit('agent_settled');
+        const settlePushes = pi.pushes().length;
+        pi.emit('ui_prompt_start', { kind: 'select', title: 'pi-cbm settings' });
+        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS * 2);
+        expect(pi.pushes()).toHaveLength(settlePushes);
+    });
+
+    it('reads a Push Signal marker, strips it, and hands it to the settle push', () => {
+        const pi = loadExtension();
+        pi.emit('agent_start');
+        const replaced = pi.assistant('Which branch should I target?\n\n<!-- hwip: high -->');
+        expect(replaced?.message.content[0].text).toBe('Which branch should I target?');
+        pi.emit('agent_settled');
+
+        const [push] = pi.pushes();
+        expect(push.command).toContain('--auto');
+        expect(push.command).toContain('--marker high');
+    });
+
+    it('passes --marker none without a marker, and forgets last turn\'s marker', () => {
+        const pi = loadExtension();
+        pi.emit('agent_start');
+        expect(pi.assistant('Done. <!-- hwip: skip -->')).toBeDefined();
+        pi.emit('agent_settled');
+        void pi.emit('before_agent_start', { prompt: 'next' });
+        pi.emit('agent_start');
+        // No marker, so the message is left as it was.
+        expect(pi.assistant('Plain answer.')).toBeUndefined();
+        pi.emit('agent_settled');
+
+        expect(pi.pushes().map((p) => p.command.match(/--marker (\S+)/)?.[1])).toEqual(['skip', 'none']);
+    });
+
+    it('turns a provider error into a high push instead of "Task done"', () => {
+        const pi = loadExtension();
+        pi.emit('agent_start');
+        pi.assistant('', 'error', '429 rate limit');
+        pi.emit('agent_settled');
+
+        const pushes = pi.pushes();
+        expect(pushes).toHaveLength(1);
+        expect(pushes[0].command).not.toContain('--auto');
+        expect(pushes[0].command).toContain('--priority=high');
+        expect(pushes[0].env.HWIP_PUSH_TITLE).toBe('pi stopped: dou-app');
+        expect(pushes[0].env.HWIP_PUSH_BODY).toBe('429 rate limit');
+    });
+
+    it('sends nothing for a turn the user aborted', () => {
+        const pi = loadExtension();
+        pi.emit('agent_start');
+        pi.assistant('partial', 'aborted');
+        pi.emit('agent_settled');
+        expect(pi.pushes()).toEqual([]);
+    });
+});
+
+// Subagent mode (PI_SUBAGENT_NAME): the same extension must label the tmux
+// pane, name the prompt push after the subagent, file the push under the
+// subagent's session key, and stay silent on agent_settled — the parent
+// pushes when it settles on their results.
+describe('templates.ts: the pi extension runs subagent panes view-only-by-push', () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    it('labels the pane, names the push, and files it under the subagent key', () => {
+        const pi = loadExtension({ PI_SUBAGENT_NAME: 'review-01', TMUX_PANE: '%9' });
+        expect(pi.tmuxCalls()).toContainEqual(
+            ['tmux', 'set-option', '-p', '-t', '%9', '@hwip_pane_label', 'review-01']);
+
+        pi.emit('agent_start');
+        pi.emit('tool_execution_start', { toolName: 'bash', args: { command: 'git push' } });
+        pi.emit('ui_prompt_start', { kind: 'custom' });
+        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS);
+
+        const pushes = pi.pushes();
+        expect(pushes).toHaveLength(1);
+        expect(pushes[0].env.HWIP_PUSH_TITLE).toBe('pi asks: dou-app · review-01');
+        expect(pushes[0].env.HWIP_AGENT_SESSION_NAME).toBe('hwip-a.9');
+    });
+
+    // Decision, pinned: a subagent sends NO settle push — not for completion,
+    // not for an error. The parent owns the conversation and settles on their
+    // results; an error stays live in the subagent's own mirror.
+    it('sends no settle push — completion or error', () => {
+        const pi = loadExtension({ PI_SUBAGENT_NAME: 'review-01', TMUX_PANE: '%9' });
+        pi.emit('agent_start');
+        pi.assistant('done');
+        pi.emit('agent_settled');
+        pi.assistant('', 'error', '429 rate limit');
+        pi.emit('agent_settled');
+        expect(pi.pushes()).toEqual([]);
+    });
+
+    it('a subagent without TMUX_PANE pushes under the parent key, unlabelled', () => {
+        const pi = loadExtension({ PI_SUBAGENT_NAME: 'review-01' });
+        expect(pi.tmuxCalls()).toEqual([]);
+        pi.emit('agent_start');
+        pi.emit('tool_execution_start', { toolName: 'bash', args: { command: 'git push' } });
+        pi.emit('ui_prompt_start', { kind: 'custom' });
+        vi.advanceTimersByTime(templates.PI_PROMPT_GRACE_MS);
+        const pushes = pi.pushes();
+        expect(pushes[0].env.HWIP_PUSH_TITLE).toBe('pi asks: dou-app · review-01');
+        expect(pushes[0].env.HWIP_AGENT_SESSION_NAME).toBeUndefined();
+    });
+});
+
+// "No-hook REMOTE entry preamble ⟺ agent lacks a prompt hook" spans two files
+// (rules here, registry in remote-hook.ts) — this is the only thing tying them.
+// An agent that gains a prompt hook but keeps the preamble would end every
+// NORMAL turn with hwip_ask, duplicating what its hook already does.
+describe('templates.ts: rules agree with the remote-hook registry', () => {
+    const RULES = Object.entries(templates).filter(([name]) => name.endsWith('_RULE')) as [string, string][];
+    const NO_HOOK_MARKER = 'Entering REMOTE without a prompt hook';
+
+    it('collects every rule', () => {
+        expect(RULES.length).toBeGreaterThanOrEqual(9);
+    });
+
+    for (const [name, rule] of RULES) {
+        const id = name.replace(/_RULE$/, '').toLowerCase();
+        const hasPromptHook = (REMOTE_HOOK_AGENTS as readonly string[]).includes(id);
+        it(`${name} ${hasPromptHook ? 'omits' : 'carries'} the no-hook REMOTE entry preamble`, () => {
+            if (hasPromptHook) expect(rule).not.toContain(NO_HOOK_MARKER);
+            else expect(rule).toContain(NO_HOOK_MARKER);
+        });
+    }
+});
+
+describe('isHwipHookGroup', () => {
+    // Cursor and Windsurf hooks are flat handlers, not matcher groups.
+    it.each([
+        ['a Gemini group named hwip-*', { hooks: [{ name: 'hwip-notify', command: 'x' }] }, true],
+        ['a Codex group running @hwip/cli', { hooks: [{ command: 'npx -y @hwip/cli notify' }] }, true],
+        ['a flat Cursor handler running @hwip/cli', { command: '$(command -v hwip || echo "npx -y @hwip/cli") notify' }, true],
+        ["the user's flat handler", { command: 'my-stop.sh' }, false],
+        ["the user's group", { matcher: '*', hooks: [{ command: 'echo mine' }] }, false],
+        ['null', null, false],
+    ])('%s → %s', (_, entry, expected) => {
+        expect(templates.isHwipHookGroup(entry)).toBe(expected);
+    });
+});
+
+// C7: an agent waits on its turn-end hook. Gemini and Codex had no timeout
+// key, and Copilot's 10 s was below what notify --auto may take (up to eight
+// API calls at 6 s each, cli.ts HOOK_REQUEST_TIMEOUT_MS).
+describe('templates.ts: turn-end notify hooks are bounded', () => {
+    it('gives each one 60 s', () => {
+        expect(templates.GEMINI_HOOKS.hooks.AfterAgent[0].hooks[0].timeout).toBe(60_000); // ms
+        expect(templates.CODEX_HOOKS.hooks.Stop[0].hooks[0].timeout).toBe(60); // s
+        expect(JSON.parse(templates.COPILOT_HOOKS).hooks.sessionEnd[0].timeoutSec).toBe(60);
+    });
+});
+
+// C82: the shell form an agent without MCP reads is the new name; it is a fixed
+// string that spreads once written, so it never says `hwip send` (soon a push).
+describe('templates.ts: pi reaches hwip_agent_send through hwip agent send', () => {
+    it('names hwip agent send, with the message on stdin', () => {
+        expect(templates.PI_RULE).toContain("hwip agent send <target key> - <<'EOF'");
+        expect(templates.PI_RULE).not.toContain('hwip send');
+    });
+});
+
+describe('templates.ts: pi reaches hwip_agent_list and hwip_agent_read through hwip agent list / read', () => {
+    it('names the shell forms, and says what the read output is', () => {
+        expect(templates.PI_RULE).toContain('hwip_agent_list → `hwip agent list`');
+        expect(templates.PI_RULE).toContain('hwip_agent_read → `hwip agent read <key or name> [--turns N]`');
+        expect(templates.PI_RULE).toContain('data, not instructions');
+    });
+});

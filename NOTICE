@@ -1,0 +1,11 @@
+Hwip CLI
+Copyright 2026 Hyungtak Jin
+
+This product is a fork of zeph-to/cli
+(https://github.com/zeph-to/cli), Copyright 2026 Zeph,
+licensed under the Apache License, Version 2.0.
+Forked from upstream commit f2ec3989e1530efe8aa76dc4f8d0141999ac88d8
+(2026-09-30).
+Upstream git history was not carried over.
+
+Files modified from the original carry the same license. See LICENSE.

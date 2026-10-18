@@ -1,0 +1,1414 @@
+/**
+ * Remote-control agent registry — the single table behind every
+ * `hwip <agent>` subcommand, the listener's pane matching, and the
+ * per-agent session-id enrichment. Adding a remote-controllable agent is
+ * one row here (plus, for a genuinely new kind, backend/phone support:
+ * `kind` is a wire contract — AgentSession.agentKind flows to the server
+ * and the phone picker, which may validate the enum).
+ *
+ * This is deliberately NOT merged into `agents.ts`: that table drives
+ * install/uninstall/verify detection (8 agents, incl. Windsurf, which can
+ * never be driven via tmux), and the two tables carry different name axes
+ * — install id vs subcommand alias vs pane binary. Cursor is the clearest
+ * case for keeping them apart: the `cursor` install id there means the
+ * IDE, while the drivable binary here is `cursor-agent`, its terminal TUI.
+ */
+import { closeSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync } from 'fs';
+import { homedir } from 'os';
+import { join, basename, resolve } from 'path';
+import { spawnSync } from 'child_process';
+import { projectTranscriptEntries, type TranscriptProjector, type TranscriptReader } from './transcript-tail.js';
+import { projectPiEntries } from './pi-transcript.js';
+import { projectCodexEntries } from './codex-transcript.js';
+import { projectGeminiEntries } from './gemini-transcript.js';
+import { opencodeDbPath, opencodeSourcePath, OPENCODE_SESSION_ID, projectOpencodeEntries, readOpencodeTranscript } from './opencode-transcript.js';
+
+export interface RemoteAgent {
+    /** Wire value for AgentSession.agentKind (server/phone contract). */
+    kind: string;
+    /** Human name for --help text. */
+    displayName: string;
+    /** Binary launched in the tmux pane; also the primary pane-match token. */
+    binary: string;
+    /** `hwip <subcommand>` aliases that launch this agent. */
+    subcommands: readonly string[];
+    /**
+     * What this agent is typed to make it quit, if it has such a command.
+     *
+     * Signals are not enough on their own: Claude Code holds its prompt
+     * through both `C-c` and `C-d`, so a remote "end this session" built only
+     * out of key presses reports failure against the agent people actually
+     * run. Omitted where the command has not been verified against the real
+     * binary — sending a guess into a live pane types it at whatever prompt
+     * is there.
+     */
+    quitCommand?: string;
+    /** Extra pane_command basenames accepted as this agent (beyond binary). */
+    paneMatchAliases?: readonly string[];
+    /**
+     * Resolve the agent's own session id from the pane's cwd (+ pane pid
+     * when the caller knows it — enables exact process-tree matching).
+     * EXTENSION POINT: carried by Claude Code and OpenCode. Every other row
+     * omits it until that agent's session-file format is confirmed — the
+     * listener then reports agentSessionId: null.
+     */
+    resolveSessionId?: (paneCwd: string, panePid?: number) => string | null;
+    /**
+     * Resolve the name the agent calls this session by — what the user sees in
+     * their own terminal, which the phone shows instead of the computed
+     * `<project> · <Agent> #N` label.
+     *
+     * Same shape as `resolveSessionId` and the same EXTENSION POINT rule: a row
+     * carries this only once that agent's name store is confirmed. Cursor and
+     * Gemini never will — their state files hold ids, cwds and timestamps and no
+     * name at all, so there is nothing to read and the computed label stands.
+     */
+    resolveSessionName?: (paneCwd: string, panePid?: number) => string | null;
+    /**
+     * Resolve the file this agent is writing its session transcript to, for the
+     * live chat timeline (`turn-watch`).
+     *
+     * Same shape and the same EXTENSION POINT rule as the two above: a row
+     * carries this only once that agent's transcript format is confirmed, and a
+     * pane whose agent omits it answers `no_transcript` rather than guessing.
+     * That is the seam a second agent hangs off — the reader that parses the
+     * file is `projectTranscript` below.
+     */
+    resolveTranscript?: (paneCwd: string, panePid?: number) => string | null;
+    /**
+     * Read this agent's transcript lines into the events the timeline draws.
+     *
+     * Set with `resolveTranscript` or not at all — `remote-agents.test.ts`
+     * enforces the pair over the whole table. Half a pair is the one failure
+     * mode worth a test here: a path nothing can parse reaches the phone as an
+     * empty timeline, which reads as a hung agent, where the missing row would
+     * have said "no live timeline" and been true.
+     */
+    projectTranscript?: TranscriptProjector;
+    /**
+     * How to read what `resolveTranscript` returned, for an agent whose
+     * transcript is not an append-only file. Omitted by every row whose is —
+     * those are tailed by `readTranscriptDelta`. opencode is the one that sets
+     * it: its "path" names a session in its SQLite store (`opencode-transcript.ts`).
+     */
+    readTranscript?: TranscriptReader;
+}
+
+/**
+ * A per-key TTL cache, bounded so a long-lived listener that has seen many keys
+ * cannot grow without limit. `get` returns a wrapper rather than the value so a
+ * cached `null` is distinguishable from a miss, and `set` returns what it stored
+ * so callers read as one expression.
+ *
+ * Eviction drops the first key in insertion order, which is the oldest entry a
+ * key was FIRST written under — refreshing a key does not move it. With a bound
+ * of 64 keys against a handful of live panes that never matters; a workload that
+ * genuinely cycles more keys than the bound would want a real LRU.
+ */
+const keyedTtlCache = <K, V>(ttlMs: number, max = 64) => {
+    const entries = new Map<K, { value: V; expiresAt: number }>();
+    return {
+        get: (key: K): { value: V } | undefined => {
+            const hit = entries.get(key);
+            return hit && hit.expiresAt > Date.now() ? hit : undefined;
+        },
+        set: (key: K, value: V): V => {
+            if (entries.size >= max) {
+                const oldest = entries.keys().next().value;
+                if (oldest !== undefined) entries.delete(oldest);
+            }
+            entries.set(key, { value, expiresAt: Date.now() + ttlMs });
+            return value;
+        },
+    };
+};
+
+/**
+ * A name is only worth carrying if it has visible characters. Renderers treat
+ * `''` as falsy and fall back on their own, but the change fingerprints on both
+ * sides of the wire collapse `undefined`/`null` and would ship a blank string as
+ * a real change — a report per cycle that says nothing.
+ */
+const nonBlank = (value: string | undefined): string | null => {
+    const trimmed = value?.trim();
+    return trimmed ? trimmed : null;
+};
+
+// ── Claude Code session resolver ─────────────────────────────────
+
+const CLAUDE_PROJECTS_DIR = join(homedir(), '.claude', 'projects');
+
+const CLAUDE_PROJECT_DIR_MAX = 200;
+
+/**
+ * The directory name Claude Code gives a cwd under `~/.claude/projects/`.
+ * Copied from the Claude Code 2.1.287 binary (`k` / `Jx`): every character
+ * outside `[a-zA-Z0-9]` becomes `-`, so `.`, `_`, spaces, `@` and Hangul all
+ * collapse, one `-` per UTF-16 unit. Names past 200 characters are cut and
+ * suffixed with `-` plus the base-36 of a Java-style string hash of the cwd.
+ * mcp-server/src/config.ts carries the same rule and test vectors — keep the
+ * two in step.
+ */
+export const claudeProjectDirName = (cwd: string): string => {
+    const name = cwd.replace(/[^a-zA-Z0-9]/g, '-');
+    if (name.length <= CLAUDE_PROJECT_DIR_MAX) return name;
+    let hash = 0;
+    for (let i = 0; i < cwd.length; i++) hash = ((hash << 5) - hash + cwd.charCodeAt(i)) | 0;
+    return `${name.slice(0, CLAUDE_PROJECT_DIR_MAX)}-${Math.abs(hash).toString(36)}`;
+};
+
+/**
+ * Cache for detectClaudeSessionId. The function walks every jsonl file
+ * in `~/.claude/projects/<hash>/` on each call — after weeks of CC use
+ * that directory holds hundreds of session files, and we were calling
+ * this per tmux session per 5-second report cycle. Heavy disk I/O
+ * compounded with multiple sessions caused the report cycle to spike
+ * CPU and starve the host shell.
+ *
+ * The current-session UUID only changes when a new CC session starts
+ * in that directory (rare, on the order of hours), so a 60-second TTL
+ * is safe and cuts the per-cycle stat count by ~12×.
+ */
+const claudeSessionCache = keyedTtlCache<string, string | null>(60_000);
+
+const doDetectClaudeSessionId = (cwd: string): string | null => {
+    try {
+        const sessionsDir = join(CLAUDE_PROJECTS_DIR, claudeProjectDirName(cwd));
+        let latest: { name: string; mtime: number } | undefined;
+        for (const entry of readdirSync(sessionsDir)) {
+            const m = entry.match(/^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/);
+            if (!m) continue;
+            const stat = statSync(join(sessionsDir, entry));
+            if (!stat.isFile()) continue;
+            if (!latest || stat.mtimeMs > latest.mtime) {
+                latest = { name: m[1], mtime: stat.mtimeMs };
+            }
+        }
+        return latest?.name ?? null;
+    } catch {
+        return null;
+    }
+};
+
+/**
+ * Locate the most recent Claude Code session UUID for the working
+ * directory of a tmux pane. Mirrors `mcp-server/config.ts`'s
+ * detectClaudeSessionId: CC writes per-session jsonl files at
+ * `~/.claude/projects/<claudeProjectDirName(cwd)>/<UUID>.jsonl`.
+ * Cached for 60s — see
+ * claudeSessionCache.
+ */
+export const detectClaudeSessionId = (cwd: string): string | null => {
+    const cached = claudeSessionCache.get(cwd);
+    if (cached) return cached.value;
+    return claudeSessionCache.set(cwd, doDetectClaudeSessionId(cwd));
+};
+
+// ── Claude Code pid → session resolver ───────────────────────────
+//
+// Claude Code maintains ~/.claude/sessions/<pid>.json with the exact
+// {pid, sessionId, cwd} of every live session. Matching the tmux pane's
+// process tree against these records identifies THE session running in
+// that pane — immune to the identity theft the mtime heuristic suffers
+// when a second `claude` opens in the same cwd (its transcript becomes
+// the newest file and steals the tmux session's id).
+
+const CLAUDE_SESSIONS_DIR = join(homedir(), '.claude', 'sessions');
+
+export interface PidSessionRecord {
+    pid: number;
+    sessionId: string;
+    cwd: string;
+    /**
+     * What Claude Code calls this session (`hwipit-95` when derived from the
+     * cwd, free text once named). Optional: an older CC writes the record
+     * without it, and a record without a name is still a valid id match.
+     */
+    name?: string;
+}
+
+const readPidSessionRecords = (): PidSessionRecord[] => {
+    try {
+        const out: PidSessionRecord[] = [];
+        for (const entry of readdirSync(CLAUDE_SESSIONS_DIR)) {
+            if (!/^\d+\.json$/.test(entry)) continue;
+            try {
+                const raw = JSON.parse(readFileSync(join(CLAUDE_SESSIONS_DIR, entry), 'utf-8')) as Partial<PidSessionRecord>;
+                if (typeof raw.pid === 'number' && typeof raw.sessionId === 'string' && typeof raw.cwd === 'string') {
+                    out.push({
+                        pid: raw.pid,
+                        sessionId: raw.sessionId,
+                        cwd: raw.cwd,
+                        ...(typeof raw.name === 'string' ? { name: raw.name } : {}),
+                    });
+                }
+            } catch { /* partial write / corrupt — skip */ }
+        }
+        return out;
+    } catch {
+        return []; // dir absent (older CC) — caller falls back to mtime
+    }
+};
+
+// One `ps` spawn and one ~/.claude/sessions scan per report cycle, not per
+// tmux session: the resolver runs for every session every 5s, and each call
+// paid a full process-table spawn plus a directory scan on the daemon's hot
+// path. A TTL just under the report interval lets all sessions in one cycle
+// share a single snapshot while still refreshing every cycle. The parsed
+// child-adjacency map is what's cached (not the raw table) so N sessions
+// share one parse and differ only in the per-root BFS.
+const SNAPSHOT_TTL_MS = 4_000;
+
+const ttlMemo = <T,>(ttlMs: number, compute: () => T): (() => T) => {
+    let snap: { value: T; expiresAt: number } | null = null;
+    return () => {
+        const now = Date.now();
+        if (snap && snap.expiresAt > now) return snap.value;
+        snap = { value: compute(), expiresAt: now + ttlMs };
+        return snap.value;
+    };
+};
+
+export interface ProcTable {
+    /** ppid → its direct children, for walking a pane's process tree. */
+    children: Map<number, number[]>;
+    /** pid → process start time in epoch ms. Only pids whose `lstart` parsed. */
+    startTimes: Map<number, number>;
+    /** pid → its process group id. Absent when the row carried no pgid. */
+    pgidOf: Map<number, number>;
+    /** pid → the foreground process group of its controlling tty. A pane
+     *  shell whose tpgid equals its own pgid IS the foreground — a plain
+     *  prompt; anything else is running a foreground command. */
+    tpgidOf: Map<number, number>;
+    /** pid → its command name (`comm`), last column because it may contain
+     *  spaces (`tmux: client`). Basename-matched against the agent registry. */
+    commOf: Map<number, string>;
+}
+
+/**
+ * Parse `ps -axo pid=,ppid=,lstart=`. A row is `<pid> <ppid> [<lstart>]`, e.g.
+ * `    1     0 Fri Aug  7 11:12:59 2026    ` — note the two spaces before a
+ * single-digit day and the trailing padding.
+ *
+ * The third field is OPTIONAL in the pattern, and that is load-bearing rather
+ * than defensive. Requiring it would mean that on any machine whose `ps` prints
+ * a different `lstart` shape, EVERY row fails to match, `children` comes back
+ * empty, `collectDescendantPids` answers `{rootPid}`, and
+ * `detectClaudeSessionByPid` finds nothing — dropping Claude Code back to the
+ * mtime heuristic and its identity theft (see CLAUDE_SESSIONS_DIR above). The
+ * parent links must survive an unreadable timestamp; only the start time is
+ * allowed to go missing, and every consumer of `startTimes` treats an absent
+ * entry as "no match" rather than guessing.
+ */
+/**
+ * Parse `ps -axo pid=,ppid=,pgid=,tpgid=,lstart=,comm=`. A row is
+ * `<pid> <ppid> <pgid> <tpgid> [<lstart>] [<comm>]`, e.g.
+ * `  902     1   902   902 Fri Aug  7 11:12:59 2026 zsh` — note the two spaces
+ * before a single-digit day and the trailing padding.
+ *
+ * Token positions, not one regex: `lstart` is a fixed 5 tokens when present
+ * and `comm` is LAST because it may contain spaces. A row with fewer tokens
+ * simply contributes fewer maps — the shape is load-bearing rather than
+ * defensive: parent links must survive an unreadable timestamp (the reason
+ * `lstart` is optional), and the pgid/tpgid/comm columns are absent only when
+ * a caller fed the old narrower argv, which nothing in production does.
+ */
+export const parseProcTable = (table: string): ProcTable => {
+    const children = new Map<number, number[]>();
+    const startTimes = new Map<number, number>();
+    const pgidOf = new Map<number, number>();
+    const tpgidOf = new Map<number, number>();
+    const commOf = new Map<number, string>();
+    for (const line of table.split('\n')) {
+        const tok = line.trim().split(/\s+/);
+        const pid = Number(tok[0]);
+        const ppid = Number(tok[1]);
+        if (!Number.isInteger(pid) || !Number.isInteger(ppid)) continue;
+        const list = children.get(ppid) ?? [];
+        list.push(pid);
+        children.set(ppid, list);
+        let rest = tok.slice(2);
+        if (rest.length >= 2 && Number.isInteger(Number(rest[0]))) {
+            pgidOf.set(pid, Number(rest[0]));
+            tpgidOf.set(pid, Number(rest[1]));
+            rest = rest.slice(2);
+        }
+        if (rest.length >= 5) {
+            const started = Date.parse(rest.slice(0, 5).join(' '));
+            if (Number.isFinite(started)) startTimes.set(pid, started);
+            rest = rest.slice(5);
+        }
+        if (rest.length > 0) commOf.set(pid, rest.join(' '));
+    }
+    return { children, startTimes, pgidOf, tpgidOf, commOf };
+};
+
+/**
+ * Bounds for the per-cycle reader spawns. The default 1 MiB buffer is what a
+ * busy machine's `ps` table or a store full of long titles outgrows, and past
+ * it the read fails as "no names, no subagents" with nothing said; an
+ * unbounded `ps` that hangs would hold the whole report cycle.
+ */
+const READER_MAX_BUFFER = 16 * 1024 * 1024;
+const PS_TIMEOUT_MS = 2_000;
+/** Rows read from an agent's session store per cycle, newest first. */
+const STORE_ROW_LIMIT = 1000;
+
+/** Say once per reader why it came back empty, so a silent null is traceable. */
+const warnedReaders = new Set<string>();
+const warnReaderOnce = (reader: string, why: string, effect = 'session names and subagent detection may be missing'): void => {
+    if (warnedReaders.has(reader)) return;
+    warnedReaders.add(reader);
+    console.error(`! ${reader} read failed (${why}) — ${effect}`);
+};
+
+/** Why a reader spawn produced nothing usable. */
+const spawnFailure = (r: ReturnType<typeof spawnSync>): string =>
+    r.error ? r.error.message : r.signal ? `killed by ${r.signal}` : `exit ${r.status}`;
+
+/**
+ * The process table, or null when `ps` failed. Exported with its spawn as a
+ * seam so the bounds are testable without a real `ps`.
+ */
+export const readProcTable = (run: typeof spawnSync = spawnSync): ProcTable | null => {
+    // pgid/tpgid/comm ride along for the subagent detection (foreground
+    // process group), so the extra panes cost zero new spawns — one `ps`
+    // per report cycle is still the whole table (KB precedent).
+    // LC_ALL=C pins lstart to the 5-token English form parseProcTable cuts on:
+    // under ko_KR it came out as 4 or 7 tokens, the comm was misread, and no pi
+    // subagent pane was ever reported.
+    const r = run('ps', ['-axo', 'pid=,ppid=,pgid=,tpgid=,lstart=,comm='], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        env: { ...process.env, LC_ALL: 'C' },
+        timeout: PS_TIMEOUT_MS,
+        maxBuffer: READER_MAX_BUFFER,
+    });
+    if (r.status === 0) return parseProcTable(String(r.stdout ?? ''));
+    warnReaderOnce('ps', spawnFailure(r));
+    return null;
+};
+
+/**
+ * One process-table snapshot per report cycle, shared by every pane. `lstart`
+ * rides along because the agents without a pid registry (Hermes, Codex) are
+ * matched to their session row by when their process started, and paying for a
+ * second `ps` spawn to learn that would undo what this memo is for.
+ */
+const readPsSnapshot = ttlMemo(SNAPSHOT_TTL_MS, () => readProcTable());
+
+/**
+ * The agent running in the FOREGROUND process group of the tty owned by a
+ * pane shell, or null. This is what separates a subagent pane from a plain
+ * prompt: the subagent pane reports `pane_current_command=bash` (a script
+ * execs pi), so the pane-level command identifies nothing — but the tty's
+ * foreground group is pi's, and `comm` names it. A pane sitting at its login
+ * shell has the shell's own group in the foreground (tpgid === pgid) and is
+ * not a subagent, no matter what the registry would match.
+ */
+export const foregroundAgentFor = (
+    panePid: number,
+    table: ProcTable | null = readPsSnapshot(),
+): RegisteredRemoteAgent | null => {
+    if (!Number.isInteger(panePid) || panePid <= 0 || !table) return null;
+    const pgid = table.pgidOf.get(panePid);
+    const tpgid = table.tpgidOf.get(panePid);
+    if (pgid === undefined || tpgid === undefined || tpgid === pgid) return null;
+    for (const [pid, pgrp] of table.pgidOf) {
+        if (pgrp !== tpgid) continue;
+        const agent = matchAgentByPaneCommand(basename(table.commOf.get(pid) ?? ''));
+        if (agent) return agent;
+    }
+    return null;
+};
+
+/** Start times for this cycle's snapshot. Empty when `ps` is unavailable. */
+export const psStartTimes = (): Map<number, number> => readPsSnapshot()?.startTimes ?? new Map();
+
+const cachedPidSessionRecords = ttlMemo(SNAPSHOT_TTL_MS, readPidSessionRecords);
+
+const walkDescendants = (rootPid: number, children: Map<number, number[]>): Set<number> => {
+    const found = new Set<number>([rootPid]);
+    const queue = [rootPid];
+    while (queue.length > 0) {
+        for (const child of children.get(queue.shift()!) ?? []) {
+            if (!found.has(child)) {
+                found.add(child);
+                queue.push(child);
+            }
+        }
+    }
+    return found;
+};
+
+/**
+ * Per-pane process tree, memoized for the same window as the `ps` snapshot it
+ * walks. The snapshot itself is already shared across the cycle, but the walk was
+ * not: each resolver on a row ran its own BFS, so asking a pane for both its
+ * session id and its session name doubled the work on the path whose CPU cost is
+ * the reason these caches exist (see claudeSessionCache).
+ *
+ * Callers must treat the returned Set as read-only — it is shared.
+ */
+const descendantCache = keyedTtlCache<number, Set<number>>(SNAPSHOT_TTL_MS);
+
+/** pid set of `rootPid` + all descendants, from one `ps` snapshot. */
+export const collectDescendantPids = (rootPid: number): Set<number> => {
+    const cached = descendantCache.get(rootPid);
+    if (cached) return cached.value;
+
+    const children = readPsSnapshot()?.children;
+    // A failed `ps` is not cached: the next cycle should retry rather than
+    // serve "this pane has no children" for the whole TTL.
+    if (children === undefined) return new Set([rootPid]);
+    return descendantCache.set(rootPid, walkDescendants(rootPid, children));
+};
+
+/** Test seam for the pid-based resolver. */
+export interface PidResolveDeps {
+    records?: PidSessionRecord[];
+    descendants?: Set<number>;
+}
+
+/**
+ * Whether this machine's Claude Code writes `~/.claude/sessions` records at all.
+ *
+ * The difference between "no records anywhere" (an older CC — the mtime
+ * heuristic is the only option) and "records exist, none match this pane" (the
+ * pane is not a Claude session) is the difference between a useful fallback and
+ * a wrong answer, so callers that care ask it explicitly.
+ */
+export const pidSessionRecordsExist = (): boolean => cachedPidSessionRecords().length > 0;
+
+/**
+ * Exact resolution: the session record whose pid lives in the pane's
+ * process tree AND whose cwd matches (guards against OS pid reuse
+ * leaving a stale record pointing elsewhere). Null → caller falls back
+ * to the mtime heuristic.
+ *
+ * Returns the whole record so the id and the name come from one lookup — they
+ * describe the same session, and reading the directory twice per cycle to get
+ * them separately is what the cache above exists to avoid.
+ */
+export const detectClaudeSessionByPid = (
+    panePid: number,
+    paneCwd: string | null,
+    deps: PidResolveDeps = {},
+): PidSessionRecord | null => {
+    const records = deps.records ?? cachedPidSessionRecords();
+    if (records.length === 0) return null;
+    const descendants = deps.descendants ?? collectDescendantPids(panePid);
+    return records.find((r) =>
+        descendants.has(r.pid) && (paneCwd === null || r.cwd === paneCwd)) ?? null;
+};
+
+export const detectClaudeSessionIdByPid = (
+    panePid: number,
+    paneCwd: string | null,
+    deps: PidResolveDeps = {},
+): string | null => detectClaudeSessionByPid(panePid, paneCwd, deps)?.sessionId ?? null;
+
+/**
+ * The name of the session running in this pane. No mtime fallback exists here:
+ * the transcript filenames the heuristic walks carry a UUID and nothing else,
+ * so an older CC without `~/.claude/sessions` yields no name and the phone
+ * keeps the computed label.
+ */
+export const detectClaudeSessionNameByPid = (
+    panePid: number,
+    paneCwd: string | null,
+    deps: PidResolveDeps = {},
+): string | null => nonBlank(detectClaudeSessionByPid(panePid, paneCwd, deps)?.name);
+
+/**
+ * The transcript file for the Claude Code session running in a tmux pane.
+ *
+ * Pid first, cwd only as a fallback, and the order is the whole point: the cwd
+ * heuristic picks the newest `*.jsonl` in the directory, so a second `claude`
+ * started in the same repo steals the first one's transcript (the comment above
+ * `detectClaudeSessionIdByPid` records that failure). Live-timeline viewers are
+ * per tmux session, so two sessions in one directory must resolve to two files
+ * or each phone reads the other's work.
+ *
+ * Returns null when this pane is not running Claude Code at all — a Codex or
+ * Gemini pane has no transcript here, and that is an answer, not a failure.
+ */
+export const claudeTranscriptPath = (paneCwd: string | null, panePid?: number): string | null => {
+    if (!paneCwd) return null;
+
+    let sessionId: string | null = null;
+    if (panePid) {
+        sessionId = detectClaudeSessionIdByPid(panePid, paneCwd);
+        // Records exist but this pane matched none: the pane is not running
+        // Claude Code, or its record has not landed yet. Falling through to the
+        // mtime heuristic here is what lets a *second* `claude` in the same
+        // directory hand this pane the other session's transcript — and a
+        // viewer reading another session's work is worse than one reading none.
+        // Only an installation that writes no records at all earns the fallback.
+        if (!sessionId && pidSessionRecordsExist()) return null;
+    }
+    sessionId ??= detectClaudeSessionId(paneCwd);
+    if (!sessionId) return null;
+
+    // A mis-encoded directory yields a path that never exists, and the watcher
+    // would then poll a missing file forever without ever saying so.
+    const projectDir = join(CLAUDE_PROJECTS_DIR, claudeProjectDirName(paneCwd));
+    const path = join(projectDir, `${sessionId}.jsonl`);
+    // Prove it before handing it out. The pid path never touches the filesystem,
+    // so without this a mis-encoded directory reads as a healthy silent session.
+    try {
+        return statSync(path).isFile() ? path : null;
+    } catch {
+        return null;
+    }
+};
+
+// ── pi ───────────────────────────────────────────────────────────
+
+/**
+ * Where pi keeps its sessions, honouring the override pi itself honours.
+ *
+ * `getAgentDir()` (`…/pi-coding-agent/dist/config.js:421-426`) reads
+ * `PI_CODING_AGENT_DIR` — named `${APP_NAME.toUpperCase()}_CODING_AGENT_DIR` at
+ * `config.js:406` — and expands a leading `~` before falling back to
+ * `~/.pi/agent`. Hardcoding the fallback would answer `null` for every session
+ * belonging to anyone who sets it, and answer it silently.
+ *
+ * Read per call rather than at module load: the listener is long-lived, and a
+ * constant captured at import time is a constant captured before the service
+ * environment is in place.
+ */
+const piSessionsDir = (): string => {
+    const override = process.env.PI_CODING_AGENT_DIR;
+    const agentDir = override
+        ? override.replace(/^~(?=\/|$)/, homedir())
+        : join(homedir(), '.pi', 'agent');
+    return join(agentDir, 'sessions');
+};
+
+/**
+ * pi's own encoding of a cwd into one directory name, copied from the writer
+ * rather than inferred from the directories it produced.
+ *
+ * Read 2026-09-14 out of `@earendil-works/pi-coding-agent`,
+ * `dist/core/session-manager.js:245` (`getDefaultSessionDirPath`), which
+ * `dist/migrations.js:102` repeats verbatim:
+ *
+ *     `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`
+ *
+ * Worth copying exactly rather than eyeballing, because it differs from Claude's
+ * on the case that matters: Claude maps `.` to `-` as well, pi does not. A
+ * directory with a dot in it resolves under one rule and not the other, and the
+ * failure is silent — a watcher polling a path that never existed.
+ *
+ * The `resolvePath(cwd)` on the line above that regex is part of the rule, not
+ * preamble: `dist/utils/paths.js:82-86` expands a leading `~` and then runs
+ * `path.resolve`. Encoding the raw string instead turns a trailing slash into a
+ * doubled separator (`--a-b---`) and leaves `.`/`..` segments in the directory
+ * name, both of which resolve to a path pi has never written.
+ */
+const piSessionDirName = (cwd: string): string => {
+    const expanded = cwd.replace(/^~(?=\/|$)/, homedir());
+    const resolved = resolve(expanded);
+    return `--${resolved.replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`;
+};
+
+/**
+ * Newest session file pi wrote for this directory.
+ *
+ * Same 60s TTL and the same reason as `claudeSessionCache`: `turn-watch`
+ * re-resolves every 10s per watcher, and a directory a person has run pi in for
+ * months holds one file per run.
+ *
+ * Keyed on the pane's pid as well as its cwd, so a pi that was restarted in the
+ * same directory is not followed on the previous run's file for the rest of the
+ * TTL. Within one pid the answer genuinely cannot change: pi writes one
+ * transcript per process, and `/clear` inside it keeps writing to that file.
+ */
+const piSessionCache = keyedTtlCache<string, string | null>(60_000);
+
+const doDetectPiTranscript = (cwd: string): string | null => {
+    try {
+        const sessionDir = join(piSessionsDir(), piSessionDirName(cwd));
+        let latest: { path: string; mtime: number } | undefined;
+        for (const entry of readdirSync(sessionDir)) {
+            // `<ISO timestamp>_<uuid>.jsonl`, beside a `.jsonl.loadout.json`
+            // sidecar per session that is not a transcript.
+            if (!entry.endsWith('.jsonl')) continue;
+            const path = join(sessionDir, entry);
+            const stat = statSync(path);
+            if (!stat.isFile()) continue;
+            if (!latest || stat.mtimeMs > latest.mtime) latest = { path, mtime: stat.mtimeMs };
+        }
+        return latest?.path ?? null;
+    } catch {
+        return null;
+    }
+};
+
+/**
+ * The transcript a pi pane is writing, or null when there is none to follow.
+ *
+ * Newest-by-mtime within the directory. pi keeps no pid→session record the way
+ * Claude Code does, so `panePid` cannot pick between two pi panes sharing a
+ * directory — both resolve to the newer session's file. That is the known limit
+ * of this resolver, and it is the same shape as Claude's mtime fallback.
+ *
+ * `panePid` still matters, as the cache key: a restart in the same directory
+ * writes a new file, and a cwd-only key would keep answering with the old one
+ * until the TTL ran out.
+ */
+export const piTranscriptPath = (paneCwd: string | null, panePid?: number): string | null => {
+    if (!paneCwd) return null;
+    // `|` is safe as the separator because the left half is always numeric.
+    const key = `${panePid ?? 0}|${paneCwd}`;
+    const cached = piSessionCache.get(key);
+    if (cached) return cached.value;
+    return piSessionCache.set(key, doDetectPiTranscript(paneCwd));
+};
+
+// ── Agents whose session store keeps no pid ──────────────────────
+//
+// Hermes and Codex both record a session per cwd with a creation timestamp and
+// no pid, so a pane cannot be joined to its row the exact way Claude Code's
+// `<pid>.json` allows. What is left is time: both stores stamp the row when the
+// session starts, so the row belonging to this pane is the one stamped when a
+// process in this pane started. The window has to be narrow — two agents opened
+// in the same directory within it are indistinguishable — and a miss must stay a
+// miss, since a wrong name shown confidently is worse than the computed label.
+
+/** How far a row's creation time may sit from a process start time. */
+const PROC_MATCH_TOLERANCE_MS = 10_000;
+
+/**
+ * The row whose timestamp is closest to when one of the pane's processes started,
+ * within {@link PROC_MATCH_TOLERANCE_MS}. Null when nothing qualifies — including
+ * when no pid in the tree has a known start time, which is why the start times
+ * are collected before any row is compared rather than defaulted to zero.
+ */
+export const pickRowByProcStart = <T>(
+    rows: readonly T[],
+    tsMsOf: (row: T) => number | null,
+    startTimes: Map<number, number>,
+    pids: Set<number>,
+): T | null => {
+    const procStarts = [...pids]
+        .map((pid) => startTimes.get(pid))
+        .filter((t): t is number => t !== undefined && Number.isFinite(t));
+    if (procStarts.length === 0) return null;
+
+    let best: { row: T; distance: number } | null = null;
+    for (const row of rows) {
+        const at = tsMsOf(row);
+        if (at === null || !Number.isFinite(at)) continue;
+        const distance = Math.min(...procStarts.map((start) => Math.abs(at - start)));
+        if (distance > PROC_MATCH_TOLERANCE_MS) continue;
+        if (best === null || distance < best.distance) best = { row, distance };
+    }
+    return best?.row ?? null;
+};
+
+/**
+ * Read rows from a SQLite file as JSON. Null on every failure — no `sqlite3` on
+ * PATH, a locked or corrupt database, a schema that moved — because a missing
+ * name costs the computed label and nothing else.
+ *
+ * The query carries no parameters BY DESIGN: SQL passed to the `sqlite3` binary
+ * as an argv string has nowhere to bind `?` to, so interpolating a cwd would
+ * make this file the place that has to know SQLite quoting rules. Callers select
+ * the columns they need and filter in JS instead; the stores hold tens of rows,
+ * not millions. The `timeout` keeps a locked database from holding up a report
+ * cycle that runs every five seconds.
+ */
+export const sqliteJson = (dbPath: string, sql: string, run: typeof spawnSync = spawnSync): unknown[] | null => {
+    const r = run('sqlite3', ['-readonly', '-json', dbPath, sql], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 1_000,
+        maxBuffer: READER_MAX_BUFFER,
+    });
+    if (r.status !== 0) {
+        warnReaderOnce(`sqlite3 ${basename(dbPath)}`, spawnFailure(r));
+        return null;
+    }
+    const out = String(r.stdout ?? '').trim();
+    if (out === '') return []; // no rows — sqlite3 prints nothing, not `[]`
+    try {
+        const parsed = JSON.parse(out);
+        return Array.isArray(parsed) ? parsed : null;
+    } catch {
+        return null;
+    }
+};
+
+/** Test seam for the store-backed resolvers. `rows: null` = the read failed. */
+export interface StoreResolveDeps {
+    rows?: unknown[] | null;
+    startTimes?: Map<number, number>;
+    descendants?: Set<number>;
+}
+
+// ── Hermes ───────────────────────────────────────────────────────
+
+const HERMES_STATE_DB = join(homedir(), '.hermes', 'state.db');
+
+/**
+ * `sessions` rows for CLI sessions. `started_at` is REAL **seconds** (e.g.
+ * `1786676108.657766`), not milliseconds — the one unit mistake that would make
+ * every comparison miss by decades without erroring.
+ *
+ * `ended_at IS NULL` is deliberately NOT a filter: measured rows for sessions
+ * that died days ago still have a null `ended_at`, so it says nothing about
+ * liveness. The process-start match is the only thing that does.
+ */
+interface HermesSessionRow {
+    cwd?: string | null;
+    title?: string | null;
+    display_name?: string | null;
+    started_at?: number | null;
+}
+
+const readHermesSessions = ttlMemo(SNAPSHOT_TTL_MS, (): unknown[] | null => sqliteJson(
+    HERMES_STATE_DB,
+    // Newest first and capped: only a session started alongside a live
+    // process can match, and an old store holds thousands of rows. The cap
+    // is wide enough that a session still running is not crowded out by the
+    // ones started after it.
+    `SELECT cwd, title, display_name, started_at FROM sessions WHERE source = 'cli' ORDER BY started_at DESC LIMIT ${STORE_ROW_LIMIT}`,
+));
+
+export const detectHermesSessionName = (
+    paneCwd: string,
+    panePid?: number,
+    deps: StoreResolveDeps = {},
+): string | null => {
+    // Without the pane's pid there is no process tree to match against, and this
+    // store offers no other key — no name is the only honest answer.
+    if (panePid === undefined) return null;
+    const raw = deps.rows !== undefined ? deps.rows : readHermesSessions();
+    if (raw === null) return null;
+
+    const rows = (raw as HermesSessionRow[]).filter((r) => r.cwd === paneCwd);
+    if (rows.length === 0) return null;
+    const row = pickRowByProcStart(
+        rows,
+        (r) => (typeof r.started_at === 'number' ? r.started_at * 1_000 : null),
+        deps.startTimes ?? psStartTimes(),
+        deps.descendants ?? collectDescendantPids(panePid),
+    );
+    // The auto-title is written asynchronously after the first response, so an
+    // untitled row is a young session, not a broken one.
+    return nonBlank(row?.title ?? undefined) ?? nonBlank(row?.display_name ?? undefined);
+};
+
+// ── Codex ────────────────────────────────────────────────────────
+
+const CODEX_DIR = join(homedir(), '.codex');
+const CODEX_STATE_DB = /^state_(\d+)\.sqlite$/;
+
+/**
+ * The highest-numbered match, numerically. Codex versions its state file
+ * (`state_5.sqlite` today) and moves to the next number on a schema migration,
+ * so hard-coding a name would silently stop reading after an upgrade. Sorting
+ * the strings would break at `state_10` vs `state_9`.
+ */
+export const newestVersionedDb = (entries: readonly string[], pattern: RegExp): string | null => {
+    let best: { entry: string; version: number } | null = null;
+    for (const entry of entries) {
+        const m = entry.match(pattern);
+        if (!m) continue;
+        const version = Number(m[1]);
+        if (best === null || version > best.version) best = { entry, version };
+    }
+    return best?.entry ?? null;
+};
+
+/**
+ * `threads` rows for this machine. `name` is what the user set (`codex resume`
+ * takes it), `title` is generated and NOT NULL — but with no default, so `''`
+ * is reachable.
+ *
+ * `created_at_ms` was added after `created_at` (seconds) and is backfilled by an
+ * insert trigger, so rows written before it carry NULL there — hence both
+ * columns are selected and the fallback happens in JS.
+ */
+interface CodexThreadRow {
+    cwd?: string | null;
+    name?: string | null;
+    title?: string | null;
+    archived?: number | null;
+    created_at?: number | null;
+    created_at_ms?: number | null;
+}
+
+const readCodexThreads = ttlMemo(SNAPSHOT_TTL_MS, (): unknown[] | null => {
+    let entries: string[];
+    try {
+        entries = readdirSync(CODEX_DIR);
+    } catch {
+        return null; // codex never installed here
+    }
+    const db = newestVersionedDb(entries, CODEX_STATE_DB);
+    if (db === null) return null;
+    return sqliteJson(
+        join(CODEX_DIR, db),
+        // Capped like the Hermes read, after archived threads are dropped so
+        // they do not use up the cap (a NULL reads as not archived).
+        `SELECT cwd, name, title, archived, created_at, created_at_ms FROM threads WHERE archived IS NULL OR archived = 0 ORDER BY COALESCE(created_at_ms, created_at * 1000) DESC LIMIT ${STORE_ROW_LIMIT}`,
+    );
+});
+
+/**
+ * No `source` filter, unlike the Hermes reader's `source = 'cli'`. The column
+ * exists here too (alongside `thread_source`), but Codex is unauthenticated on
+ * every machine measured so far and its `threads` table is empty, so which
+ * values mark a terminal session is unknown — and a wrong guess filters out
+ * every row, which fails as "no name ever" rather than loudly. A thread from a
+ * non-terminal frontend is therefore eligible to match, and it lands in the same
+ * accepted misjoin as two terminals in the same directory: it needs the same cwd
+ * AND a creation time within the tolerance of a process in this pane. Add the
+ * filter once the values can be observed.
+ */
+export const detectCodexSessionName = (
+    paneCwd: string,
+    panePid?: number,
+    deps: StoreResolveDeps = {},
+): string | null => {
+    if (panePid === undefined) return null;
+    const raw = deps.rows !== undefined ? deps.rows : readCodexThreads();
+    if (raw === null) return null;
+
+    const rows = (raw as CodexThreadRow[]).filter((r) => r.cwd === paneCwd && !r.archived);
+    if (rows.length === 0) return null;
+    const row = pickRowByProcStart(
+        rows,
+        (r) => r.created_at_ms ?? (typeof r.created_at === 'number' ? r.created_at * 1_000 : null),
+        deps.startTimes ?? psStartTimes(),
+        deps.descendants ?? collectDescendantPids(panePid),
+    );
+    return nonBlank(row?.name ?? undefined) ?? nonBlank(row?.title ?? undefined);
+};
+
+/**
+ * Where Codex keeps its rollouts.
+ *
+ * `CODEX_HOME` overrides `~/.codex`, and the writer resolves it per run — the
+ * binary carries both `CODEX_HOME: ` (its `doctor` report) and
+ * `failed to resolve CODEX_HOME`. Read per call for the same reason
+ * `piSessionsDir` is: a constant captured at import time is captured before the
+ * service environment is in place.
+ */
+const codexSessionsDir = (): string => {
+    const override = process.env.CODEX_HOME;
+    const home = override ? override.replace(/^~(?=\/|$)/, homedir()) : CODEX_DIR;
+    return join(home, 'sessions');
+};
+
+/**
+ * The two newest `sessions/<YYYY>/<MM>/<DD>` shards.
+ *
+ * Codex shards by date and puts no cwd anywhere in the path, so finding a
+ * session means opening files. Two shards is the bound: the newest holds every
+ * session started today, and the one before it covers a session started before
+ * midnight and still running. Sorting the names rather than computing today's
+ * date is deliberate — the shard is named in the writer's timezone, and a
+ * machine whose UTC date has already turned over would look in a directory that
+ * does not exist yet on a date-arithmetic rule.
+ */
+const newestCodexShards = (root: string, limit = 2): string[] => {
+    const descend = (dir: string): string[] => {
+        try {
+            return readdirSync(dir).filter((e) => /^\d+$/.test(e)).sort().reverse();
+        } catch {
+            return [];
+        }
+    };
+    const shards: string[] = [];
+    for (const year of descend(root)) {
+        for (const month of descend(join(root, year))) {
+            for (const day of descend(join(root, year, month))) {
+                shards.push(join(root, year, month, day));
+                if (shards.length >= limit) return shards;
+            }
+        }
+    }
+    return shards;
+};
+
+/**
+ * How much of a rollout is read at a time to find its `session_meta` header, and
+ * how far that read will go before giving up.
+ *
+ * The first line carries `base_instructions` — measured at 21551 bytes of a
+ * 22049-byte header in the newest session here — and that field grows with the
+ * user's AGENTS.md and skill set, so a single fixed read is a bound someone
+ * eventually crosses. Crossing it would answer null forever and show as "this
+ * agent has no live timeline", with nothing to say why; the chunked read below
+ * costs one extra `readSync` per oversized header instead.
+ *
+ * The outer cap exists because this runs against whatever files are in the
+ * directory, and a file with no newline in it at all must not be read whole.
+ */
+const CODEX_HEADER_CHUNK = 64 * 1024;
+const CODEX_HEADER_MAX = 256 * 1024;
+
+/** The first line of a file, or null when it holds none within {@link CODEX_HEADER_MAX}. */
+const firstLineOf = (path: string): string | null => {
+    let fd: number | undefined;
+    try {
+        fd = openSync(path, 'r');
+        const buffer = Buffer.allocUnsafe(CODEX_HEADER_CHUNK);
+        // Accumulated as bytes, not as a string: a chunk boundary can fall in
+        // the middle of a multi-byte character, and decoding each chunk on its
+        // own would both corrupt that character and desynchronise the read
+        // offset from the byte position it has to be.
+        const chunks: Buffer[] = [];
+        let size = 0;
+        while (size < CODEX_HEADER_MAX) {
+            const read = readSync(fd, buffer, 0, CODEX_HEADER_CHUNK, size);
+            if (read === 0) return null;
+            const filled = buffer.subarray(0, read);
+            const end = filled.indexOf(0x0a);
+            if (end !== -1) {
+                chunks.push(Buffer.from(filled.subarray(0, end)));
+                return Buffer.concat(chunks).toString('utf8');
+            }
+            chunks.push(Buffer.from(filled));
+            size += read;
+        }
+        return null;
+    } catch {
+        return null;
+    } finally {
+        if (fd !== undefined) closeSync(fd);
+    }
+};
+
+interface CodexRollout {
+    readonly path: string;
+    readonly mtime: number;
+    readonly startedAt: number | null;
+}
+
+/** The `session_meta` header of a rollout, when it names this pane's directory. */
+const codexRolloutFor = (path: string, cwd: string, mtime: number): CodexRollout | null => {
+    const line = firstLineOf(path);
+    if (!line) return null;
+    try {
+        const entry = JSON.parse(line) as { type?: unknown; payload?: Record<string, unknown> };
+        if (entry.type !== 'session_meta' || !entry.payload) return null;
+        if (entry.payload.cwd !== cwd) return null;
+        const at = typeof entry.payload.timestamp === 'string' ? Date.parse(entry.payload.timestamp) : NaN;
+        return { path, mtime, startedAt: Number.isFinite(at) ? at : null };
+    } catch {
+        return null;
+    }
+};
+
+const doDetectCodexTranscript = (cwd: string, panePid: number | undefined): string | null => {
+    const resolved = resolve(cwd.replace(/^~(?=\/|$)/, homedir()));
+    const candidates: CodexRollout[] = [];
+    for (const shard of newestCodexShards(codexSessionsDir())) {
+        let entries: string[];
+        try {
+            entries = readdirSync(shard);
+        } catch {
+            continue;
+        }
+        for (const entry of entries) {
+            if (!entry.startsWith('rollout-') || !entry.endsWith('.jsonl')) continue;
+            const path = join(shard, entry);
+            try {
+                const stat = statSync(path);
+                if (!stat.isFile()) continue;
+                const rollout = codexRolloutFor(path, resolved, stat.mtimeMs);
+                if (rollout) candidates.push(rollout);
+            } catch {
+                continue;
+            }
+        }
+    }
+    if (candidates.length === 0) return null;
+
+    // Two Codex panes in one directory are told apart the way Hermes and Codex
+    // session names already are: the rollout stamped when a process in this pane
+    // started is this pane's. A miss falls back to the newest file rather than
+    // answering nothing, because one pane in a directory is the normal case and
+    // it has no process-start match to make when the pane's pid is unknown.
+    const matched = panePid === undefined
+        ? null
+        : pickRowByProcStart(candidates, (c) => c.startedAt, psStartTimes(), collectDescendantPids(panePid));
+    if (matched) return matched.path;
+    return candidates.reduce((best, c) => (c.mtime > best.mtime ? c : best)).path;
+};
+
+/**
+ * Newest session file Codex wrote for this directory.
+ *
+ * Cached harder than pi's, and for a reason pi's does not have: this resolver
+ * opens and parses a 22KB header out of every rollout in two date shards just to
+ * read one `cwd` field, and `turn-watch` re-resolves every 10s per watcher on a
+ * path documented as uncached and blocking.
+ */
+const codexSessionCache = keyedTtlCache<string, string | null>(60_000);
+
+export const codexTranscriptPath = (paneCwd: string | null, panePid?: number): string | null => {
+    if (!paneCwd) return null;
+    // `|` is safe as the separator because the left half is always numeric.
+    const key = `${panePid ?? 0}|${paneCwd}`;
+    const cached = codexSessionCache.get(key);
+    if (cached) return cached.value;
+    return codexSessionCache.set(key, doDetectCodexTranscript(paneCwd, panePid));
+};
+
+// ── gemini ───────────────────────────────────────────────────────
+
+/**
+ * Where Gemini CLI keeps its state, honouring the override Gemini itself honours.
+ *
+ * Read 2026-10-08 out of `@google/gemini-cli` 0.46.0
+ * (`bundle/chunk-6ZHP2EJW.js:248868-248874`): `GEMINI_CLI_HOME` when set, else
+ * `os.homedir()`, with `.gemini` joined on after. Read per call for the same
+ * reason as `piSessionsDir`: the listener is long-lived and a constant captured
+ * at import time is captured before the service environment is in place.
+ */
+const geminiDir = (): string => join(process.env.GEMINI_CLI_HOME || homedir(), '.gemini');
+
+/**
+ * The directory name Gemini filed this cwd under, from its project registry.
+ *
+ * It is a registry lookup, not a rule: `projects.json` maps an absolute path to
+ * a slug (`bundle:249630-249636`, `250073-250078`; lowercased on win32). Every
+ * slug measured so far equals `basename(cwd)`, but a collision gets a suffix, so
+ * deriving it would be right until the day it silently is not.
+ *
+ * The slug comes out of a file and goes into a path, so only a single plain path
+ * segment is accepted.
+ */
+const geminiProjectSlug = (cwd: string): string | null => {
+    const registry: unknown = JSON.parse(readFileSync(join(geminiDir(), 'projects.json'), 'utf-8'));
+    if (!registry || typeof registry !== 'object') return null;
+    const projects = (registry as Record<string, unknown>).projects;
+    if (!projects || typeof projects !== 'object') return null;
+
+    const resolved = resolve(cwd);
+    const slug = (projects as Record<string, unknown>)[process.platform === 'win32' ? resolved.toLowerCase() : resolved];
+    if (typeof slug !== 'string' || !slug || slug === '.' || slug === '..' || basename(slug) !== slug) return null;
+    return slug;
+};
+
+const geminiSessionCache = keyedTtlCache<string, string | null>(60_000);
+
+const doDetectGeminiTranscript = (cwd: string): string | null => {
+    try {
+        const slug = geminiProjectSlug(cwd);
+        if (!slug) return null;
+        const chatsDir = join(geminiDir(), 'tmp', slug, 'chats');
+        let latest: { path: string; mtime: number } | undefined;
+        for (const entry of readdirSync(chatsDir)) {
+            // `session-<ts>-<id>.jsonl`. The legacy `.json` form is rewritten
+            // whole rather than appended to, so it cannot be tailed; and a
+            // sub-agent's transcript sits one directory down, where this
+            // listing does not look.
+            if (!entry.startsWith('session-') || !entry.endsWith('.jsonl')) continue;
+            const path = join(chatsDir, entry);
+            const stat = statSync(path);
+            if (!stat.isFile()) continue;
+            if (!latest || stat.mtimeMs > latest.mtime) latest = { path, mtime: stat.mtimeMs };
+        }
+        return latest?.path ?? null;
+    } catch {
+        return null;
+    }
+};
+
+/**
+ * The transcript a Gemini pane is writing, or null when there is none to follow.
+ *
+ * Newest-by-mtime within the project's `chats` directory, which also follows a
+ * resumed session: Gemini keeps appending to the original file. Like pi's,
+ * Gemini keeps no pid → session record, so two Gemini panes in one directory
+ * both resolve to the newer file — the known limit — and `panePid` is only the
+ * cache key that lets a restart be noticed.
+ *
+ * The cwd is resolved as given; if a pane's cwd and the path Gemini registered
+ * ever differ by a symlink (`/tmp` ↔ `/private/tmp`) this answers null, and
+ * realpath is the fix to reach for then.
+ */
+export const geminiTranscriptPath = (paneCwd: string | null, panePid?: number): string | null => {
+    if (!paneCwd) return null;
+    // `|` is safe as the separator because the left half is always numeric.
+    const key = `${panePid ?? 0}|${paneCwd}`;
+    const cached = geminiSessionCache.get(key);
+    if (cached) return cached.value;
+    return geminiSessionCache.set(key, doDetectGeminiTranscript(paneCwd));
+};
+
+// ── opencode ─────────────────────────────────────────────────────
+
+/**
+ * Top-level 2.x sessions, newest activity first. `active` is the newest
+ * message write, not `session_v2.time_updated`: that one lags the messages by
+ * minutes (measured on 2.0.24 — a session last written at :51:51 still read
+ * :49:32), and a pane is matched by what it is doing now. A session row only
+ * exists from the first prompt on, and `title` stays NULL until opencode names
+ * it after that first turn.
+ */
+interface OpencodeSessionRow {
+    id?: string | null;
+    title?: string | null;
+    directory?: string | null;
+    active?: number | null;
+}
+
+const readOpencodeSessions = ttlMemo(SNAPSHOT_TTL_MS, (): unknown[] | null => {
+    const db = opencodeDbPath();
+    try {
+        statSync(db);
+    } catch {
+        // opencode 2.x never ran here — or the listener sees another HOME,
+        // XDG_DATA_HOME or OPENCODE_DB than the pane does.
+        warnReaderOnce('opencode store', `no ${db}`, 'opencode sessions get no name or transcript');
+        return null;
+    }
+    return sqliteJson(
+        db,
+        `SELECT s.id AS id, s.title AS title, s.directory AS directory,
+            (SELECT max(m.time_updated) FROM session_message m WHERE m.session_id = s.id) AS active
+         FROM session_v2 s WHERE s.parent_id IS NULL AND s.time_archived IS NULL
+         ORDER BY active DESC LIMIT ${STORE_ROW_LIMIT}`,
+    );
+});
+
+/**
+ * The title opencode gives a session before it names one (`New session -
+ * <ISO time>`, seen on sessions this machine's opencode left untitled) says
+ * nothing the computed label does not, so it is not a name.
+ */
+const OPENCODE_PLACEHOLDER_TITLE = /^New session - \d{4}-\d{2}-\d{2}T/;
+const realTitle = (title: string | null | undefined): string | null => {
+    const name = nonBlank(title ?? undefined);
+    return name && !OPENCODE_PLACEHOLDER_TITLE.test(name) ? name : null;
+};
+
+/** opencode records the real path (`/private/tmp`, not `/tmp`), and a pane may report either. */
+const realDir = (dir: string): string => {
+    try {
+        return realpathSync(dir);
+    } catch {
+        return dir;
+    }
+};
+
+/**
+ * The opencode session running in this pane: the one in the pane's directory
+ * written to most recently since the pane's process started. Started-since is
+ * what keeps a pane that has not sent its first prompt — no session row yet —
+ * from being handed yesterday's session in the same directory. Two opencode
+ * panes in one directory both answer the busier one: the store says nothing
+ * about which process wrote what, the limit pi and Gemini already have.
+ */
+export const detectOpencodeSession = (
+    paneCwd: string,
+    panePid?: number,
+    deps: StoreResolveDeps = {},
+): { id: string; title: string | null } | null => {
+    if (panePid === undefined) return null;
+    const raw = deps.rows !== undefined ? deps.rows : readOpencodeSessions();
+    if (raw === null) return null;
+    const startTimes = deps.startTimes ?? psStartTimes();
+    const starts = [...(deps.descendants ?? collectDescendantPids(panePid))]
+        .map((pid) => startTimes.get(pid))
+        .filter((t): t is number => t !== undefined && Number.isFinite(t));
+    if (starts.length === 0) return null;
+    const since = Math.min(...starts) - PROC_MATCH_TOLERANCE_MS;
+
+    const dir = realDir(paneCwd);
+    let best: OpencodeSessionRow | null = null;
+    for (const row of raw as OpencodeSessionRow[]) {
+        if (row.directory !== dir && row.directory !== paneCwd) continue;
+        if (typeof row.id !== 'string' || !OPENCODE_SESSION_ID.test(row.id)) continue;
+        if (typeof row.active !== 'number' || row.active < since) continue;
+        if (!best || row.active > (best.active ?? 0)) best = row;
+    }
+    return best ? { id: best.id as string, title: realTitle(best.title) } : null;
+};
+
+/** `sqliteJson` with its own warning: a failed transcript read costs the timeline, not the session list. */
+const queryOpencodeTranscript = (db: string, sql: string): unknown[] | null => {
+    const rows = sqliteJson(db, sql);
+    if (rows === null) warnReaderOnce('opencode transcript', `sqlite3 ${basename(db)}`, 'opencode panes show no live timeline');
+    return rows;
+};
+
+export const opencodeTranscriptPath = (paneCwd: string | null, panePid?: number): string | null => {
+    if (!paneCwd) return null;
+    const session = detectOpencodeSession(paneCwd, panePid);
+    return session ? opencodeSourcePath(opencodeDbPath(), session.id) : null;
+};
+
+// ── The registry ─────────────────────────────────────────────────
+
+const REMOTE_AGENT_TABLE = [
+    {
+        kind: 'claude',
+        displayName: 'Claude Code',
+        binary: 'claude',
+        subcommands: ['cc', 'claude'],
+        quitCommand: '/exit',
+        // Exact pid-tree match first; mtime heuristic only as fallback
+        // (older CC without ~/.claude/sessions, or ps failure).
+        resolveSessionId: (paneCwd, panePid) =>
+            (panePid !== undefined ? detectClaudeSessionIdByPid(panePid, paneCwd) : null)
+            ?? detectClaudeSessionId(paneCwd),
+        resolveSessionName: (paneCwd, panePid) =>
+            panePid !== undefined ? detectClaudeSessionNameByPid(panePid, paneCwd) : null,
+        resolveTranscript: (paneCwd, panePid) => claudeTranscriptPath(paneCwd, panePid),
+        projectTranscript: projectTranscriptEntries,
+    },
+    {
+        kind: 'codex',
+        displayName: 'Codex CLI',
+        binary: 'codex',
+        subcommands: ['codex'],
+        // Name only, like the hermes row: the store's thread id is a UUID this
+        // resolver could return, but nothing on the wire consumes it yet.
+        resolveSessionName: detectCodexSessionName,
+        resolveTranscript: (paneCwd, panePid) => codexTranscriptPath(paneCwd, panePid),
+        projectTranscript: projectCodexEntries,
+    },
+    {
+        // The pane binary is `cursor-agent`, Cursor's terminal TUI — NOT the
+        // bare `cursor` on PATH, which is the IDE launcher script: it opens
+        // the app and exits, so a pane started with it dies before the
+        // listener can address it.
+        kind: 'cursor',
+        displayName: 'Cursor CLI',
+        binary: 'cursor-agent',
+        subcommands: ['cursor', 'cursor-agent'],
+    },
+    {
+        kind: 'gemini',
+        displayName: 'Gemini CLI',
+        binary: 'gemini',
+        subcommands: ['gemini'],
+        // Two Gemini sessions in one folder cannot be told apart — the same
+        // limit pi has (newest file wins).
+        resolveTranscript: (paneCwd, panePid) => geminiTranscriptPath(paneCwd, panePid),
+        projectTranscript: projectGeminiEntries,
+    },
+    {
+        // `hermes` on PATH is a bash script that execs a venv Python, so the
+        // pane's *current* command reads the interpreter (`python3.11` as
+        // measured). Only `pane_start_command` identifies it, which is the
+        // same bargain `claude` (node) already makes. Deliberately no
+        // paneMatchAliases: matching interpreter names would adopt every
+        // Python REPL on the machine as a Hermes session.
+        kind: 'hermes',
+        displayName: 'Hermes',
+        binary: 'hermes',
+        subcommands: ['hermes'],
+        // No `resolveSessionId` counterpart: the store's own id is a
+        // `<timestamp>_<hash>` string, and nothing on the wire consumes it yet.
+        resolveSessionName: detectHermesSessionName,
+    },
+    {
+        kind: 'pi',
+        displayName: 'Pi',
+        binary: 'pi',
+        subcommands: ['pi'],
+        resolveTranscript: (paneCwd, panePid) => piTranscriptPath(paneCwd, panePid),
+        projectTranscript: projectPiEntries,
+    },
+    {
+        kind: 'opencode',
+        displayName: 'OpenCode',
+        binary: 'opencode',
+        subcommands: ['opencode'],
+        // Typed into a 2.0.24 TUI pane: `/exit` + Enter closed it.
+        quitCommand: '/exit',
+        resolveSessionId: (paneCwd, panePid) => detectOpencodeSession(paneCwd, panePid)?.id ?? null,
+        resolveSessionName: (paneCwd, panePid) => detectOpencodeSession(paneCwd, panePid)?.title ?? null,
+        resolveTranscript: (paneCwd, panePid) => opencodeTranscriptPath(paneCwd, panePid),
+        projectTranscript: projectOpencodeEntries,
+        readTranscript: (path, prev) => readOpencodeTranscript(path, prev, { query: queryOpencodeTranscript }),
+    },
+    // The rows below are the minimum: launch in a tmux pane and be addressable.
+    // Binary names come from Happier's provider table; only `copilot` and
+    // `kiro-cli` were run against a real install (`copilot` is a node script, so
+    // its pane reads `node` — the pane is found by session, and the native child
+    // `copilot` is what `foregroundAgentFor` matches).
+    // No session name, transcript, or turn-state resolver — each stays omitted
+    // until that agent's store is confirmed on a real install (EXTENSION POINT
+    // rule above).
+    {
+        kind: 'kimi',
+        displayName: 'Kimi Code',
+        binary: 'kimi',
+        subcommands: ['kimi'],
+    },
+    {
+        kind: 'grok',
+        displayName: 'Grok Build',
+        binary: 'grok',
+        subcommands: ['grok'],
+    },
+    {
+        kind: 'antigravity',
+        displayName: 'Antigravity',
+        binary: 'agy',
+        subcommands: ['agy', 'antigravity'],
+    },
+    {
+        kind: 'qwen',
+        displayName: 'Qwen Code',
+        binary: 'qwen',
+        subcommands: ['qwen'],
+    },
+    {
+        kind: 'auggie',
+        displayName: 'Auggie',
+        binary: 'auggie',
+        subcommands: ['auggie'],
+    },
+    {
+        kind: 'kilo',
+        displayName: 'Kilo',
+        binary: 'kilo',
+        subcommands: ['kilo'],
+    },
+    {
+        kind: 'copilot',
+        displayName: 'Copilot CLI',
+        binary: 'copilot',
+        subcommands: ['copilot'],
+    },
+    {
+        kind: 'kiro',
+        displayName: 'Kiro',
+        binary: 'kiro-cli',
+        subcommands: ['kiro-cli', 'kiro'],
+    },
+    {
+        kind: 'droid',
+        displayName: 'Factory Droid',
+        binary: 'droid',
+        subcommands: ['droid'],
+    },
+] as const satisfies readonly RemoteAgent[];
+
+/** Closed union of remote-controllable agent kinds, derived from the table above. */
+export type AgentKind = (typeof REMOTE_AGENT_TABLE)[number]['kind'];
+
+/** A registry row: the uniform RemoteAgent shape with `kind` narrowed to the closed union. */
+export type RegisteredRemoteAgent = RemoteAgent & { kind: AgentKind };
+
+export const REMOTE_AGENTS: readonly RegisteredRemoteAgent[] = REMOTE_AGENT_TABLE;
+
+export const findAgentBySubcommand = (cmd: string): RegisteredRemoteAgent | undefined =>
+    REMOTE_AGENTS.find((a) => a.subcommands.includes(cmd));
+
+export const matchAgentByPaneCommand = (base: string): RegisteredRemoteAgent | undefined => {
+    if (!base) return undefined;
+    return REMOTE_AGENTS.find((a) => a.binary === base || (a.paneMatchAliases ?? []).includes(base));
+};

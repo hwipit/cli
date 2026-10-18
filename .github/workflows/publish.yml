@@ -1,0 +1,63 @@
+name: Release
+
+# Manual only: nothing publishes from this fork on push. The job also refuses to
+# run outside the hwipit org, under a non-@hwip package name, or while a
+# dependency still points at a local checkout (file:).
+on:
+  workflow_dispatch:
+
+# Prevent two release runs racing each other on rapid pushes.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  release:
+    if: github.repository_owner == 'hwipit'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # semantic-release needs full git history to scan commits since
+          # the last release tag.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Refuse non-Hwip package name or local dependencies
+        run: |
+          name=$(node -p "require('./package.json').name")
+          case "$name" in
+            @hwip/*) echo "publishing $name" ;;
+            *) echo "::error::package name is '$name', expected @hwip/*"; exit 1 ;;
+          esac
+          if node -e "const d=require('./package.json').dependencies||{};process.exit(Object.values(d).some(v=>v.startsWith('file:'))?0:1)"; then
+            echo "::error::a dependency uses file:, publish @hwip/mcp-server and pin a version first"; exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+          # Cache node_modules across runs for faster CI.
+          cache: npm
+
+      # Reproducible install — fails if package-lock.json is out of date.
+      - run: npm ci
+
+      # Type-check + unit tests. Block the release on any failure so we
+      # never publish a broken build to npm.
+      - run: npm run build
+      - run: npm test
+
+      - name: Semantic Release
+        run: npx semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

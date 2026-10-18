@@ -1,0 +1,20 @@
+
+❯ summarize readme
+
+⏺ Reading 1 file, listing 1 directory… (ctrl+o to expand)
+  ⎿  $ ls -la /home/dev/demo
+
+────────────────────────────────────────
+ Bash command
+ Run shell command
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ rtk ls -la /home/dev/demo
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ This command requires approval
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don’t ask again for: rtk ls *
+   3. No
+
+ Esc to cancel · Tab to amend

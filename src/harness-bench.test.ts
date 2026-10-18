@@ -1,0 +1,199 @@
+/**
+ * Harness capability bench — does the shipped rule set actually classify the
+ * screens each supported agent really draws?
+ *
+ * Why this exists separately from agent-state.test.ts: that suite feeds the
+ * engine hand-written approximations, which proves the rule *shapes* work but
+ * can never catch a vendor changing its UI. Every fixture here is a verbatim
+ * `tmux capture-pane -p` of a live session, captured by running the agent —
+ * originally observed for this repo, never transcribed from another project
+ * (the boundary in agent-rules.default.ts:5-7 and SPEC-AGENT-AWARENESS.md:7).
+ *
+ * The bench reports a matrix of harness × state. A blank cell is NOT a failure:
+ * an agent whose screens were never captured ships with no rules ("Honest
+ * ignorance beats guessed state" — agent-rules.default.ts header). What the
+ * bench asserts is that the engine's answer matches what the bundle claims to
+ * know:
+ *
+ *   - harness WITH bundled rules → the real pane must classify correctly.
+ *     This is the regression gate: a vendor UI change turns a cell red.
+ *   - harness WITHOUT bundled rules → the real pane must come back `unknown`.
+ *     This is the honesty gate: it fails the moment someone half-fills a rule
+ *     set and starts guessing states the bundle cannot actually detect.
+ *
+ * A rule is therefore written only after a fixture proves it: add the capture,
+ * the case below, then the rule in agent-rules.default.ts. The same rules are
+ * copied, in the same order, into hwip server/src/agent-rules/manifest.json.
+ * Nothing mechanical ties the two repos together — that manifest cannot be read
+ * from this repo's CI, the same limit PUBLISHED_FLOOR lives with.
+ *
+ * ── Re-capturing a fixture ────────────────────────────────────────
+ * Fixtures go stale when a vendor redraws its UI. Replace one by observing the
+ * screen again — never by hand-editing the file, or the bench stops testing
+ * reality:
+ *
+ *     tmux new-session -d -s bench -x 110 -y 45 '<agent-binary>'
+ *     # drive the session to the screen you want, then:
+ *     tmux capture-pane -p -t bench -S -40 > src/fixtures/panes/<agent>-<state>.txt
+ *     tmux kill-session -t bench
+ *
+ * Then trim the capture to the screen itself. Two things must not survive into
+ * the repo: trailing blank rows tmux pads the pane height with, and absolute
+ * paths from the capturing machine (`/Users/...`) — local noise that has
+ * nothing to do with the state signal.
+ */
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { afterAll, describe, expect, it } from 'vitest';
+import { clearRegexCache, evaluateState, type AgentState } from './agent-state.js';
+import { DEFAULT_MANIFEST } from './agent-rules.default.js';
+import { compareManifestVersions } from './agent-rules-fetch.js';
+import { REMOTE_AGENTS, type AgentKind } from './remote-agents.js';
+
+const PANES_DIR = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'panes');
+
+interface BenchCase {
+    agent: AgentKind;
+    /** What a user looking at this pane would say the agent is doing. */
+    expected: AgentState;
+    fixture: string;
+    /** The screen this capture came from, for the matrix and for the next reader. */
+    screen: string;
+}
+
+/**
+ * Captured 2026-08-11 — Claude Code v2.1.227, Gemini CLI v0.46.0, both in a
+ * 110x45 tmux pane, using the recipe above. pi v0.85.1 captured 2026-09-11 the
+ * same way, run as `pi -ne -e <ask_user_question extension>` so the capture
+ * could not push to a phone; the blocked screen is that extension's picker.
+ * Codex CLI v0.160.1 captured 2026-10-08 as `codex --no-daemon` in a scratch
+ * directory on a private tmux server: its workspace was out of credits, so no
+ * turn ever ran — only the hooks and usage-limit dialogs were drawn. Captured
+ * again 2026-10-15, same version and way, in a fresh git directory: the update
+ * and folder-trust dialogs at startup, the prompt at rest, and a turn up to the
+ * point the server refused it for credits — the client draws its working line
+ * before that answer, and the prompt at rest again after the refusal. No tool
+ * ever ran, so the tool-approval dialog is still uncaptured.
+ */
+const CASES: readonly BenchCase[] = [
+    { agent: 'claude', expected: 'working', fixture: 'claude-working.txt', screen: 'spinner with elapsed time + token counter' },
+    { agent: 'claude', expected: 'blocked', fixture: 'claude-blocked-askuserquestion.txt', screen: 'AskUserQuestion picker' },
+    { agent: 'claude', expected: 'blocked', fixture: 'claude-blocked-trust-dialog.txt', screen: 'folder trust dialog' },
+    { agent: 'claude', expected: 'idle', fixture: 'claude-idle.txt', screen: 'prompt at rest' },
+    { agent: 'codex', expected: 'blocked', fixture: 'codex-blocked-hooks-review.txt', screen: 'hooks review dialog at startup' },
+    { agent: 'codex', expected: 'blocked', fixture: 'codex-blocked-usage-limit.txt', screen: 'usage limit dialog' },
+    { agent: 'codex', expected: 'blocked', fixture: 'codex-blocked-update.txt', screen: 'update dialog at startup' },
+    { agent: 'codex', expected: 'blocked', fixture: 'codex-blocked-trust-dialog.txt', screen: 'folder trust dialog' },
+    { agent: 'codex', expected: 'working', fixture: 'codex-working.txt', screen: 'Working line with interrupt hint, composer and footer still drawn' },
+    { agent: 'codex', expected: 'idle', fixture: 'codex-idle.txt', screen: 'fresh session at rest' },
+    { agent: 'codex', expected: 'idle', fixture: 'codex-idle-after-failed-turn.txt', screen: 'at rest after a refused turn' },
+    { agent: 'gemini', expected: 'working', fixture: 'gemini-working.txt', screen: 'Thinking… spinner with cancel hint' },
+    { agent: 'gemini', expected: 'blocked', fixture: 'gemini-blocked-trust-dialog.txt', screen: 'folder trust dialog' },
+    { agent: 'gemini', expected: 'idle', fixture: 'gemini-idle.txt', screen: 'input box at rest' },
+    { agent: 'pi', expected: 'working', fixture: 'pi-working.txt', screen: 'Working spinner in the editor border' },
+    { agent: 'pi', expected: 'blocked', fixture: 'pi-blocked.txt', screen: 'ask_user_question picker' },
+    { agent: 'pi', expected: 'idle', fixture: 'pi-idle.txt', screen: 'fresh session at rest' },
+];
+
+const readPane = (fixture: string): string => readFileSync(join(PANES_DIR, fixture), 'utf-8');
+
+const hasBundledRules = (agent: AgentKind): boolean => (DEFAULT_MANIFEST.agents[agent] ?? []).length > 0;
+
+const classify = (c: BenchCase) => {
+    clearRegexCache();
+    return evaluateState(readPane(c.fixture), c.agent, DEFAULT_MANIFEST);
+};
+
+describe('harness bench — bundled rules vs real panes', () => {
+    for (const c of CASES) {
+        const covered = hasBundledRules(c.agent);
+        const label = covered
+            ? `${c.agent}: ${c.screen} → ${c.expected}`
+            : `${c.agent}: ${c.screen} → unknown (no bundled rules yet)`;
+
+        it(label, () => {
+            const result = classify(c);
+            if (covered) {
+                expect(result.state).toBe(c.expected);
+                // A correct answer from no rule at all would mean the engine
+                // guessed; every covered cell must name the rule that decided it.
+                expect(result.ruleId).toBeTruthy();
+            } else {
+                expect(result.state).toBe('unknown');
+            }
+        });
+    }
+
+    // The matrix is a REPORT, not a gate — the per-case tests above are what
+    // fail. Printing it from afterAll keeps that honest: a test whose assertion
+    // cannot fail would be a report wearing a test's clothes.
+    //
+    // Rows come from the registry rather than a hand-kept list of covered
+    // agents, so an agent added to REMOTE_AGENTS shows up here as an empty row
+    // instead of silently not appearing at all. Cursor did the latter for
+    // months, back when this walked a separate map someone had to remember.
+    afterAll(() => {
+        const states: AgentState[] = ['working', 'blocked', 'idle'];
+        const rows = REMOTE_AGENTS.map(({ kind }) => {
+            const captured = CASES.some((c) => c.agent === kind);
+            if (!captured) return `  ${kind.padEnd(8)} no fixtures captured yet`;
+            const cells = states.map((state) => {
+                const c = CASES.find((x) => x.agent === kind && x.expected === state);
+                if (!c) return `${state}: no fixture`;
+                if (!hasBundledRules(kind)) return `${state}: uncovered`;
+                const got = classify(c);
+                return `${state}: ${got.state === state ? got.ruleId : `MISMATCH(${got.state})`}`;
+            });
+            return `  ${kind.padEnd(8)} ${cells.join(' | ')}`;
+        });
+        process.stdout.write(['harness bench matrix:', ...rows, ''].join('\n'));
+    });
+});
+
+/**
+ * The bundle must never claim a version the published manifest hasn't reached.
+ *
+ * `loadManifestFromCache` and the fetch path both gate on
+ * `compareManifestVersions(remote, DEFAULT_MANIFEST.version) >= 0`
+ * (agent-rules-fetch.ts:148,217). Bumping the bundle past what
+ * api.hwip.app serves makes every fetched manifest `stale-ignored` — and with it
+ * the `disabledRuleIds` kill-switch, which is the one lever that turns off a
+ * bad rule without a release. That is the failure the 0.5.10 rollback taught
+ * (SPEC-AGENT-AWARENESS.md §S7).
+ *
+ * PUBLISHED_FLOOR mirrors the server's published agent-rules manifest. It is
+ * a constant rather than a live read for hermeticity, NOT because the value is
+ * out of reach: agent-rules-fetch.ts pulls that same manifest from the public
+ * `api.hwip.app/v1/agent-detection/manifest`, so a unit test could too — and
+ * then would fail whenever the network did, which is not what this test is for.
+ *
+ * The cost is a hand-maintained mirror with no drift gate, unlike the
+ * plugin→cli artifacts that `sync-from-plugin.mjs --check` keeps honest. If
+ * this pair drifts often enough to hurt, the fix is a scheduled job that reads
+ * the live endpoint and fails only itself — not making this test depend on a
+ * network. Raising the floor is a deliberate act: merge the manifest into hwip
+ * `main` first, then move this line (and DEFAULT_MANIFEST.version with it — a
+ * release that adds rules bumps both to the same string). The floor is the
+ * version on hwip `main`, not the one api.hwip.app serves: until the server is
+ * deployed, a fetched manifest older than the bundle is `stale-ignored` and
+ * `disabledRuleIds` cannot reach it, so deploy the server before publishing
+ * the cli. A floor that lags the merged version is harmless — it only ever
+ * blocks a bundle bump, never a fetch.
+ */
+const PUBLISHED_FLOOR = '2026.10.15.1';
+
+describe('bundled manifest vs published manifest', () => {
+    it('does not outrank what the endpoint serves', () => {
+        expect(compareManifestVersions(DEFAULT_MANIFEST.version, PUBLISHED_FLOOR)).toBeLessThanOrEqual(0);
+    });
+
+    it('keeps the kill-switch reachable for every bundled rule', () => {
+        // disabledRuleIds targets ids; a duplicate id would make the switch
+        // ambiguous, and an empty one makes it unusable.
+        const ids = Object.values(DEFAULT_MANIFEST.agents).flatMap((rules) => rules ?? []).map((r) => r.id);
+        expect(ids.length).toBeGreaterThan(0);
+        expect(ids.every((id) => id.length > 0)).toBe(true);
+        expect(new Set(ids).size).toBe(ids.length);
+    });
+});

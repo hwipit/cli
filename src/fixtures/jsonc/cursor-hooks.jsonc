@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "hooks": {
+    // format after every edit
+    "afterFileEdit": [{ "command": "./fmt.sh" }],
+    "stop": [
+      { "command": "./my-stop.sh" }, // mine
+    ],
+  },
+}

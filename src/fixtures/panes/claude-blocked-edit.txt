@@ -1,0 +1,21 @@
+⏺ Write(notes.txt)
+  ⎿  Wrote 1 line to notes.txt
+      1 alpha
+
+⏺ Update(notes.txt)
+
+────────────────────────────────────────
+ Edit file
+ notes.txt
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ 1 -alpha
+ 1   No newline at end of file
+ 2 +beta
+ 3   No newline at end of file
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to make this edit to notes.txt?
+ ❯ 1. Yes
+   2. Yes, and allow Claude to edit files in its ~/.claude folder for this session
+   3. No
+
+ Esc to cancel · Tab to amend

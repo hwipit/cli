@@ -1,0 +1,86 @@
+{
+  "name": "@hwip/cli",
+  "version": "0.0.0-semantic-release",
+  "description": "Hwip CLI + push notification SDK for AI agents",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "bin": {
+    "hwip": "./dist/cli.js"
+  },
+  "engines": {
+    "node": "^20.17.0 || ^22.13.0 || >=23.5.0"
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.map",
+    "!dist/**/*.tsbuildinfo",
+    "!dist/test-setup.*",
+    "!dist/test-state-dir.*",
+    "NOTICE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "sync:plugin": "node scripts/sync-from-plugin.mjs",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.1",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.8.0",
+    "vitest": "^4.1.11"
+  },
+  "release": {
+    "branches": [
+      "main"
+    ],
+    "plugins": [
+      "@semantic-release/commit-analyzer",
+      "@semantic-release/release-notes-generator",
+      "@semantic-release/npm",
+      "@semantic-release/github"
+    ]
+  },
+  "author": "Hwip <dev@hwip.app>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hwipit/cli"
+  },
+  "homepage": "https://github.com/hwipit/cli",
+  "bugs": {
+    "url": "https://github.com/hwipit/cli/issues"
+  },
+  "keywords": [
+    "hwip",
+    "push",
+    "notification",
+    "cli",
+    "webhook",
+    "ai-agent",
+    "mcp",
+    "claude",
+    "devtools"
+  ],
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "dependencies": {
+    "@hwip/mcp-server": "^0.1.0",
+    "@inquirer/prompts": "^8.4.3",
+    "https-proxy-agent": "^7.0.6",
+    "jsonc-parser": "^3.3.1",
+    "re2js": "^2.8.6",
+    "undici": "^6.29.0",
+    "ws": "^8.21.0"
+  }
+}

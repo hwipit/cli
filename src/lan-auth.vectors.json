@@ -1,0 +1,70 @@
+{
+  "info": "hwip-lan-v1",
+  "hkdf": "HKDF-SHA256, salt empty, 32 bytes; info hwip-lan-v1 (mac) / hwip-lan-v1-meta (meta)",
+  "mac": "HMAC-SHA256 over method|path|senderDeviceId|transferId|timestamp|nonce|sha256(body), hex",
+  "meta": "base64(iv[12] || AES-256-GCM(metaKey, iv, compact JSON) || tag[16])",
+  "receipt": "HMAC-SHA256(macKey, \"hwip-lan-receipt|\" + mac hex), hex — the receiver's answer header on 200/201",
+  "generatedBy": "python hashlib/hmac + cryptography AESGCM (independent of every consumer); regenerated for the hwip rename 2026-09-30",
+  "cases": [
+    {
+      "name": "zero secret, ping, empty body",
+      "sharedSecretHex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "macKeyHex": "34ef286574644a3a3cb2a658cb376009b325e80a87ce2b2b7623fd36271bcafb",
+      "metaKeyHex": "c35fe836545495bf510828b4cb7798ed18207dbc83b1e539e3759df5cfefc384",
+      "method": "GET",
+      "path": "/hwip/lan/v1/ping",
+      "bodyHex": "",
+      "bodySha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "fields": {
+        "senderDeviceId": "dev_listener_0123abcd",
+        "transferId": "ping",
+        "timestamp": 1800000000000,
+        "nonce": "00000000000000000000000000000000"
+      },
+      "canonical": "GET|/hwip/lan/v1/ping|dev_listener_0123abcd|ping|1800000000000|00000000000000000000000000000000|e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "macHex": "e2312bc5ddcc64578f6bd331921c65c68b5f88b6ba9368feca5e748c25a56057",
+      "receiptHex": "581b220ad871c5651e24bb6b07d59c58803b65dd649ddfc37b8b838160a8d348"
+    },
+    {
+      "name": "sequential secret, upload, small body, sealed meta",
+      "sharedSecretHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "macKeyHex": "d1434d31c2c2d676b51cc3e738bdde4d9f2b079e4599df6e571e7bea67f385b5",
+      "metaKeyHex": "c5f70d0d42e49bbe2faca1ab5210406210cc61739b74fc831e09aad30927a1b4",
+      "method": "POST",
+      "path": "/hwip/lan/v1/upload",
+      "bodyHex": "68656c6c6f206c6f63616c207472616e73666572",
+      "bodySha256": "587985cf16d087a41a0ae357bfd133b02196f16e2344dfa85bfd767bfe3a1a5d",
+      "fields": {
+        "senderDeviceId": "dev_mcp_9f8e7d6c",
+        "transferId": "tr_01J9ZK3Q5W8X",
+        "timestamp": 1800000123456,
+        "nonce": "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+      },
+      "canonical": "POST|/hwip/lan/v1/upload|dev_mcp_9f8e7d6c|tr_01J9ZK3Q5W8X|1800000123456|0f1e2d3c4b5a69788796a5b4c3d2e1f0|587985cf16d087a41a0ae357bfd133b02196f16e2344dfa85bfd767bfe3a1a5d",
+      "macHex": "66d14b59efe513ec795633f32dfad29a505b19ad771f2633b5d0fa44a2bdde51",
+      "metaJson": "{\"fileName\":\"shot.png\",\"fileType\":\"image/png\",\"fileSize\":20,\"iv\":\"AAAAAAAAAAAAAAAA\",\"deviceKeyMap\":{\"dev_listener_0123abcd\":\"{\\\"encryptedKey\\\":\\\"AA==\\\",\\\"keyIv\\\":\\\"AA==\\\"}\"},\"transferId\":\"tr_01J9ZK3Q5W8X\"}",
+      "metaIvHex": "000102030405060708090a0b",
+      "metaSealedBase64": "AAECAwQFBgcICQoLT/41dBFrGQWJBEUL96DiMosIb6hw/aMxVhagD6d4umWpOcugDEs4oF9ELrboNKpGJNGut1FBIglQf+1f9f0ryt9Fcc0P16jwsv7hOnoptWlWOieESdu72xh97A8NbGtxzpPeCdJoUrlXbYDBsV+cjyBsU6z5POLos/rCqWAZCF3W2MmUl8soNF40h67txocMyxEoHmvyWwLNMIiKUTvVuMYMnTO3kCqB68ooZZPBWgLJ9EbEP/g+S5kTk62tEJO/UGIUc1S2O2rvnTxekonMrA0f0R2UWVEFMB+tXb0=",
+      "receiptHex": "f4527cbed83642e32c6ec47cd352dd2523788775b094f9ced33f2e1048d4a490"
+    },
+    {
+      "name": "all-ff secret, upload, binary body",
+      "sharedSecretHex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "macKeyHex": "710cb7e31e09ec8b252c0bc7d1a34bda94167971780144e6745acc1270c74e35",
+      "metaKeyHex": "65a97e9e0be59ee86004009591f723097b74de3c8538cc04ce06758accb92118",
+      "method": "POST",
+      "path": "/hwip/lan/v1/upload",
+      "bodyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+      "bodySha256": "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880",
+      "fields": {
+        "senderDeviceId": "dev_android_abc.def:1",
+        "transferId": "a-b_c",
+        "timestamp": 1,
+        "nonce": "ffffffffffffffffffffffffffffffff"
+      },
+      "canonical": "POST|/hwip/lan/v1/upload|dev_android_abc.def:1|a-b_c|1|ffffffffffffffffffffffffffffffff|40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880",
+      "macHex": "48fecd5d2832c097e2e5d73d648aad08003cf5f835d2689701cc13f851b2c7ba",
+      "receiptHex": "60d87e546365e109e81c46ae859656435adf2073244988c84441370823a591ab"
+    }
+  ]
+}

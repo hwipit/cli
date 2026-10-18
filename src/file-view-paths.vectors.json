@@ -1,0 +1,67 @@
+[
+  {
+    "path": "",
+    "ok": false,
+    "why": "empty"
+  },
+  {
+    "path": "a\u0000b",
+    "ok": false,
+    "why": "NUL"
+  },
+  {
+    "path": "/abs",
+    "ok": false,
+    "why": "absolute"
+  },
+  {
+    "path": "a/../b",
+    "ok": false,
+    "why": "parent segment"
+  },
+  {
+    "path": "./a",
+    "ok": false,
+    "why": "dot segment"
+  },
+  {
+    "path": ".git/config",
+    "ok": false,
+    "why": ".git segment"
+  },
+  {
+    "path": "sub/.GIT/HEAD",
+    "ok": false,
+    "why": ".git segment, any depth, any case"
+  },
+  {
+    "path": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "ok": false,
+    "why": "over 1,024 bytes"
+  },
+  {
+    "path": "a\u001fb",
+    "ok": false,
+    "why": "control character"
+  },
+  {
+    "path": "-a",
+    "ok": true,
+    "why": "leading dash is only ever read after --"
+  },
+  {
+    "path": "\ud55c\uae00/\ud30c\uc77c \uc774\ub984.md",
+    "ok": true,
+    "why": "unicode"
+  },
+  {
+    "path": "a//b",
+    "ok": false,
+    "why": "empty segment"
+  },
+  {
+    "path": "a/b/",
+    "ok": false,
+    "why": "trailing slash is an empty segment"
+  }
+]

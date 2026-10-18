@@ -1,0 +1,400 @@
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+    autoPushMode, decidePush, GATE_DEFAULTS, isMuted, isRemoteActive, normalizeMarker,
+    normalizePushMode, projectHash, PUSHMODE_DEFAULT, PUSHMODE_DEFAULT_FLAG, readPushMode,
+    clearRemoteActive, REMOTE_TTL_SEC, remoteStatePath, stateDir, touchRemoteActive,
+} from './gate.js';
+
+// ── Cross-repo parity vectors ────────────────────────────────────
+//
+// src/fixtures/gate-vectors.json is vendored from hwipit/plugin (the
+// canonical copy lives at plugin/tests/fixtures/gate-vectors.json and is
+// also run against the bash gate in plugin/hooks/gate.sh). Any semantic
+// divergence between the two implementations fails one side's CI.
+
+interface Vector {
+    name: string;
+    input: {
+        toolCount: number;
+        nonReadonlyCount: number;
+        alreadyAsked: boolean;
+        marker: string;
+        pushMode: string;
+        away?: boolean;
+    };
+    expect: { push: boolean; priority: 'high' | 'normal' };
+}
+
+const VECTORS: Vector[] = JSON.parse(
+    readFileSync(join(__dirname, 'fixtures', 'gate-vectors.json'), 'utf-8'),
+);
+
+describe('gate.ts: decidePush parity with plugin/hooks/gate.sh', () => {
+    it('has a non-trivial vector set', () => {
+        expect(VECTORS.length).toBeGreaterThanOrEqual(20);
+    });
+
+    for (const v of VECTORS) {
+        it(v.name, () => {
+            const verdict = decidePush({
+                toolCount: v.input.toolCount,
+                nonReadonlyCount: v.input.nonReadonlyCount,
+                alreadyAsked: v.input.alreadyAsked,
+                marker: normalizeMarker(v.input.marker),
+                pushMode: normalizePushMode(v.input.pushMode),
+                away: v.input.away ?? false,
+            });
+            expect(verdict).toEqual(v.expect);
+        });
+    }
+});
+
+describe('gate.ts: normalizers', () => {
+    it('normalizeMarker maps unknown/undefined to none', () => {
+        expect(normalizeMarker(undefined)).toBe('none');
+        expect(normalizeMarker('urgent')).toBe('none');
+        expect(normalizeMarker('high')).toBe('high');
+    });
+
+    it('normalizePushMode maps unknown/undefined to normal', () => {
+        expect(normalizePushMode(undefined)).toBe('normal');
+        expect(normalizePushMode('banana')).toBe('normal');
+        expect(normalizePushMode('quiet')).toBe('quiet');
+        expect(normalizePushMode('loud')).toBe('loud');
+    });
+
+    it('GATE_DEFAULTS assume real work (push in normal mode)', () => {
+        expect(decidePush({ ...GATE_DEFAULTS, marker: 'none', pushMode: 'normal' }))
+            .toEqual({ push: true, priority: 'normal' });
+    });
+
+    // Why --pushmode-default exists: a hook that supplies no turn facts also
+    // supplies no marker, and quiet only lets a `high` marker (or an away
+    // user) through. So for those agents quiet is silence while they're present.
+    it('GATE_DEFAULTS can never push in quiet mode while the user is present', () => {
+        expect(decidePush({ ...GATE_DEFAULTS, marker: 'none', pushMode: 'quiet', away: false }))
+            .toEqual({ push: false, priority: 'normal' });
+    });
+});
+
+// ── Per-project state files (hash parity with the bash hooks) ────
+
+let TMP: string;
+let savedXdgStateHome: string | undefined;
+
+beforeEach(() => {
+    TMP = mkdtempSync(join(tmpdir(), 'hwip-gate-test-'));
+    // Isolate state reads/writes from the machine's real ~/.local/state.
+    savedXdgStateHome = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = join(TMP, 'state');
+    mkdirSync(stateDir(), { recursive: true });
+});
+
+afterEach(() => {
+    const hash = projectHash(TMP);
+    if (savedXdgStateHome === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = savedXdgStateHome;
+    rmSync(TMP, { recursive: true, force: true });
+    if (hash) {
+        rmSync(`/tmp/hwip-muted-${hash}`, { force: true });
+        rmSync(`/tmp/hwip-pushmode-${hash}`, { force: true });
+    }
+});
+
+describe('gate.ts: project state helpers', () => {
+    it('projectHash matches the bash hooks\' cksum keying', () => {
+        const expected = execFileSync('cksum', { input: TMP, encoding: 'utf-8' }).split(' ')[0];
+        expect(projectHash(TMP)).toBe(expected);
+    });
+
+    it('isMuted reflects <stateDir>/muted-<hash>', () => {
+        const dir = join(TMP, 'state', 'hwip');
+        expect(isMuted(TMP)).toBe(false);
+        writeFileSync(join(dir, `muted-${projectHash(TMP)}`), '');
+        expect(isMuted(TMP)).toBe(true);
+    });
+
+    it('isMuted honors a user-owned legacy /tmp mute file', () => {
+        expect(isMuted(TMP)).toBe(false);
+        writeFileSync(`/tmp/hwip-muted-${projectHash(TMP)}`, '');
+        expect(isMuted(TMP)).toBe(true);
+    });
+
+    // ── The default: no dial file ────────────────────────────────
+    //
+    // This is the twin of plugin/hooks/gate.sh's missing-5th-argument default
+    // (tested in plugin/tests/test-gate-vectors.sh). The shared vectors never
+    // reach it — every vector passes pushMode explicitly — so each side has to
+    // pin it locally or the two can drift without either CI noticing.
+
+    it('PUSHMODE_DEFAULT is quiet', () => {
+        expect(PUSHMODE_DEFAULT).toBe('quiet');
+    });
+
+    it('readPushMode falls back to quiet when no dial file exists', () => {
+        expect(readPushMode(TMP)).toBe('quiet');
+    });
+
+    it('readPushMode takes a caller-supplied fallback for the no-dial case', () => {
+        // What --pushmode-default gives the hook-driven agents whose hooks
+        // cannot emit a marker.
+        expect(readPushMode(TMP, 'normal')).toBe('normal');
+    });
+
+    it('a dial file always outranks the caller-supplied fallback', () => {
+        const file = join(TMP, 'state', 'hwip', `pushmode-${projectHash(TMP)}`);
+        writeFileSync(file, 'quiet');
+        expect(readPushMode(TMP, 'loud')).toBe('quiet');
+    });
+
+    // The hash used to come from a `cksum` spawn, which made "no cksum on
+    // PATH" an unhashable project. It is computed in process now.
+    it('hashes the project without cksum on PATH', () => {
+        const savedPath = process.env.PATH;
+        process.env.PATH = '';
+        try {
+            expect(projectHash(TMP)).toMatch(/^\d+$/);
+        } finally {
+            process.env.PATH = savedPath;
+        }
+    });
+
+    it('an empty dial file reads as normal, not as the no-dial default', () => {
+        // A truncated or failed write is a corrupted dial, not an absent one.
+        // Resolving it to quiet would hide the breakage as silence. The bash
+        // twin substitutes `normal` in hwip-stop.sh for the same reason.
+        const file = join(TMP, 'state', 'hwip', `pushmode-${projectHash(TMP)}`);
+        writeFileSync(file, '   \n');
+        expect(readPushMode(TMP, 'loud')).toBe('normal');
+    });
+
+    it('readPushMode reads the dial file, tolerating whitespace', () => {
+        const file = join(TMP, 'state', 'hwip', `pushmode-${projectHash(TMP)}`);
+        writeFileSync(file, 'quiet\n');
+        expect(readPushMode(TMP)).toBe('quiet');
+        writeFileSync(file, ' loud ');
+        expect(readPushMode(TMP)).toBe('loud');
+        writeFileSync(file, 'banana');
+        expect(readPushMode(TMP)).toBe('normal');
+    });
+
+    // `loud`, not `quiet`: quiet is now what a missing dial resolves to, so a
+    // quiet expectation here would pass even if the file were never read.
+    it('readPushMode falls back to a user-owned legacy /tmp dial file', () => {
+        writeFileSync(`/tmp/hwip-pushmode-${projectHash(TMP)}`, 'loud\n');
+        expect(readPushMode(TMP)).toBe('loud');
+    });
+
+    it('readPushMode falls back to the global pushmode-default', () => {
+        const dir = join(TMP, 'state', 'hwip');
+        writeFileSync(join(dir, 'pushmode-default'), 'loud');
+        expect(readPushMode(TMP)).toBe('loud');
+        // A per-project dial always outranks the machine-wide default.
+        writeFileSync(join(dir, `pushmode-${projectHash(TMP)}`), 'normal');
+        expect(readPushMode(TMP)).toBe('normal');
+    });
+
+    // ── --pushmode-default (the flag the installed hooks carry) ──
+
+    // Only what autoPushMode adds on top of readPushMode is asserted here —
+    // the pass-through cases are already covered above, and duplicating them
+    // would light up four failures for one cause.
+    it('autoPushMode ignores a valueless or garbled flag', () => {
+        // `--pushmode-default` with nothing after it parses to boolean true.
+        expect(autoPushMode(TMP, true)).toBe('quiet');
+        expect(autoPushMode(TMP, 'banana')).toBe('normal');
+    });
+
+    it("autoPushMode lets the user's dial beat the flag", () => {
+        // The whole priority rule: the flag only names a default. A dial is an
+        // expression of intent and always wins, or /hwip-mode quiet would be a lie
+        // for every hook-driven agent.
+        writeFileSync(join(TMP, 'state', 'hwip', `pushmode-${projectHash(TMP)}`), 'quiet');
+        expect(autoPushMode(TMP, 'loud')).toBe('quiet');
+    });
+
+    it('isMuted has no global default — mute stays project-only', () => {
+        writeFileSync(join(TMP, 'state', 'hwip', 'muted-default'), '');
+        expect(isMuted(TMP)).toBe(false);
+    });
+});
+
+// ── Sticky REMOTE state (twin of gate.sh hwip_remote_active/_touch) ──
+
+describe('gate.ts: sticky REMOTE state', () => {
+    const NOW = 1_800_000_000_000; // fixed clock; the epoch second is 1800000000
+    const at = (ms: number) => () => ms;
+
+    it('keys the state file exactly as the bash hook does', () => {
+        touchRemoteActive(TMP, at(NOW));
+        expect(remoteStatePath(projectHash(TMP)!))
+            .toBe(join(TMP, 'state', 'hwip', `remote-active-${projectHash(TMP)}`));
+        expect(readFileSync(remoteStatePath(projectHash(TMP)!), 'utf-8').trim())
+            .toBe(String(Math.floor(NOW / 1000)));
+    });
+
+    it('is inactive with no state file, and does not create one', () => {
+        expect(isRemoteActive(TMP, at(NOW))).toBe(false);
+        expect(existsSync(remoteStatePath(projectHash(TMP)!))).toBe(false);
+    });
+
+    it('stays active right up to the TTL boundary', () => {
+        touchRemoteActive(TMP, at(NOW));
+        const lastFreshMs = NOW + REMOTE_TTL_SEC * 1000;
+        expect(isRemoteActive(TMP, at(lastFreshMs))).toBe(true);
+    });
+
+    // The sweep is the only thing that ends a REMOTE session nobody exited:
+    // there is no SessionEnd hook, so a crashed session's state would
+    // otherwise make every later session in this project ask an absent phone.
+    it('sweeps state one second past the TTL', () => {
+        touchRemoteActive(TMP, at(NOW));
+        const file = remoteStatePath(projectHash(TMP)!);
+        expect(isRemoteActive(TMP, at(NOW + (REMOTE_TTL_SEC + 1) * 1000))).toBe(false);
+        expect(existsSync(file)).toBe(false);
+    });
+
+    // C114 — the same values as plugin#14 (hwip_age_sec, tests/test-hook-cli-and-state.sh P28): a plain number of at most 12 digits,
+    // a leading 0 is decimal, a time ahead of the clock is read as now (and written back as now, so the TTL counts from here).
+    describe('a time the file holds (the vectors of plugin hwip_age_sec)', () => {
+        const file = () => remoteStatePath(projectHash(TMP)!);
+        const hold = (content: string) => {
+            mkdirSync(join(TMP, 'state', 'hwip'), { recursive: true });
+            writeFileSync(file(), `${content}\n`);
+        };
+        const NOW_SEC = Math.floor(NOW / 1000);
+
+        it('reads a leading 0 as decimal', () => {
+            hold(`0${NOW_SEC}`);
+            expect(isRemoteActive(TMP, at(NOW))).toBe(true);
+        });
+
+        it.each([
+            ['more digits than a time (20 zeros and an 8)', '00000000000000000008'],
+            ['23 digits', '99999999999999999999999'],
+            ['13 digits (year 33658 is not a time)', '9999999999999'],
+        ])('sweeps %s', (_name, content) => {
+            hold(content);
+            expect(isRemoteActive(TMP, at(NOW))).toBe(false);
+            expect(existsSync(file())).toBe(false);
+        });
+
+        // Only the length rule can sweep this one: read as a number it is now.
+        it('sweeps 13 digits that read as now (000 and the time)', () => {
+            hold(`000${NOW_SEC}`);
+            expect(isRemoteActive(TMP, at(NOW))).toBe(false);
+            expect(existsSync(file())).toBe(false);
+        });
+
+        it('reads the first line only, and not the spaces around it', () => {
+            hold(`  ${NOW_SEC}\t`);
+            expect(isRemoteActive(TMP, at(NOW))).toBe(true);
+            hold(`${NOW_SEC}\nnot a time`);
+            expect(isRemoteActive(TMP, at(NOW))).toBe(true);
+        });
+
+        it.each([['a carriage return', `${NOW_SEC}\r`], ['a byte order mark', `\uFEFF${NOW_SEC}`]])('sweeps a time that has %s in it, as bash does', (_name, content) => {
+            hold(content);
+            expect(isRemoteActive(TMP, at(NOW))).toBe(false);
+            expect(existsSync(file())).toBe(false);
+        });
+
+        // Not writable: nothing would ever end a future value, so it is not REMOTE (and the file goes if it can).
+        // (root writes through a read-only mode, so there is nothing to test as root.)
+        it.skipIf(process.getuid?.() === 0)('is not REMOTE when a time ahead of the clock cannot be rewritten', () => {
+            hold(String(NOW_SEC + 999_999));
+            const dir = join(TMP, 'state', 'hwip');
+            chmodSync(file(), 0o444);
+            chmodSync(dir, 0o555);
+            try {
+                expect(isRemoteActive(TMP, at(NOW))).toBe(false);
+                // Not even a sweep could remove it, and it stays unreadable as REMOTE on every later call too.
+                expect(isRemoteActive(TMP, at(NOW))).toBe(false);
+            } finally {
+                chmodSync(dir, 0o755);
+            }
+        });
+
+        it('sweeps a time older than the TTL', () => {
+            hold(String(NOW_SEC - 20_000));
+            expect(isRemoteActive(TMP, at(NOW))).toBe(false);
+            expect(existsSync(file())).toBe(false);
+        });
+
+        it.each([['999999 seconds ahead', String(NOW_SEC + 999_999)], ['a 12-digit time far ahead', '999999999999']])(
+            'reads %s as now: live, and the stored time is pulled back to now',
+            (_name, content) => {
+                hold(content);
+
+                expect(isRemoteActive(TMP, at(NOW))).toBe(true);
+
+                expect(readFileSync(file(), 'utf-8').trim()).toBe(String(NOW_SEC));
+                // From then on it ages like any other: it ends at the TTL, not when the clock catches up with the file.
+                expect(isRemoteActive(TMP, at(NOW + (REMOTE_TTL_SEC + 1) * 1000))).toBe(false);
+            },
+        );
+
+        it('leaves a time that is not ahead as it is', () => {
+            hold(String(NOW_SEC - 100));
+            expect(isRemoteActive(TMP, at(NOW))).toBe(true);
+            expect(readFileSync(file(), 'utf-8').trim()).toBe(String(NOW_SEC - 100));
+        });
+    });
+
+    it('sweeps state it cannot parse', () => {
+        const file = remoteStatePath(projectHash(TMP)!);
+        writeFileSync(file, 'not-a-timestamp\n');
+        expect(isRemoteActive(TMP, at(NOW))).toBe(false);
+        expect(existsSync(file)).toBe(false);
+    });
+
+    // Parity regression against the bash twin's `case "$ts" in *[!0-9]*)`,
+    // which rejects every one of these. Number() is looser: it reads '1e10' as
+    // ten billion, so a file bash sweeps would have kept REMOTE alive here
+    // until the year 2286.
+    it.each(['1e10', '0x10', '+5', '1_000'])('sweeps non-digit state %j', (raw) => {
+        const file = remoteStatePath(projectHash(TMP)!);
+        writeFileSync(file, `${raw}\n`);
+        expect(isRemoteActive(TMP, at(NOW))).toBe(false);
+        expect(existsSync(file)).toBe(false);
+    });
+
+    it('refreshing pushes the expiry back', () => {
+        touchRemoteActive(TMP, at(NOW));
+        const later = NOW + REMOTE_TTL_SEC * 1000;
+        touchRemoteActive(TMP, at(later));
+        expect(isRemoteActive(TMP, at(later + REMOTE_TTL_SEC * 1000))).toBe(true);
+    });
+
+    it('clearing ends REMOTE, and clearing nothing is not an error', () => {
+        touchRemoteActive(TMP, at(NOW));
+        clearRemoteActive(TMP);
+        expect(isRemoteActive(TMP, at(NOW))).toBe(false);
+        expect(existsSync(remoteStatePath(projectHash(TMP)!))).toBe(false);
+        expect(() => clearRemoteActive(TMP)).not.toThrow();
+    });
+});
+
+describe('posixCksum', () => {
+    // Every state file the plugin and older CLIs wrote is named by `cksum`;
+    // a hash that drifts from it silently orphans mute, push-mode and REMOTE state.
+    it.each([
+        ['', '4294967295'],
+        ['/Users/me/workspace/project', '2176855199'],
+        ['/tmp/한글 dir', '706219155'],
+    ])('matches cksum for %j', (dir, expected) => {
+        expect(projectHash(dir)).toBe(expected);
+    });
+
+    it.each(['/', '/home/user/project', 'a'.repeat(300), '/path with spaces/and\ttab', '/émoji/🚀'])(
+        'matches the real cksum binary for %j',
+        (dir) => {
+            const real = execFileSync('cksum', { input: dir, encoding: 'utf-8' }).split(' ')[0];
+            expect(projectHash(dir)).toBe(real);
+        },
+    );
+});

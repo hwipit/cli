@@ -4,7 +4,7 @@ import { mkdtempSync, realpathSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { checkoutOf } from './config.js';
-import { detectProjectDir, detectProjectName, handOffExec, herdrSessionArgs, inPaneNote, planShellSession, tmuxMissingMessage, readShellSessionState, sanitizeLabel, shellTargets, sessionSidecarArgs, splitAgentOptions, targetForAgent, tmuxSessionName } from './wrapper.js';
+import { detectProjectDir, detectProjectName, handOffExec, herdrEnvArgs, herdrSessionArgs, installedTmuxVersion, inPaneNote, planShellSession, tmuxMissingMessage, readShellSessionState, sanitizeLabel, shellTargets, sessionSidecarArgs, splitAgentOptions, targetForAgent, tmuxSessionName } from './wrapper.js';
 import type { ProcessHandOff } from './wrapper.js';
 
 // TMUX is in here for two reasons: targetForAgent branches on it, and a
@@ -98,13 +98,13 @@ describe('targetForAgent', () => {
     // quoted into a single string rather than passed as separate argv entries.
     it('shell-quotes passthrough args that carry spaces or quotes', () => {
         process.env.CLAUDE_PROJECT_DIR = '/work/hwip-quote-probe';
-        const [, , , , shellCmd] = targetForAgent('claude', ['--resume', 'a b']).args;
+        const shellCmd = targetForAgent('claude', ['--resume', 'a b']).args.find((a) => a.startsWith('claude'));
         expect(shellCmd).toBe("claude --resume 'a b'");
     });
 
     it('leaves shell-safe args unquoted', () => {
         process.env.CLAUDE_PROJECT_DIR = '/work/hwip-plain-probe';
-        const [, , , , shellCmd] = targetForAgent('claude', ['--resume']).args;
+        const shellCmd = targetForAgent('claude', ['--resume']).args.find((a) => a.startsWith('claude'));
         expect(shellCmd).toBe('claude --resume');
     });
 
@@ -124,7 +124,8 @@ describe('targetForAgent', () => {
         const { kind, cmd, args } = targetForAgent('pi', ['/skill:02-implement a.md'], 'pi', { detach: true, label: 'impl' });
         expect(kind).toBe('tmux-detached');
         expect(cmd).toBe('tmux');
-        expect(args).toEqual(['new', '-d', '-s', 'hwip-pi-config-impl', '-c', '/work/pi-config', "pi '/skill:02-implement a.md'",
+        expect(args).toEqual(['new', '-d', '-s', 'hwip-pi-config-impl', '-c', '/work/pi-config',
+            ...herdrEnvArgs('pi', {}, installedTmuxVersion()), "pi '/skill:02-implement a.md'",
             ';', 'set-option', '-t', '=hwip-pi-config-impl:', '@hwip_project', 'pi-config', ';', 'set-option', '-t', '=hwip-pi-config-impl:', '@hwip_session_label', 'impl']);
     });
 
@@ -328,6 +329,60 @@ describe('herdrSessionArgs', () => {
     it('rides on the attaching launch', () => {
         const { args } = targetForAgent('claude', []);
         expect(args).toContain('@hwip_herdr_pane');
+    });
+});
+
+// The agent's own env names its herdr pane for herdr's native integrations. Under tmux
+// that env is the server's global one — the long-closed pane that started the server.
+describe('herdrEnvArgs', () => {
+    const herdr = {
+        HERDR_ENV: '1',
+        HERDR_PANE_ID: 'wF:p1',
+        HERDR_SOCKET_PATH: '/Users/u/.config/herdr/herdr.sock',
+        HERDR_BIN_PATH: '/Users/u/.local/bin/herdr',
+        HERDR_TAB_ID: 'wF:t1',
+        HERDR_WORKSPACE_ID: 'wF',
+        HERDR_STARTUP_CWD: '/Users/u',
+    };
+    const env = (values: Record<string, string>): string[] => Object.entries(values).flatMap(([k, v]) => ['-e', `${k}=${v}`]);
+    const blank = env(Object.fromEntries(Object.keys(herdr).map((k) => [k, ''])));
+
+    it('hands the attaching herdr pane to an agent herdr reports natively', () => {
+        expect(herdrEnvArgs('codex', herdr, 'tmux 3.5a')).toEqual(env(herdr));
+    });
+
+    // hwip reports these itself; a second source on the same pane replaces hwip's label,
+    // and its release drops both (measured, herdr 0.9.3).
+    it('blanks the pane for an agent hwip reports itself', () => {
+        expect(herdrEnvArgs('claude', herdr, 'tmux 3.5a')).toEqual(blank);
+        expect(herdrEnvArgs('pi', herdr, 'tmux 3.5a')).toEqual(blank);
+    });
+
+    it('blanks the pane outside herdr', () => {
+        expect(herdrEnvArgs('codex', {}, 'tmux 3.5a')).toEqual(blank);
+        expect(herdrEnvArgs('codex', { ...herdr, HERDR_ENV: '0' }, 'tmux 3.5a')).toEqual(blank);
+    });
+
+    it('passes nothing to a tmux older than 3.2, which has no new-session -e', () => {
+        expect(herdrEnvArgs('codex', herdr, 'tmux 3.1c')).toEqual([]);
+        expect(herdrEnvArgs('codex', herdr, 'tmux 2.9a')).toEqual([]);
+        expect(herdrEnvArgs('codex', herdr, '')).toEqual([]);
+    });
+
+    it('reads development builds as new enough', () => {
+        expect(herdrEnvArgs('codex', herdr, 'tmux next-3.7')).toEqual(env(herdr));
+        expect(herdrEnvArgs('codex', herdr, 'tmux master')).toEqual(env(herdr));
+        expect(herdrEnvArgs('codex', herdr, 'tmux 3.10')).toEqual(env(herdr));
+    });
+
+    // Right before the shell command: tmux reads flags only up to it.
+    it('rides on both launches, ahead of the shell command', () => {
+        process.env.CLAUDE_PROJECT_DIR = '/work/hwip-herdr-env-probe';
+        const before = (args: string[], n: number) => args.slice(args.indexOf('codex') - n, args.indexOf('codex'));
+        const attached = herdrEnvArgs('codex', process.env, installedTmuxVersion());
+        expect(before(targetForAgent('codex', [], 'codex').args, attached.length)).toEqual(attached);
+        const detached = herdrEnvArgs('codex', {}, installedTmuxVersion());
+        expect(before(targetForAgent('codex', [], 'codex', { detach: true, label: 'x' }).args, detached.length)).toEqual(detached);
     });
 });
 

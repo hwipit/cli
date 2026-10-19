@@ -42,7 +42,7 @@ process.env.XDG_STATE_HOME = join(TMP, 'state');
 const PROJECT_DIR = join(TMP, 'work', 'api');
 mkdirSync(PROJECT_DIR, { recursive: true });
 
-const { handleSessionForgetRequest, computeListenerDeviceId, continueRuns } = await import('./listener.js');
+const { handleSessionForgetRequest, computeListenerDeviceId, continueRuns, knownSessionsToReport, knownSessionsFingerprint } = await import('./listener.js');
 const { rememberSessions, knownSessions, continuedRunId } = await import('./session-registry.js');
 
 const NAME = 'hwip-api';
@@ -123,6 +123,18 @@ describe('continue: what the registry keeps', () => {
         const entries = knownSessions();
         expect(entries.map((e) => e.runId)).toEqual([A]);
         expect(entries[0]).toMatchObject({ runId: A, startedAt: iso(A), tmuxRunIds: [T], agentSessionId: CONVERSATION });
+    });
+});
+
+describe('continue: what the server is told', () => {
+    it('reports the tmux sessions the ended run went on in, and sees them as a change', () => {
+        endedA();
+        rememberSessions([{ ...sighting(A), tmuxRunId: T }], Date.now() - 30_000);
+
+        const reported = knownSessionsToReport([]);
+        expect(reported).toMatchObject([{ runId: A, tmuxRunIds: [T] }]);
+        const unjoined = reported.map(({ tmuxRunIds: _joined, ...rest }) => rest);
+        expect(knownSessionsFingerprint(reported)).not.toBe(knownSessionsFingerprint(unjoined));
     });
 });
 

@@ -432,6 +432,8 @@ export interface ReportedKnownSession {
     /** The seq block the run's chunks took (Q24): the server reads its conversation from that key range alone. */
     firstSeq?: number;
     lastSeq?: number;
+    /** The later tmux sessions the run went on in (Q35): the server ends another run's push window at their start. */
+    tmuxRunIds?: string[];
     lastSeenAt: string;
 }
 
@@ -464,12 +466,13 @@ export const knownSessionsToReport = (
             ...(e.runId ? { runId: e.runId } : {}),
             ...(e.startedAt ? { startedAt: e.startedAt } : {}),
             ...(e.runId ? seqs.get(runSeqsKey(e.name, e.runId)) : undefined),
+            ...(e.tmuxRunIds?.length ? { tmuxRunIds: e.tmuxRunIds } : {}),
             lastSeenAt: e.lastSeenAt,
         }));
 };
 
 export const knownSessionsFingerprint = (known: ReportedKnownSession[]): string =>
-    known.map((k) => `${k.name} ${k.agentKind} ${k.runId ?? ''} ${k.lastSeenAt} ${k.firstSeq ?? ''} ${k.lastSeq ?? ''}`).sort().join('|');
+    known.map((k) => `${k.name} ${k.agentKind} ${k.runId ?? ''} ${k.lastSeenAt} ${k.firstSeq ?? ''} ${k.lastSeq ?? ''} ${k.tmuxRunIds?.join(',') ?? ''}`).sort().join('|');
 
 export const sessionsFingerprint = (sessions: AgentSession[]): string =>
     sessions

@@ -57,12 +57,14 @@ import {
 } from './listener-process.js';
 import { projectHash, remoteDigest, remoteMarkerPath, stateDir } from './gate.js';
 import {
+    continuedRunId,
     forgetSession,
     knownSessions,
     recallRun,
     runKey,
     recallSession,
     rememberSessions,
+    runOfTmuxSession,
     sessionDirectoryExists,
     type KnownSession,
 } from './session-registry.js';
@@ -819,9 +821,34 @@ const epochToIso = (epoch: string | undefined): string | undefined => {
  * from `createdAt` for listeners that do not send one (`runIdOf`), so the two
  * must agree: `epochToIso` keeps whole seconds and this floors them.
  */
-export const runIdOfEpoch = (epoch: string | undefined): string | undefined => {
-    const iso = epochToIso(epoch);
-    return iso ? String(Math.floor(Date.parse(iso) / 1000)) : undefined;
+export const runIdOfEpoch = (epoch: string | undefined): string | undefined => runIdOfIso(epochToIso(epoch));
+
+/** The run id of the tmux session that started at `iso` (a session's `createdAt`). */
+const runIdOfIso = (iso: string | undefined): string | undefined => {
+    const ms = iso ? Date.parse(iso) : NaN;
+    return Number.isFinite(ms) ? String(Math.floor(ms / 1000)) : undefined;
+};
+
+/**
+ * Each live session's run once the sweep has read the conversations (hwip
+ * docs/session-runs.md §3): a session carrying on an earlier run's
+ * conversation reports — and its recorder tags — that run instead of its new
+ * tmux session. `sessions` and `recordable` are this sweep's, changed in place.
+ */
+export const continueRuns = (
+    sessions: AgentSession[],
+    recordable: Record<string, RecordableSession>,
+    conversationOf: (name: string) => string | null | undefined,
+    known: readonly KnownSession[] = knownSessions(),
+): void => {
+    for (const s of sessions) {
+        if (s.parentName || !s.runId) continue;
+        const runId = continuedRunId(known, s.name, s.agentKind, s.runId, conversationOf(s.name));
+        if (runId === s.runId) continue;
+        s.runId = runId;
+        const source = recordable[s.name];
+        if (source) recordable[s.name] = { ...source, runId };
+    }
 };
 
 // ─── Agent state detection (SPEC-AGENT-AWARENESS §S1) ──────────────
@@ -2022,7 +2049,8 @@ export const handleSessionForgetRequest = (
     // A name running again is not the run being forgotten: an ended run of it goes on its own (Q29).
     // The running run itself, a request naming no run, or a run tmux could not tell apart stay refused.
     if (liveness === 'running') {
-        const live = runId ? liveRunIdOf(sessionName) : undefined;
+        const tmuxRun = runId ? liveRunIdOf(sessionName) : undefined;
+        const live = tmuxRun ? runOfTmuxSession(sessionName, tmuxRun) : undefined;
         if (!runId || !live || live === runId) return reply({ error: 'still_running' });
     }
     const outcome = forgetSession(
@@ -4423,6 +4451,7 @@ export const collectSessionsVerbose = (): CollectResult => {
         if (!id) return undefined;
         return resumeIdCount.get(id) === 1 ? id : null;
     };
+    continueRuns(sessions, recordable, ownResumeId);
     // Write down what each live session IS, while it still exists to be read.
     // tmux forgets a session the moment it ends, which is exactly when the
     // phone wants it back — and a resume must take its directory and its binary
@@ -4441,6 +4470,7 @@ export const collectSessionsVerbose = (): CollectResult => {
             label: s.label,
             runId: s.runId,
             startedAt: s.createdAt,
+            tmuxRunId: runIdOfIso(s.createdAt),
             agentSessionId: ownResumeId(s.name),
         })),
     );

@@ -44,6 +44,12 @@ export interface KnownSession {
      * agent whose id this machine cannot read, and in files written before it.
      */
     agentSessionId?: string;
+    /**
+     * The later tmux sessions this run went on in (`session_created`, as
+     * `runId`): the same conversation carried on after an `exit` is the same
+     * run (`continuedRunId`). Absent for a run that has had one tmux session.
+     */
+    tmuxRunIds?: string[];
     /** Last time this machine saw the session running. */
     lastSeenAt: string;
 }
@@ -63,6 +69,8 @@ export const KNOWN_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 const registryPath = (): string => join(stateDir(), 'known-sessions.json');
 
+const isTmuxRunIds = (v: unknown): boolean => v === undefined || (Array.isArray(v) && v.every((id) => typeof id === 'string'));
+
 const readAll = (): KnownSession[] => {
     try {
         const raw = readFileSync(registryPath(), 'utf-8');
@@ -78,7 +86,8 @@ const readAll = (): KnownSession[] => {
                 typeof (e as KnownSession).cwd === 'string' &&
                 typeof (e as KnownSession).agentKind === 'string' &&
                 typeof (e as KnownSession).lastSeenAt === 'string' &&
-                ((e as KnownSession).runId === undefined || typeof (e as KnownSession).runId === 'string'),
+                ((e as KnownSession).runId === undefined || typeof (e as KnownSession).runId === 'string') &&
+                isTmuxRunIds((e as KnownSession).tmuxRunIds),
         );
     } catch {
         return [];
@@ -147,6 +156,43 @@ export const recallRun = (
 ): KnownSession | null =>
     knownSessions(now).find((e) => e.name === name && e.agentKind === agentKind) ?? null;
 
+/** tmux sessions remembered per run: an `exit` and `-c` every few minutes all day stays a short list. */
+export const MAX_TMUX_RUNS_PER_RUN = 10;
+
+/** Agents whose own resume is measured to keep the conversation id: Claude Code 2.1.300's `-c` does. */
+const CONTINUING_KINDS: ReadonlySet<string> = new Set(['claude']);
+
+/**
+ * Which run the tmux session `tmuxRunId` of `name` is (hwip docs/session-runs.md §3).
+ *
+ * Its own, unless it carries on an earlier run: it was already joined to one
+ * (a sweep or a listener restart since), or the agent's conversation
+ * `conversationId` is the one an earlier run of the same name and agent last
+ * had. A tmux session that has had a conversation of its own stays its own run
+ * — a fresh start `/resume`d into an old conversation keeps what it wrote first.
+ */
+export const continuedRunId = (
+    entries: readonly KnownSession[],
+    name: string,
+    agentKind: string,
+    tmuxRunId: string,
+    conversationId: string | null | undefined,
+): string => {
+    const ofName = entries.filter((e) => e.name === name && e.agentKind === agentKind && e.runId);
+    const joined = ofName.find((e) => e.runId !== tmuxRunId && e.tmuxRunIds?.includes(tmuxRunId));
+    if (joined?.runId) return joined.runId;
+    if (!conversationId || !CONTINUING_KINDS.has(agentKind)) return tmuxRunId;
+    if (ofName.some((e) => e.runId === tmuxRunId && e.agentSessionId)) return tmuxRunId;
+    const earlier = ofName
+        .filter((e) => e.agentSessionId === conversationId && Number(e.runId) < Number(tmuxRunId))
+        .sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt))[0];
+    return earlier?.runId ?? tmuxRunId;
+};
+
+/** The run going on in tmux session `tmuxRunId` of `name`: the one it was joined to, else its own. */
+export const runOfTmuxSession = (name: string, tmuxRunId: string, now: number = Date.now()): string =>
+    knownSessions(now).find((e) => e.name === name && e.tmuxRunIds?.includes(tmuxRunId))?.runId ?? tmuxRunId;
+
 let readOnly = false;
 
 /**
@@ -177,6 +223,8 @@ export const rememberSessions = (
         label?: string | null;
         runId?: string;
         startedAt?: string;
+        /** The tmux session it runs in; one other than `runId` means the run goes on in it (`continuedRunId`). */
+        tmuxRunId?: string;
         /**
          * The conversation a resume may pick up. Absent: not readable this
          * sweep, so the run keeps the one it had. Null: read, but not this
@@ -199,6 +247,9 @@ export const rememberSessions = (
             const before = byRun.get(runKey(s.name, s.agentKind));
             if (before && before.lastSeenAt >= s.startedAt) byRun.delete(runKey(s.name, s.agentKind));
         }
+        // Carried on in a new tmux session: what an earlier sweep wrote under that session is this run.
+        const continued = !!s.runId && !!s.tmuxRunId && s.tmuxRunId !== s.runId;
+        if (continued) byRun.delete(runKey(s.name, s.agentKind, s.tmuxRunId));
         const key = runKey(s.name, s.agentKind, s.runId);
         // A sweep that could not read the id — the agent has not written its
         // record yet — keeps the one this run already had. Keyed by run and
@@ -207,6 +258,11 @@ export const rememberSessions = (
         const prev = byRun.get(key);
         const keepPrev = s.agentSessionId === undefined && prev?.cwd === s.cwd;
         const agentSessionId = s.agentSessionId || (keepPrev ? prev?.agentSessionId : undefined);
+        // A run keeps its first start whichever tmux session it goes on in.
+        const startedAt = continued ? prev?.startedAt ?? s.startedAt : s.startedAt;
+        const tmuxRunIds = continued && s.tmuxRunId
+            ? [...(prev?.tmuxRunIds ?? []).filter((id) => id !== s.tmuxRunId), s.tmuxRunId].slice(-MAX_TMUX_RUNS_PER_RUN)
+            : prev?.tmuxRunIds;
         byRun.set(key, {
             name: s.name,
             cwd: s.cwd as string,
@@ -214,8 +270,9 @@ export const rememberSessions = (
             ...(s.project ? { project: s.project } : {}),
             ...(s.label ? { label: s.label } : {}),
             ...(s.runId ? { runId: s.runId } : {}),
-            ...(s.startedAt ? { startedAt: s.startedAt } : {}),
+            ...(startedAt ? { startedAt } : {}),
             ...(agentSessionId ? { agentSessionId } : {}),
+            ...(tmuxRunIds?.length ? { tmuxRunIds } : {}),
             lastSeenAt: seenAt,
         });
     }

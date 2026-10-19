@@ -57,7 +57,7 @@ vi.mock('child_process', async (importOriginal) => {
 });
 
 const listener = await import('./listener.js');
-const { recallSession } = await import('./session-registry.js');
+const { recallSession, rememberSessions, knownSessions } = await import('./session-registry.js');
 const { REMOTE_AGENTS } = await import('./remote-agents.js');
 
 let logSpy: ReturnType<typeof vi.spyOn>;
@@ -255,5 +255,39 @@ describe('collectSessionsVerbose — what the sweep does today', () => {
             expect(s.createdAt).toBeUndefined();
             expect(s.lastActivityAt).toBeUndefined();
         });
+    });
+});
+
+describe('collectSessionsVerbose — a conversation carried on in a new tmux session', () => {
+    const NAME = 'hwip-cont';
+    const A = '1790000000';
+    const T = '1790007200';
+    const CONVERSATION = '34e85b28-3808-4504-bec0-da9ca546081b';
+    const iso = (sec: string) => new Date(Number(sec) * 1000).toISOString();
+
+    beforeEach(() => {
+        vi.spyOn(console, 'log').mockImplementation(() => {});
+        listener.resetSessionStates();
+        listPanes = answer(paneRow({ session: NAME, created: T, paneId: '%5' }));
+    });
+    afterEach(() => vi.restoreAllMocks());
+
+    it('reports the earlier run once the conversation is read, and leaves no entry for the new tmux session', () => {
+        rememberSessions([{ name: NAME, cwd: '/tmp/proj', agentKind: 'claude', runId: A, startedAt: iso(A), agentSessionId: CONVERSATION }], Date.now() - 60_000);
+        const claude = REMOTE_AGENTS.find((a) => a.kind === 'claude')!;
+        const resume = vi.spyOn(claude, 'resolveResumeId').mockReturnValue(null);
+
+        // The agent has not written its record yet: the new tmux session is its own run for now.
+        expect(listener.collectSessionsVerbose().sessions.find((s) => s.name === NAME)?.runId).toBe(T);
+
+        resume.mockReturnValue(CONVERSATION);
+        expect(listener.collectSessionsVerbose().sessions.find((s) => s.name === NAME)?.runId).toBe(A);
+        expect(knownSessions().filter((e) => e.name === NAME)).toEqual([
+            expect.objectContaining({ runId: A, startedAt: iso(A), tmuxRunIds: [T], agentSessionId: CONVERSATION }),
+        ]);
+
+        // A later sweep that cannot read the conversation stays on the run.
+        resume.mockReturnValue(null);
+        expect(listener.collectSessionsVerbose().sessions.find((s) => s.name === NAME)?.runId).toBe(A);
     });
 });

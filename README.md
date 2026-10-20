@@ -833,7 +833,7 @@ The phone also reads this machine's schedules (see [Scheduled sessions](#schedul
 { subtype: 'agent.schedule.list.result',  requestId, at, schedules | encrypted | error }
 ```
 
-`schedules` is the list as a JSON string; `encrypted` is the list sealed for the asking device (purpose `schedule.list`, bound to this machine's device id) as `{ v: 1, requestId, at, schedules: [...], unreadable? }` — the app checks that the `requestId` inside is the one it asked, so an older sealed list is not taken for a newer answer. `unreadable` is how many schedule files could not be read; a directory that cannot be listed at all, or that holds more than 20 files, is the error `read_failed`, never an empty list (and a remove then fails as `schedule_failed`; `hwip schedule rm` still works on the computer). A list too long for one frame has its prompts shortened, step by step (`too_large` only when it does not fit even without them). Each entry holds `id`, `source`, `agentKind`, `project` (the directory's name, not its path), `session`, `when`, `prompt` (cut to 500 characters, shorter when the list would not fit), `maxRuntimeMin`, `nextAt` and the `last` result — never a directory path or the agent's arguments.
+`schedules` is the list as a JSON string; `encrypted` is the list sealed for the asking device (purpose `schedule.list`, bound to this machine's device id) as `{ v: 1, requestId, at, schedules: [...], unreadable? }` — the app checks that the `requestId` inside is the one it asked, so an older sealed list is not taken for a newer answer. `unreadable` is how many schedule files could not be read; a directory that cannot be listed at all, or that holds more than 20 files, is the error `read_failed`, never an empty list (and a remove then fails as `schedule_failed`; `hwip schedule rm` still works on the computer). A list too long for one frame has its prompts shortened, step by step (`too_large` only when it does not fit even without them). Each entry holds `id`, `source`, `agentKind`, `project` (the directory's name, not its path), `session`, `when`, `prompt` (cut to 500 characters, shorter when the list would not fit; `promptLocked: true` says the phone cannot change it — it is not the whole text, or the schedule has agent arguments — so the app leaves it to `hwip schedule edit`), `maxRuntimeMin`, `nextAt` and the `last` result — never a directory path or the agent's arguments.
 
 ### Your API key and redirects
 
@@ -1189,7 +1189,7 @@ device, takes plain commands as before; an unreadable
 forgets the pins, and with them goes back to taking plain commands until a
 device is pinned again.
 
-**A schedule request** — the phone making or removing a scheduled session — rides
+**A schedule request** — the phone making, changing or removing a scheduled session — rides
 the same `agent.command` push, with a `schedule` field and no `body`. It carries
 a time, a prompt and, if the phone says so, an agent and a run time — and nothing
 else. The directory and the agent come from what this machine recorded for the
@@ -1198,8 +1198,11 @@ schedule at another directory; it cannot send agent arguments, a worktree or a
 label either, and a request that carries one is refused rather than ignored
 (`schedule_invalid`; `schedule_limit` at 20 schedules; `unknown_session` for a
 session this machine never recorded; `schedule_failed` when this machine's own
-files would not read or write). A remove names the schedule's own
-session, so it cannot reach another. Applying a request never types into a
+files would not read or write). A change (`op: 'update'`) carries the schedule's id
+and any of the time, the prompt and the run time; what it leaves out stays as it was,
+and a change with none of them is refused. A schedule made on the computer with agent arguments keeps its prompt: the phone may change its time and run time, not what is typed under those arguments. A change and a remove name the schedule's own
+session, so they cannot reach another. A listener of an older build refuses a change as
+`schedule_invalid`. Applying a request never types into a
 session. The request is sealed like any
 command — the whole of it inside the body, only `op` beside it, and the sender,
 label and counter checks above apply, so a replay or a swapped `op` changes

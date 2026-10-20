@@ -384,6 +384,9 @@ export interface ScheduleChange {
     maxRuntimeMin?: number;
 }
 
+/** A change as it arrives from outside (the phone): its values are checked with the schedule they make. */
+export type UncheckedScheduleChange = { [K in keyof ScheduleChange]?: unknown };
+
 /** `missing` — no such schedule; `invalid` — the id or the changed schedule was refused; `io` — the file could not be written. */
 export type UpdateResult = { ok: true; schedule: Schedule } | { ok: false; error: string; failure: 'missing' | 'invalid' | 'io' };
 
@@ -393,19 +396,18 @@ export type UpdateResult = { ok: true; schedule: Schedule } | { ok: false; error
  * the runner counts the edited schedule's runs from then, so the times it had before are neither run nor counted as
  * missed. A change of the prompt or the run time only keeps the count where it was — an hourly run stays on its hour.
  */
-export const updateSchedule = (id: string, change: ScheduleChange, now: number): UpdateResult => {
+export const updateSchedule = (id: string, change: UncheckedScheduleChange, now: number): UpdateResult => {
     if (!isScheduleId(id)) return { ok: false, error: 'not a schedule id', failure: 'invalid' };
     if (change.when === undefined && change.prompt === undefined && change.maxRuntimeMin === undefined) {
         return { ok: false, error: 'nothing to change', failure: 'invalid' };
     }
     const current = readOne(id);
     if (!current) return { ok: false, error: `no schedule ${id}`, failure: 'missing' };
-    const next: Schedule = { ...current, ...change, ...(change.when === undefined ? {} : { updatedAt: new Date(now).toISOString() }) };
-    const checked = validateSchedule(next);
+    const checked = validateSchedule({ ...current, ...change, ...(change.when === undefined ? {} : { updatedAt: new Date(now).toISOString() }) });
     if (!checked.ok) return { ok: false, error: checked.error, failure: 'invalid' };
     try {
-        replaceFile(schedulePath(id), `${JSON.stringify(next, null, 2)}\n`, undefined, 0o600);
-        return { ok: true, schedule: next };
+        replaceFile(schedulePath(id), `${JSON.stringify(checked.value, null, 2)}\n`, undefined, 0o600);
+        return { ok: true, schedule: checked.value };
     } catch (err) {
         return { ok: false, error: `could not write the schedule: ${err instanceof Error ? err.message : String(err)}`, failure: 'io' };
     }

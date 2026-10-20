@@ -39,6 +39,17 @@ Codex / …). Safe to re-run: a saved login is reused untouched (no
 prompts), so a re-run just refreshes the agent integrations. To switch
 account, `hwip install --relogin` forces a fresh sign-in.
 
+**Auto session names.** Agents without a title of their own — Codex,
+Cursor, Windsurf, Gemini and pi — name their sessions after what they were
+asked, so the phone shows that instead of a tmux name. The registrations
+`hwip install` writes turn it on (`HWIP_AUTONAME=1` in the MCP entry, the
+`hwip_session_title` tool in the pi extension), so **after updating
+`@hwip/cli`, run `hwip install` once more** to get it on a machine
+installed before; `hwip verify` says which agents still lack it. Claude
+Code and opencode title sessions themselves and are left as they are. To
+hide the names agents choose, turn off *Name sessions automatically* in
+the app's settings — names you set yourself always show.
+
 **Why global, not `npx`?** `hwip cc` (drive a session from your phone)
 needs `hwip` on your `PATH`, and the agent hooks this installs are
 `$(command -v hwip || npx …)` — a global binary skips an npx cold-start

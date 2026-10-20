@@ -12,7 +12,7 @@ import { runLoginFlow, resolveAllowHosts, resolveWebUrl, resolveTimeoutSec } fro
 import { detectAgents, resolveCommand } from './agents.js';
 import { ensureTmux, planTmuxInstall } from './tmux-install.js';
 import {
-  GEMINI_MCP_ADD, GEMINI_MCP_ADD_LEGACY, MCP_SERVERS_ENTRY, OPENCODE_MCP_ENTRY,
+  GEMINI_MCP_ADD, GEMINI_MCP_ADD_BARE, GEMINI_MCP_ADD_LEGACY, MCP_SERVERS_ENTRY, OPENCODE_MCP_ENTRY,
 } from './mcp-command.js';
 import { upsertHwipMcpTable } from './codex-config.js';
 import { FileChangedError, NotUtf8Error, readTextIfExists, replaceFile } from './replace-file.js';
@@ -355,7 +355,12 @@ const installGemini = (): void => {
       execSync(GEMINI_MCP_ADD_LEGACY, { stdio: 'pipe' });
       ok('MCP server added (legacy gemini CLI)');
     } catch {
-      fail(`MCP add failed. Manual: ${GEMINI_MCP_ADD}`);
+      try {
+        execSync(GEMINI_MCP_ADD_BARE, { stdio: 'pipe' });
+        ok('MCP server added (legacy gemini CLI, without auto session names)');
+      } catch {
+        fail(`MCP add failed. Manual: ${GEMINI_MCP_ADD}`);
+      }
     }
   }
   try {

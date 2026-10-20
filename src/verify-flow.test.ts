@@ -254,3 +254,45 @@ describe('hwip verify', () => {
         expect(checks).toContainEqual(expect.objectContaining({ label: expect.stringContaining('listener not running'), state: 'warn' }));
     });
 });
+
+// Auto session names need HWIP_AUTONAME in the agent's MCP entry, which only a
+// `hwip install` from this release writes: an older install says nothing otherwise.
+describe('hwip verify and auto session names', () => {
+    const write = async (path: string[], text: string) => {
+        const { mkdirSync, writeFileSync } = await import('node:fs');
+        mkdirSync(join(home, ...path.slice(0, -1)), { recursive: true });
+        writeFileSync(join(home, ...path), text);
+    };
+    const mcpRows = async () => {
+        await verify({ json: true });
+        return (JSON.parse(logs.pop() as string).checks as Array<{ section: string; label: string; state: string }>)
+            .filter((check) => check.section === 'MCP registrations')
+            .map(({ label, state }) => [label, state]);
+    };
+
+    it('asks for a reinstall where the flag is missing, and only for the agents it is set for', async () => {
+        await write(['.cursor', 'mcp.json'], JSON.stringify({ mcpServers: { hwip: { command: 'hwip', args: ['mcp'], env: {} } } }));
+        await write(['.codex', 'config.toml'], '[mcp_servers.hwip]\ncommand = "hwip"\nargs = ["mcp"]\nenv = { HWIP_AUTONAME = "1" }\n');
+        await write(['.config', 'opencode', 'opencode.json'], JSON.stringify({ mcp: { hwip: { type: 'local', command: ['hwip', 'mcp'] } } }));
+
+        expect(await mcpRows()).toEqual([
+            ['Cursor: launches `hwip mcp`', 'pass'],
+            ['Cursor: auto session names off — Re-run: hwip install', 'warn'],
+            ['OpenCode: launches `hwip mcp`', 'pass'],
+            ['Codex CLI: launches `hwip mcp`', 'pass'],
+        ]);
+    });
+});
+
+describe('hwip verify and auto session names in codex', () => {
+    it('asks for a reinstall when the codex entry has no flag', async () => {
+        const { mkdirSync, writeFileSync } = await import('node:fs');
+        mkdirSync(join(home, '.codex'), { recursive: true });
+        writeFileSync(join(home, '.codex', 'config.toml'), '[mcp_servers.hwip]\ncommand = "hwip"\nargs = ["mcp"]\n');
+
+        await verify({ json: true });
+        const checks = JSON.parse(logs.pop() as string).checks;
+
+        expect(checks).toContainEqual({ section: 'MCP registrations', label: 'Codex CLI: auto session names off — Re-run: hwip install', state: 'warn' });
+    });
+});

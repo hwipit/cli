@@ -7,8 +7,8 @@ import { serviceHealthChecks, serviceStatus, type ServiceHealthRow } from './lis
 import { HwipHook } from './hwip-hook.js';
 import { parseJsonc } from './jsonc-doc.js';
 import { describeNotifyFailure, isTransientNotifyFailure, readNotifyFailure } from './notify-failure.js';
-import { readHwipMcpArgv } from './codex-config.js';
-import { MCP_LAUNCH_ARGV } from './mcp-command.js';
+import { hasHwipAutoName, readHwipMcpArgv } from './codex-config.js';
+import { AUTONAME_ENV, MCP_LAUNCH_ARGV } from './mcp-command.js';
 import {
     isListenerPid, LISTENER_LOG_FILE, runningListenerPid, runningListenerWsUrl as stampedListenerWsUrl,
 } from './listener-process.js';
@@ -87,6 +87,14 @@ export const readCodexMcpArgv = (filePath: string): string[] | null => {
     }
 };
 
+const readCodexAutoName = (filePath: string): boolean => {
+    try {
+        return hasHwipAutoName(readFileSync(filePath, 'utf-8'));
+    } catch {
+        return false;
+    }
+};
+
 /**
  * Where each agent records the MCP launch, and how to read it back — the row
  * carries its own reader because codex keeps its registry in TOML while every
@@ -97,12 +105,18 @@ export const readCodexMcpArgv = (filePath: string): string[] | null => {
  * `gemini mcp add`, so this path is the gemini CLI's own storage layout,
  * confirmed by reading the file it produced, not something Hwip chose.
  */
-const MCP_REGISTRIES: ReadonlyArray<{ agent: string; path: string; argv: (path: string) => string[] | null | typeof UNREADABLE }> = [
-    { agent: 'Cursor', path: join(HOME, '.cursor', 'mcp.json'), argv: (p) => registeredMcpArgv(p, 'mcpServers') },
-    { agent: 'Windsurf', path: join(HOME, '.codeium', 'windsurf', 'mcp_config.json'), argv: (p) => registeredMcpArgv(p, 'mcpServers') },
-    { agent: 'Gemini CLI', path: join(HOME, '.gemini', 'settings.json'), argv: (p) => registeredMcpArgv(p, 'mcpServers') },
+const MCP_REGISTRIES: ReadonlyArray<{
+    agent: string;
+    path: string;
+    argv: (path: string) => string[] | null | typeof UNREADABLE;
+    /** Agents the installer turns auto session names on for; absent = not this agent's (it titles itself). */
+    autoName?: (path: string) => boolean;
+}> = [
+    { agent: 'Cursor', path: join(HOME, '.cursor', 'mcp.json'), argv: (p) => registeredMcpArgv(p, 'mcpServers'), autoName: (p) => registeredAutoName(p, 'mcpServers') },
+    { agent: 'Windsurf', path: join(HOME, '.codeium', 'windsurf', 'mcp_config.json'), argv: (p) => registeredMcpArgv(p, 'mcpServers'), autoName: (p) => registeredAutoName(p, 'mcpServers') },
+    { agent: 'Gemini CLI', path: join(HOME, '.gemini', 'settings.json'), argv: (p) => registeredMcpArgv(p, 'mcpServers'), autoName: (p) => registeredAutoName(p, 'mcpServers') },
     { agent: 'OpenCode', path: join(HOME, '.config', 'opencode', 'opencode.json'), argv: (p) => registeredMcpArgv(p, 'mcp') },
-    { agent: 'Codex CLI', path: join(HOME, '.codex', 'config.toml'), argv: readCodexMcpArgv },
+    { agent: 'Codex CLI', path: join(HOME, '.codex', 'config.toml'), argv: readCodexMcpArgv, autoName: readCodexAutoName },
 ];
 
 /** A registry file that exists but is not a JSON object — its hwip entry, if any, is unknowable. */
@@ -126,6 +140,16 @@ export const registeredMcpArgv = (filePath: string, key: string): string[] | nul
     if (Array.isArray(entry.command)) return entry.command.map(String);
     if (typeof entry.command !== 'string') return null;
     return [entry.command, ...(Array.isArray(entry.args) ? entry.args.map(String) : [])];
+};
+
+/** Whether a JSON registry's hwip entry sets HWIP_AUTONAME=1 — false for a
+ *  missing file or entry, which `registeredMcpArgv` reports on its own. */
+export const registeredAutoName = (filePath: string, key: string): boolean => {
+    if (!existsSync(filePath)) return false;
+    const data = readJson(filePath);
+    if (!isPlainObject(data)) return false;
+    const entry = (data[key] as Record<string, unknown> | undefined)?.hwip as { env?: unknown } | undefined;
+    return isPlainObject(entry?.env) && entry.env[AUTONAME_ENV] === '1';
 };
 
 /**
@@ -174,12 +198,12 @@ export const classifyMcpRegistration = (
  *  never installed drop out here so the report has no row for them. */
 const activeMcpRegistrations = (
     isOnPath: (bin: string) => boolean,
-): Array<{ agent: string; result: McpRegistration }> =>
-    MCP_REGISTRIES.flatMap((registry) => {
+): Array<{ agent: string; result: McpRegistration; namesSessions?: boolean }> =>
+    MCP_REGISTRIES.flatMap((registry): Array<{ agent: string; result: McpRegistration; namesSessions?: boolean }> => {
         const argv = registry.argv(registry.path);
         if (argv === UNREADABLE) return [{ agent: registry.agent, result: { state: 'unreadable', path: registry.path } as const }];
         const result = classifyMcpRegistration(argv, isOnPath);
-        return result ? [{ agent: registry.agent, result }] : [];
+        return result ? [{ agent: registry.agent, result, namesSessions: registry.autoName?.(registry.path) }] : [];
     });
 
 /** Where a resolved WebSocket URL came from, in the user's terms. */
@@ -350,8 +374,12 @@ export const handleVerify = async (args: Record<string, string | boolean>): Prom
     const registrations = activeMcpRegistrations(resolves);
     if (registrations.length > 0) {
         section('MCP registrations');
-        for (const { agent, result } of registrations) {
-            if (result.state === 'current') record(`${agent}: launches \`${MCP_LAUNCH_ARGV.join(' ')}\``, 'pass');
+        for (const { agent, result, namesSessions } of registrations) {
+            if (result.state === 'current') {
+                record(`${agent}: launches \`${MCP_LAUNCH_ARGV.join(' ')}\``, 'pass');
+                // Installed before auto session names: the agent never titles its sessions.
+                if (namesSessions === false) record(`${agent}: auto session names off — Re-run: hwip install`, 'warn');
+            }
             else if (result.state === 'stale') {
                 record(`${agent}: still launches \`${result.argv.join(' ')}\` — one extra resident process per session. Re-run: hwip install`, 'warn');
             } else if (result.state === 'unresolvable') {

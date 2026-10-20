@@ -32,9 +32,10 @@ describe('derived registration shapes', () => {
     });
 
     // Dropping env would break the IDEs that spawn the MCP server from a
-    // graphical context with no shell env to inherit.
+    // graphical context with no shell env to inherit. (HWIP_AUTONAME beside
+    // it: installer-autoname.test.ts.)
     it('mcpServers entry keeps the HWIP_API_KEY placeholder', () => {
-        expect(MCP_SERVERS_ENTRY.env).toEqual({ HWIP_API_KEY: '${HWIP_API_KEY}' });
+        expect(MCP_SERVERS_ENTRY.env.HWIP_API_KEY).toBe('${HWIP_API_KEY}');
     });
 
     it('opencode entry carries the launch argv in its array-command schema', () => {

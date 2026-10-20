@@ -20,6 +20,7 @@ import { dirname, join } from 'path';
 import { removeTurnRing } from './turn-ring.js';
 import { stateDir } from './gate.js';
 import { handBackToSudoUser, mkdirHandedBack } from './private-files.js';
+import type { ProviderNameSource } from './session-title.js';
 
 export interface KnownSession {
     /** tmux session name — the key the phone addresses. */
@@ -50,6 +51,14 @@ export interface KnownSession {
      * run (`continuedRunId`). Absent for a run that has had one tmux session.
      */
     tmuxRunIds?: string[];
+    /**
+     * The last name the agent gave this run (Claude's ai-title or `/rename`,
+     * …) and who gave it, as the sweep read them: what the phone calls the run
+     * once it has ended (hwip docs/session-runs.md Q39). Absent for a run never
+     * named, and in files written before it.
+     */
+    providerSessionName?: string;
+    providerSessionNameSource?: ProviderNameSource;
     /** Last time this machine saw the session running. */
     lastSeenAt: string;
 }
@@ -68,6 +77,15 @@ export const MAX_RUNS_PER_NAME = 10;
 export const KNOWN_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 const registryPath = (): string => join(stateDir(), 'known-sessions.json');
+
+const isNameSource = (v: unknown): v is ProviderNameSource => v === 'user' || v === 'auto';
+
+/** A run's name as the file holds it: a name that is not a string goes, and with it its source; a source that is not one goes alone. */
+const withReadableName = (e: KnownSession): KnownSession => {
+    const { providerSessionName: name, providerSessionNameSource: source, ...rest } = e;
+    if (typeof name !== 'string' || name === '') return rest;
+    return { ...rest, providerSessionName: name, ...(isNameSource(source) ? { providerSessionNameSource: source } : {}) };
+};
 
 const isTmuxRunIds = (v: unknown): boolean => v === undefined || (Array.isArray(v) && v.every((id) => typeof id === 'string'));
 
@@ -88,7 +106,7 @@ const readAll = (): KnownSession[] => {
                 typeof (e as KnownSession).lastSeenAt === 'string' &&
                 ((e as KnownSession).runId === undefined || typeof (e as KnownSession).runId === 'string') &&
                 isTmuxRunIds((e as KnownSession).tmuxRunIds),
-        );
+        ).map(withReadableName);
     } catch {
         return [];
     }
@@ -235,6 +253,9 @@ export const rememberSessions = (
          * run's alone to resume — the run forgets it.
          */
         agentSessionId?: string | null;
+        /** The name the agent gives the run now, and who gave it. None this sweep: the run keeps the one it had. */
+        providerSessionName?: string | null;
+        providerSessionNameSource?: ProviderNameSource;
     }>,
     now: number = Date.now(),
 ): void => {
@@ -267,6 +288,12 @@ export const rememberSessions = (
         const tmuxRunIds = continued && s.tmuxRunId
             ? [...(prev?.tmuxRunIds ?? []).filter((id) => id !== s.tmuxRunId), s.tmuxRunId].slice(-MAX_TMUX_RUNS_PER_RUN)
             : prev?.tmuxRunIds;
+        // The run's name is the last one read: a sweep that read none (the
+        // agent has not titled it yet, or its record was unreadable) does not
+        // take it away.
+        const named = s.providerSessionName
+            ? { providerSessionName: s.providerSessionName, providerSessionNameSource: s.providerSessionNameSource }
+            : prev;
         byRun.set(key, {
             name: s.name,
             cwd: s.cwd as string,
@@ -277,6 +304,8 @@ export const rememberSessions = (
             ...(startedAt ? { startedAt } : {}),
             ...(agentSessionId ? { agentSessionId } : {}),
             ...(tmuxRunIds?.length ? { tmuxRunIds } : {}),
+            ...(named?.providerSessionName ? { providerSessionName: named.providerSessionName } : {}),
+            ...(named?.providerSessionName && named.providerSessionNameSource ? { providerSessionNameSource: named.providerSessionNameSource } : {}),
             lastSeenAt: seenAt,
         });
     }

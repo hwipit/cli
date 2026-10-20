@@ -19,7 +19,7 @@ import { join, basename, resolve } from 'path';
 import { spawnSync } from 'child_process';
 import { projectTranscriptEntries, type TranscriptProjector, type TranscriptReader } from './transcript-tail.js';
 import { projectPiEntries } from './pi-transcript.js';
-import { claudeAiTitleOf, createTailWatch, type ProviderName } from './session-title.js';
+import { createTailWatch, latestClaudeAiTitle, piNamesStep, type ProviderName } from './session-title.js';
 import { projectCodexEntries } from './codex-transcript.js';
 import { projectGeminiEntries } from './gemini-transcript.js';
 import { opencodeDbPath, opencodeSourcePath, OPENCODE_SESSION_ID, projectOpencodeEntries, readOpencodeTranscript } from './opencode-transcript.js';
@@ -537,7 +537,7 @@ export const detectClaudeSessionIdByPid = (
 ): string | null => detectClaudeSessionByPid(panePid, paneCwd, deps)?.sessionId ?? null;
 
 /** Claude transcripts whose latest `ai-title` the listener keeps, read incrementally. */
-const claudeTitles = createTailWatch(claudeAiTitleOf);
+const claudeTitles = createTailWatch(latestClaudeAiTitle);
 
 /**
  * What the phone should call the Claude Code session in this pane, and who
@@ -720,6 +720,27 @@ export const piTranscriptPath = (paneCwd: string | null, panePid?: number): stri
     const cached = piSessionCache.get(key);
     if (cached) return cached.value;
     return piSessionCache.set(key, doDetectPiTranscript(paneCwd));
+};
+
+const piNames = createTailWatch(piNamesStep);
+
+/**
+ * The name a pi pane's session goes by, and who chose it: the newest
+ * `session_info` name, which is the agent's (`'auto'`) when the hwip
+ * extension's tool set it — the tool leaves a marker entry with the same name
+ * (`PI_TITLE_MARKER`) — and the user's (`/name`) otherwise. Read from the
+ * transcript tail, so a name written before the last 256 KB of a session the
+ * listener first meets late is not found until the next one is written.
+ */
+export const detectPiSessionName = (
+    paneCwd: string,
+    panePid: number | undefined,
+    transcriptOf: (paneCwd: string, panePid?: number) => string | null = piTranscriptPath,
+): ProviderName | null => {
+    const file = transcriptOf(paneCwd, panePid);
+    const names = file ? piNames.read(file) : undefined;
+    if (!names?.name) return null;
+    return { name: names.name, source: names.marked === names.name ? 'auto' : 'user' };
 };
 
 // ── Agents whose session store keeps no pid ──────────────────────
@@ -1470,6 +1491,7 @@ const REMOTE_AGENT_TABLE = [
         resolveTranscript: (paneCwd, panePid) => piTranscriptPath(paneCwd, panePid),
         projectTranscript: projectPiEntries,
         resolveResumeId: (paneCwd, panePid) => paneTranscriptId(piTranscriptPath(paneCwd, panePid), panePid),
+        resolveSessionName: (paneCwd, panePid) => detectPiSessionName(paneCwd, panePid),
     },
     {
         kind: 'opencode',

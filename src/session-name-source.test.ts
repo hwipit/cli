@@ -100,8 +100,8 @@ describe('detectClaudeProviderName', () => {
 });
 
 describe('createTailWatch', () => {
-    const pickTitle = (line: string): string | undefined =>
-        line.includes('"ai-title"') ? (JSON.parse(line) as { aiTitle?: string }).aiTitle : undefined;
+    const pickTitle = (title: string | undefined, line: string): string | undefined =>
+        line.includes('"ai-title"') ? (JSON.parse(line) as { aiTitle?: string }).aiTitle : title;
 
     it('reads a file once while it does not change, and only the new bytes after it grows', () => {
         writeFileSync(transcript, aiTitle('one'));

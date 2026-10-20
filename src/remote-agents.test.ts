@@ -120,7 +120,7 @@ describe('remote-agents.ts: table invariants', () => {
      * `resolveSessionName` leaves the whole feature dead with a green suite.
      */
     it('every agent with a readable name store is wired to its resolver', () => {
-        for (const kind of ['claude', 'hermes', 'codex', 'opencode'] as const) {
+        for (const kind of ['claude', 'hermes', 'codex', 'opencode', 'pi'] as const) {
             const row = REMOTE_AGENTS.find((a) => a.kind === kind);
             expect(typeof row?.resolveSessionName, `${kind} row lost its name resolver`).toBe('function');
         }

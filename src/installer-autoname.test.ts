@@ -110,6 +110,7 @@ describe('codex config.toml', () => {
         expect(hasHwipAutoName(`${table()}\n`)).toBe(false);
         expect(hasHwipAutoName(`${table()}\n\n[mcp_servers.other]\nenv = { HWIP_AUTONAME = "1" }\n`)).toBe(false);
         expect(hasHwipAutoName('model = "o4"\n')).toBe(false);
+        expect(hasHwipAutoName(`${table('# HWIP_AUTONAME = "1"')}\n`)).toBe(false);
     });
 });
 

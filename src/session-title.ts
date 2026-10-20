@@ -59,6 +59,7 @@ export const createTailWatch = <T,>(
             }
             // A new inode, or a file cut below where we were, is another file:
             // the reader restarted it, and the old value described what is gone.
+            // A file deleted and rewritten on a reused inode, longer than before, is not caught.
             const restarted = prev !== undefined
                 && (delta.state.ino !== prev.tail.ino || delta.state.size < prev.tail.offset);
             let value = restarted ? undefined : prev?.value;

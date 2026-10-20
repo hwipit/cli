@@ -56,7 +56,8 @@ export const OPENCODE_MCP_ENTRY = {
 // server NAME and the BINARY are both "hwip" here, so the doubled word below
 // is correct, not a copy-paste slip. Default scope is "project" (cwd-local
 // .gemini/), so user scope is pinned for a machine-wide install.
-// `-e` lands in the entry's env; an existing hwip entry is replaced whole, so a reinstall adds it.
+// `-e` lands in the entry's env. That a reinstall replaces an existing hwip entry whole, and so
+// adds the flag to it, is unverified (gemini CLI behaviour); `hwip verify` reports it if not.
 export const GEMINI_MCP_ADD = `gemini mcp add -s user -e ${AUTONAME_ENV}=1 hwip ${MCP_BIN} -- ${MCP_SUBCOMMAND.join(' ')}`;
 
 /** Older gemini CLIs only accept `mcp add <name> -- <command…>`, with no scope flag. */

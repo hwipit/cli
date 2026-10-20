@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync, appendFileSync, rmSync, truncateSync, statSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, appendFileSync, rmSync, truncateSync, statSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -136,8 +136,10 @@ describe('createTailWatch', () => {
         const watch = createTailWatch(pickTitle);
         watch.read(transcript);
 
-        rmSync(transcript);
-        writeFileSync(transcript, userLine);
+        // A rename over the path: both files exist at once, so the new one cannot reuse the old inode
+        // (Linux hands a freed inode straight back, and an rm then write would read as an append).
+        writeFileSync(`${transcript}.new`, userLine);
+        renameSync(`${transcript}.new`, transcript);
 
         expect(watch.read(transcript)).toBeUndefined();
     });

@@ -237,7 +237,7 @@ export const hasHwipAutoName = (config: string): boolean => {
     const start = definitionIndex(lines);
     if (start === -1) return false;
     const end = HWIP_INLINE_ENTRY.test(lines[start].trim()) ? start + 1 : entryEnd(lines, start);
-    return lines.slice(start, end).some((line) => FLAG_ON.test(line.trim()));
+    return lines.slice(start, end).some((line) => !line.trim().startsWith('#') && FLAG_ON.test(line.trim()));
 };
 
 /** The config with hwip's entry and its sub-tables gone, or null when it was

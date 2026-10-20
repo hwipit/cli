@@ -148,8 +148,9 @@ export const registeredAutoName = (filePath: string, key: string): boolean => {
     if (!existsSync(filePath)) return false;
     const data = readJson(filePath);
     if (!isPlainObject(data)) return false;
-    const entry = (data[key] as Record<string, unknown> | undefined)?.hwip as { env?: unknown } | undefined;
-    return isPlainObject(entry?.env) && entry.env[AUTONAME_ENV] === '1';
+    const servers = data[key];
+    const entry = isPlainObject(servers) ? servers.hwip : undefined;
+    return isPlainObject(entry) && isPlainObject(entry.env) && entry.env[AUTONAME_ENV] === '1';
 };
 
 /**

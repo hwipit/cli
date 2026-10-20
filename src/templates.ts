@@ -555,8 +555,8 @@ export default function (pi: ExtensionAPI) {
       // Cut by code point, so a cut never leaves half an emoji.
       const name = Array.from(params.title.replace(/\\s+/g, " ").trim()).slice(0, ${MAX_SESSION_TITLE}).join("").trim();
       if (!name) throw new Error("title is empty — nothing set");
-      // Marker first: if the name write then fails, the marker names no session_info and the
-      // listener reads nothing new, rather than an agent's name taken for the user's.
+      // Marker first: if the name write then fails, the new name is never taken for the user's.
+      // On a retitle the previous name then reads as the user's until the next title.
       pi.appendEntry(${JSON.stringify(PI_TITLE_MARKER)}, { name });
       pi.setSessionName(name);
       return { content: [{ type: "text", text: "Session titled: " + name }], details: {} };

@@ -45,7 +45,7 @@ asked, so the phone shows that instead of a tmux name. The registrations
 `hwip install` writes turn it on (`HWIP_AUTONAME=1` in the MCP entry, the
 `hwip_session_title` tool in the pi extension), so **after updating
 `@hwip/cli`, run `hwip install` once more** to get it on a machine
-installed before; `hwip verify` says which agents still lack it. Claude
+installed before; `hwip verify` says which MCP agents still lack it. Claude
 Code and opencode title sessions themselves and are left as they are. To
 hide the names agents choose, turn off *Name sessions automatically* in
 the app's settings — names you set yourself always show.

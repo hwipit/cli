@@ -28,11 +28,11 @@ import {
     type ScheduleChange,
     type ScheduleWhen,
 } from './schedule.js';
-import { checkoutOf } from './config.js';
-import { runningListenerPid } from './listener-process.js';
+import { checkoutOf, VERSION } from './config.js';
+import { runningListenerPid, runningListenerVersion } from './listener-process.js';
 import { findAgentBySubcommand, REMOTE_AGENTS } from './remote-agents.js';
 import { promptableScheduleKinds } from './schedule-ready.js';
-import { detectProjectDir, ensureListenerRunning, safeBasename, sanitizeLabel, tmuxSessionName } from './wrapper.js';
+import { detectProjectDir, ensureListenerRunning, listenerVersionDrifted, safeBasename, sanitizeLabel, tmuxSessionName } from './wrapper.js';
 import { isValidBranchName, worktreeDirName } from './worktree.js';
 
 export interface ScheduleCommandDeps {
@@ -46,8 +46,11 @@ export interface ScheduleCommandDeps {
     listenerRunning: () => boolean;
     /** The agent kinds a prompt can be scheduled for: those whose detection rules can say `idle` (`schedule-ready.ts`). */
     promptKinds: () => readonly string[];
-    /** Has a running listener of an older build replaced (`ensureListenerRunning`): an old one would skip a file it cannot read. */
-    refreshListener: () => Promise<void>;
+    /**
+     * Has a running listener of an older build replaced (`ensureListenerRunning`): an old one would skip a file it cannot read.
+     * False when one still runs after it.
+     */
+    refreshListener: () => Promise<boolean>;
     out: (line: string) => void;
     err: (line: string) => void;
 }
@@ -327,7 +330,11 @@ const handleEdit = async (words: string[], json: boolean, deps: ScheduleCommandD
         deps.err(`hwip schedule: ${change.error}`);
         return 2;
     }
-    if (deps.listenerRunning()) await deps.refreshListener();
+    // A new time writes `updatedAt`, which an older listener does not know: it would skip the file and the schedule would stop.
+    if (deps.listenerRunning() && !(await deps.refreshListener()) && change.value.when !== undefined) {
+        deps.err('hwip schedule: the listener running is an older hwip that could not be replaced, and it would stop running this schedule: restart it, then edit again');
+        return 1;
+    }
     const updated = updateSchedule(id, change.value, deps.now());
     if (!updated.ok) {
         deps.err(`hwip schedule: ${updated.error}`);
@@ -381,7 +388,10 @@ export const liveScheduleDeps = (): ScheduleCommandDeps => ({
     validBranch: (root, name) => isValidBranchName(root, name),
     listenerRunning: () => runningListenerPid() !== null,
     promptKinds: () => promptableScheduleKinds(REMOTE_AGENTS.map((a) => a.kind)),
-    refreshListener: () => onStderr(() => ensureListenerRunning(false)),
+    refreshListener: async () => {
+        await onStderr(() => ensureListenerRunning(false));
+        return runningListenerPid() === null || !listenerVersionDrifted(runningListenerVersion(), VERSION);
+    },
     out: (line) => console.log(line),
     err: (line) => console.error(line),
 });

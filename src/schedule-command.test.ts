@@ -25,7 +25,7 @@ const rig = (over: Partial<ScheduleCommandDeps> = {}): Rig => {
         validBranch: async (_root, name) => !name.includes('..') && !name.includes(' '),
         listenerRunning: () => true,
         promptKinds: () => ['claude', 'pi'],
-        refreshListener: async () => undefined,
+        refreshListener: async () => true,
         out: (line) => out.push(line),
         err: (line) => err.push(line),
         ...over,
@@ -393,9 +393,21 @@ describe('hwip schedule edit [F8-edit]', () => {
         await runSchedule(['add', 'cc', '--at', '09:00'], rig().deps);
         const { id } = only();
         const order: string[] = [];
-        const r = rig({ refreshListener: async () => { order.push(only().updatedAt ?? 'unedited'); } });
+        const r = rig({ refreshListener: async () => { order.push(only().updatedAt ?? 'unedited'); return true; } });
         expect(await runSchedule(['edit', id, '--at', '10:00'], r.deps)).toBe(0);
         expect(order).toEqual(['unedited']);
+    });
+
+    it('leaves a new time unwritten while an older listener still runs, since it would stop running the schedule', async () => {
+        await runSchedule(['add', 'cc', '--at', '09:00'], rig().deps);
+        const { id } = only();
+        const stuck = rig({ refreshListener: async () => false });
+        expect(await runSchedule(['edit', id, '--at', '10:00'], stuck.deps)).toBe(1);
+        expect(only().when).toEqual({ kind: 'daily', at: '09:00', days: [0, 1, 2, 3, 4, 5, 6] });
+        expect(stuck.err.join('\n')).toContain('older hwip');
+        // A change that keeps the time adds nothing an older listener cannot read.
+        expect(await runSchedule(['edit', id, '--max-runtime', '30m'], rig({ refreshListener: async () => false }).deps)).toBe(0);
+        expect(only().maxRuntimeMin).toBe(30);
     });
 });
 

@@ -125,7 +125,7 @@ import { createLanTransfer, type LanTransfer } from './lan-transfer.js';
 import { createDeviceKeyRegistration, type DeviceKeyRegistration } from './device-presence.js';
 import { PAYLOAD_LIMIT_BYTES, scanAgentCommands, type AgentCommandCatalog, type ScanResult } from './command-scan.js';
 import { hashListenerId, readMachineId, readStickyListenerId, rememberListenerId } from './listener-device-id.js';
-import { createPaneFitter, releaseStaleFits } from './pane-fit.js';
+import { createPaneFitter, macosLastKeyAt, releaseStaleFits } from './pane-fit.js';
 import { log, silenceListenerLog } from './listener-log.js';
 import { invalidateTmuxSocketCache, tmuxArgs } from './tmux-socket.js';
 import {
@@ -773,7 +773,11 @@ const worktreeCleanup = createWorktreeCleanup({
 });
 
 /** Sizes a watched window to its viewer while the phone is its latest user (pane-fit.ts). */
-const paneFitter = createPaneFitter(runTmux);
+const paneFitter = createPaneFitter(runTmux, undefined, macosLastKeyAt());
+/** Test hook. */
+export const resetPaneFitClaims = (): void => paneFitter.forgetClaims();
+/** How often fitted windows are checked for a desktop that took them back; idle windows cost nothing. */
+const PANE_FIT_RECHECK_MS = 1_000;
 
 // ─── Session inventory ──────────────────────────────────────────────
 
@@ -5967,6 +5971,7 @@ export const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
             if (sessionsTimer) { clearInterval(sessionsTimer); sessionsTimer = null; }
             if (commandsTimer) { clearInterval(commandsTimer); commandsTimer = null; }
+            if (paneFitTimer) { clearInterval(paneFitTimer); paneFitTimer = null; }
             if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
             if (stallTimer) { clearInterval(stallTimer); stallTimer = null; }
             if (loopMeterTimer) { clearInterval(loopMeterTimer); loopMeterTimer = null; }
@@ -6007,6 +6012,7 @@ export const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
         // rescan changes it. The rescan has its own slow timer — it reads the
         // filesystem, so it must never ride the 5 s session loop.
         let commandsTimer: ReturnType<typeof setInterval> | null = null;
+        let paneFitTimer: ReturnType<typeof setInterval> | null = null;
         // Per connection, like the inventory gate above: `sock.send` returning
         // is not delivery, and a fingerprint that outlived the socket would let
         // one lost frame leave the server's catalog stale until the user next
@@ -6165,6 +6171,8 @@ export const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             sessionsTimer = setInterval(() => void reportSessions(), SESSION_REPORT_INTERVAL_MS);
             void reportCommands();
             commandsTimer = setInterval(reportCommands, COMMAND_SCAN_INTERVAL_MS);
+            // A desktop key takes a fitted window back within a second, not at the phone's next renew (5 s).
+            paneFitTimer = setInterval(() => paneFitter.recheckAll(), PANE_FIT_RECHECK_MS);
 
             loopSampleAt = Date.now();
             loopMeterTimer = setInterval(() => {

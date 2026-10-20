@@ -45,7 +45,7 @@ vi.mock('child_process', async (importOriginal) => {
     };
 });
 
-const { handleStreamControl, handleCommandInput, stopAllStreams, computeListenerDeviceId } = await import('./listener.js');
+const { handleStreamControl, handleCommandInput, stopAllStreams, computeListenerDeviceId, resetPaneFitClaims } = await import('./listener.js');
 
 describe('stream — a watched window fits the phone while it is the latest user', () => {
     const device = computeListenerDeviceId();
@@ -63,6 +63,7 @@ describe('stream — a watched window fits the phone while it is the latest user
     });
     afterEach(() => {
         stopAllStreams();
+        resetPaneFitClaims();
         vi.useRealTimers();
         vi.restoreAllMocks();
     });

@@ -1,3 +1,5 @@
+import { spawnSync } from 'child_process';
+
 /**
  * Fit a tmux window to the phone that is watching it.
  *
@@ -12,7 +14,11 @@
  * decides its width — the rule tmux's own `window-size latest` follows. The
  * phone uses a window when it types into it ({@link claim}); a client uses it
  * when it attaches or a key is pressed in it, which is what
- * `#{client_activity}` records. Opening the mirror ({@link open}) is a weaker
+ * `#{client_activity}` records. tmux also moves that time on a mouse move
+ * over the window and on a focus change (herdr sends one to a pane whenever
+ * another pane is clicked), which are not using it. Where the time of the
+ * desktop's last key press is known ({@link macosLastKeyAt}), a client counts
+ * as used no later than that key, or than when it attached. Opening the mirror ({@link open}) is a weaker
  * claim: it also covers an automatic resubscribe nobody asked for, so it only
  * takes a window whose desktop has been idle for {@link DESKTOP_IDLE_SECONDS}.
  * While the phone is the later of the two, the
@@ -70,12 +76,81 @@ export const releaseStaleFits = (run: TmuxRun): number => {
     return released;
 };
 
-/** The newest `#{client_activity}` (seconds) among the clients on `target`'s session, or null when unknown. */
-const latestClientUse = (run: TmuxRun, target: string): number | null => {
-    const r = run(['list-clients', '-t', target, '-F', '#{client_activity}']);
+/** When the desktop behind the tmux client `clientPid` last pressed a key, in seconds since the epoch, or null when it cannot tell. */
+export type LastKeyAt = (clientPid: number) => number | null;
+
+/**
+ * The Mac's last key press, from the HID system's own clock (no Input Monitoring permission needed), read
+ * through `osascript` at most once a second and not again for half a minute after a failed read. A client
+ * that came in over SSH types on another machine, so the Mac's clock says nothing about it: null, as off macOS.
+ */
+export const macosLastKeyAt = (
+    now: () => number = () => Date.now(),
+    spawn: typeof spawnSync = spawnSync,
+    platform: NodeJS.Platform = process.platform,
+): LastKeyAt => {
+    let cached: { until: number; keyAt: number | null } | undefined;
+    const remote = new Map<number, boolean>();
+
+    const overSsh = (clientPid: number): boolean => {
+        const known = remote.get(clientPid);
+        if (known !== undefined) return known;
+        let found = false;
+        for (let pid = clientPid, depth = 0; pid > 1 && depth < 32; depth++) {
+            const r = spawn('ps', ['-o', 'ppid=,comm=', '-p', String(pid)], { encoding: 'utf8', timeout: 2000 });
+            const m = r.status === 0 ? /^\s*(\d+)\s+(.*)$/.exec(String(r.stdout).trim()) : null;
+            if (!m) break;
+            if (/(^|\/)sshd\b/.test(m[2])) {
+                found = true;
+                break;
+            }
+            pid = Number(m[1]);
+        }
+        remote.set(clientPid, found);
+        return found;
+    };
+
+    const keyAt = (): number | null => {
+        const readAt = now();
+        if (cached && readAt < cached.until) return cached.keyAt;
+        // kCGEventSourceStateHIDSystemState = 1, kCGEventKeyDown = 10.
+        const r = spawn('osascript', ['-l', 'JavaScript', '-e',
+            "ObjC.import('CoreGraphics'); $.CGEventSourceSecondsSinceLastEventType(1, 10)"],
+        { encoding: 'utf8', timeout: 2000 });
+        const out = String(r.stdout ?? '').trim();
+        const idle = Number(out);
+        const read = r.status === 0 && out !== '' && Number.isFinite(idle) ? Math.floor(readAt / 1000 - idle) : null;
+        // A hung or failing osascript blocks the listener for its timeout: do not ask again soon.
+        cached = { until: now() + (read === null ? 30_000 : 1000), keyAt: read };
+        return read;
+    };
+
+    return (clientPid) => {
+        if (platform !== 'darwin') return null;
+        if (Number.isFinite(clientPid) && overSsh(clientPid)) return null;
+        return keyAt();
+    };
+};
+
+interface Client { activity: number; created: number; pid: number }
+
+/** The clients on `target`'s session, or null when tmux cannot tell. */
+const readClients = (run: TmuxRun, target: string): Client[] | null => {
+    const r = run(['list-clients', '-t', target, '-F', `#{client_activity}${SEP}#{client_created}${SEP}#{client_pid}`]);
     if (r.status !== 0) return null;
-    const uses = r.stdout.split('\n').filter(Boolean).map(Number).filter(Number.isFinite);
-    return uses.length > 0 ? Math.max(...uses) : null;
+    return r.stdout.split('\n').filter(Boolean).flatMap((line) => {
+        const [activity, created, pid] = line.split(SEP).map(Number);
+        return Number.isFinite(activity) ? [{ activity, created: Number.isFinite(created) ? created : 0, pid }] : [];
+    });
+};
+
+/**
+ * When a client was last used (seconds). With the desktop's key clock, its activity counts only up to the last
+ * key press, or when it attached: a mouse move or focus change after the last key is not use.
+ */
+const clientUse = (client: Client, lastKeyAt: LastKeyAt): number => {
+    const keyAt = lastKeyAt(client.pid);
+    return keyAt === null ? client.activity : Math.max(Math.min(client.activity, keyAt), client.created);
 };
 
 const readWindow = (run: TmuxRun, target: string): { attached: number; panes: number; width: number } | null => {
@@ -88,7 +163,7 @@ const readWindow = (run: TmuxRun, target: string): { attached: number; panes: nu
 };
 
 /** `now` is in ms, as `Date.now`; tmux reports client use in whole seconds. */
-export const createPaneFitter = (run: TmuxRun, now: () => number = () => Date.now()) => {
+export const createPaneFitter = (run: TmuxRun, now: () => number = () => Date.now(), lastKeyAt: LastKeyAt = () => null) => {
     const fits = new Map<string, Fit>();
     /** When the phone last typed into and last opened each session, in tmux's seconds. */
     const claims = new Map<string, { typedAt?: number; openedAt?: number }>();
@@ -131,18 +206,30 @@ export const createPaneFitter = (run: TmuxRun, now: () => number = () => Date.no
     const notOurs = (session: string, target: string, win: { attached: number; panes: number }): boolean => {
         if (win.panes !== 1) return true;
         if (win.attached === 0) return false;
-        const clientUse = latestClientUse(run, target);
-        if (clientUse === null) return true;
+        const clients = readClients(run, target);
+        if (!clients || clients.length === 0) return true;
         const claimed = claims.get(session);
-        const typedSince = claimed?.typedAt !== undefined && clientUse < claimed.typedAt;
-        const openedOnIdle = claimed?.openedAt !== undefined && clientUse < claimed.openedAt
-            && seconds() - clientUse >= DESKTOP_IDLE_SECONDS;
-        return !typedSince && !openedOnIdle;
+        const desktops = (use: number): boolean => {
+            const typedSince = claimed?.typedAt !== undefined && use < claimed.typedAt;
+            const openedOnIdle = claimed?.openedAt !== undefined && use < claimed.openedAt
+                && seconds() - use >= DESKTOP_IDLE_SECONDS;
+            return !typedSince && !openedOnIdle;
+        };
+        // A use is never later than the raw activity: when that already leaves the window to the phone, the key
+        // clock (an osascript on macOS) is not read.
+        if (!desktops(Math.max(...clients.map((c) => c.activity)))) return false;
+        return desktops(Math.max(...clients.map((c) => clientUse(c, lastKeyAt))));
     };
 
-    /** The phone left: give the window back and forget its claim. */
+    /**
+     * The phone left: give the window back. When it typed, that is kept: the phone comes and goes (a screen
+     * locks, the app is left a moment, the mirror resubscribes), and on its return it is still the latest user
+     * unless the desktop was used since — the same test a renew applies.
+     */
     const release = (session: string): void => {
-        claims.delete(session);
+        const typedAt = claims.get(session)?.typedAt;
+        if (typedAt === undefined) claims.delete(session);
+        else claims.set(session, { typedAt });
         unfit(session);
     };
 
@@ -184,6 +271,11 @@ export const createPaneFitter = (run: TmuxRun, now: () => number = () => Date.no
         if (win && notOurs(session, held.target, win)) unfit(session);
     };
 
+    /** {@link recheck} every fitted window: a desktop key is answered within a tick, not a renew. */
+    const recheckAll = (): void => {
+        for (const session of [...fits.keys()]) recheck(session);
+    };
+
     /** Whether `session`'s window is fitted — at `cols`, when given. */
     const fitted = (session: string, cols?: unknown): boolean => {
         const held = fits.get(session);
@@ -191,5 +283,8 @@ export const createPaneFitter = (run: TmuxRun, now: () => number = () => Date.no
         return cols === undefined || held.cols === clampViewerCols(cols);
     };
 
-    return { fit, recheck, claim, open, release, fitted };
+    /** Test hook: forget every claim, as a new listener starts with none. */
+    const forgetClaims = (): void => claims.clear();
+
+    return { fit, recheck, recheckAll, claim, open, release, fitted, forgetClaims };
 };

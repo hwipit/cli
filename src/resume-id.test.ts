@@ -13,7 +13,7 @@ const deps = (rows?: unknown[]) => ({ rows, startTimes: new Map([[100, PANE_STAR
 
 describe('paneSince', () => {
     it('is the earliest process start less the tolerance, null with none known', () => {
-        expect(paneSince(90, deps())).toBe(PANE_START - 10_000);
+        expect(paneSince(90, deps())).toBe(PANE_START - 2_000);
         expect(paneSince(90, { startTimes: new Map(), descendants: new Set([90]) })).toBeNull();
     });
 });
@@ -39,6 +39,10 @@ describe('transcriptIdSince', () => {
 
     it('is null for a file last written before the pane started — a fresh start, not a resume', () => {
         expect(transcriptIdSince(file('old.jsonl', PANE_START - 60_000), PANE_START)).toBeNull();
+    });
+
+    it('is null for the last sitting\'s final write seconds before a fresh start', () => {
+        expect(transcriptIdSince(file('just-exited.jsonl', PANE_START - 5_000), paneSince(90, deps()))).toBeNull();
     });
 
     it('is null for no file, a gone file, or no known start', () => {

@@ -734,7 +734,14 @@ export const pickRowByProcStart = <T>(
 };
 
 /**
- * From when a conversation written to is this pane's: its earliest process start, less the match tolerance. A
+ * How far before the pane's start a write may land and still be the pane's: `ps` `lstart` is whole seconds. Not
+ * {@link PROC_MATCH_TOLERANCE_MS} — the last sitting's final write lands seconds before an `exit` and a fresh
+ * start, and a margin that wide would read the fresh pane as carrying it on.
+ */
+const PANE_WRITE_MARGIN_MS = 2_000;
+
+/**
+ * From when a conversation written to is this pane's: its earliest process start, less {@link PANE_WRITE_MARGIN_MS}. A
  * resume writes to the conversation it picked back up, so that one is written to after the start; a fresh start
  * has not written yet, so the folder's older conversations are all before it. Null when no start is known.
  */
@@ -743,7 +750,7 @@ export const paneSince = (panePid: number, deps: StoreResolveDeps = {}): number 
     const starts = [...(deps.descendants ?? collectDescendantPids(panePid))]
         .map((pid) => startTimes.get(pid))
         .filter((t): t is number => t !== undefined && Number.isFinite(t));
-    return starts.length === 0 ? null : Math.min(...starts) - PROC_MATCH_TOLERANCE_MS;
+    return starts.length === 0 ? null : Math.min(...starts) - PANE_WRITE_MARGIN_MS;
 };
 
 /**
@@ -889,6 +896,7 @@ export const detectHermesResumeId = (
     const since = paneSince(panePid, deps);
     if (since === null) return null;
     let best: HermesActiveRow | null = null;
+    // The query's own columns; each is checked with typeof below before it is used.
     for (const row of raw as HermesActiveRow[]) {
         if (row.cwd !== paneCwd || typeof row.id !== 'string' || !row.id) continue;
         if (typeof row.active !== 'number' || row.active * 1_000 < since) continue;

@@ -772,7 +772,7 @@ const worktreeCleanup = createWorktreeCleanup({
     tmux: (args, timeoutMs) => tmuxRun(tmuxArgs(args), timeoutMs),
 });
 
-/** Sizes a watched detached window to its viewer (pane-fit.ts). */
+/** Sizes a watched window to its viewer while the phone is its latest user (pane-fit.ts). */
 const paneFitter = createPaneFitter(runTmux);
 
 // ─── Session inventory ──────────────────────────────────────────────
@@ -2739,9 +2739,9 @@ const leaseFor = (renewing: boolean): number => (renewing ? STREAM_LEASE_MS : ST
  * Live mirrors, one per (session, viewing device): every viewer keeps the whole of the machinery a
  * single viewer had — its own capture loop state, lease, nonce, epoch and seq, sealed frames — so
  * two devices watching one pane do not take each other's stream over. A viewer with no device id
- * (a web tab) shares the empty slot, one at a time, as before. The tmux pane is shared: its width
- * is whatever the last viewer to send input or `cols` asked for (pane-fit.ts), and every viewer
- * receives the pane at that width.
+ * (a web tab) shares the empty slot, one at a time, as before. The tmux pane is shared: while the
+ * phone is its latest user its width is whatever the last viewer to send input or `cols` asked for,
+ * and a desktop client used since takes it back (pane-fit.ts); every viewer receives the pane at that width.
  */
 const activeStreams = new Map<string, ActiveStream>();
 

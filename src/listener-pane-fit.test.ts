@@ -1,8 +1,9 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 
-// A detached window a phone starts watching is sized to the phone, and gets
-// its width back when the phone leaves. tmux is faked: the window's width and
-// attached-client count are the only state the contract turns on.
+// A window a phone watches is sized to the phone while the phone is its latest
+// user, and gets its width back when the phone leaves or a desktop client is
+// used. tmux is faked: the window's width, attached-client count and client
+// activity are the only state the contract turns on.
 const FIELD_SEP = '␟';
 const SESSION = 'hwip-a';
 /** `activity`: each attached client's `#{client_activity}`, in seconds. */
@@ -46,7 +47,7 @@ vi.mock('child_process', async (importOriginal) => {
 
 const { handleStreamControl, handleCommandInput, stopAllStreams, computeListenerDeviceId } = await import('./listener.js');
 
-describe('stream — a watched detached window fits the phone', () => {
+describe('stream — a watched window fits the phone while it is the latest user', () => {
     const device = computeListenerDeviceId();
     const control = (subtype: string, extra: Record<string, unknown> = {}) =>
         handleStreamControl({ subtype, targetDeviceId: device, sessionName: SESSION, renew: true, ...extra }, () => {});

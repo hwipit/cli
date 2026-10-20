@@ -1,11 +1,13 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 
-// A detached window a phone starts watching is sized to the phone, and gets
-// its width back when the phone leaves. tmux is faked: the window's width and
-// attached-client count are the only state the contract turns on.
+// A window a phone watches is sized to the phone while the phone is its latest
+// user, and gets its width back when the phone leaves or a desktop client is
+// used. tmux is faked: the window's width, attached-client count and client
+// activity are the only state the contract turns on.
 const FIELD_SEP = '␟';
 const SESSION = 'hwip-a';
-const win = { attached: 0, width: 120 };
+/** `activity`: each attached client's `#{client_activity}`, in seconds. */
+const win: { attached: number; width: number; activity: number[] } = { attached: 0, width: 120, activity: [] };
 const tmuxCalls: string[][] = [];
 
 const fakeTmux = (args: readonly string[]) => {
@@ -27,6 +29,8 @@ const fakeTmux = (args: readonly string[]) => {
         win.width = Number(a[a.indexOf('-x') + 1]);
         return { status: 0, stdout: '', stderr: '' };
     }
+    if (a[0] === 'list-clients') return { status: 0, stdout: win.activity.map((t) => `${t}\n`).join(''), stderr: '' };
+    if (a[0] === 'send-keys') return { status: 0, stdout: '', stderr: '' };
     if (a[0] === 'capture-pane') return { status: 0, stdout: 'idle pane\n', stderr: '' };
     if (a[0] === 'set-option' || a[0] === 'list-sessions') return { status: 0, stdout: '', stderr: '' };
     return { status: 1, stdout: '', stderr: '' };
@@ -41,9 +45,9 @@ vi.mock('child_process', async (importOriginal) => {
     };
 });
 
-const { handleStreamControl, stopAllStreams, computeListenerDeviceId } = await import('./listener.js');
+const { handleStreamControl, handleCommandInput, stopAllStreams, computeListenerDeviceId } = await import('./listener.js');
 
-describe('stream — a watched detached window fits the phone', () => {
+describe('stream — a watched window fits the phone while it is the latest user', () => {
     const device = computeListenerDeviceId();
     const control = (subtype: string, extra: Record<string, unknown> = {}) =>
         handleStreamControl({ subtype, targetDeviceId: device, sessionName: SESSION, renew: true, ...extra }, () => {});
@@ -54,6 +58,7 @@ describe('stream — a watched detached window fits the phone', () => {
         vi.spyOn(console, 'log').mockImplementation(() => {});
         win.attached = 0;
         win.width = 120;
+        win.activity = [];
         tmuxCalls.length = 0;
     });
     afterEach(() => {
@@ -86,6 +91,96 @@ describe('stream — a watched detached window fits the phone', () => {
         control('agent.stream.renew', { cols: 80 });
         expect(resizes()).toEqual(['45', '80']);
         expect(tmuxCalls.at(-2)).toEqual(['set-option', '-w', '-u', '-t', '%0', 'window-size']);
+    });
+
+    it('fits an attached session the desktop has not used since the phone opened it', () => {
+        vi.setSystemTime(1_000_000_000);
+        win.attached = 1;
+        win.activity = [999_000];
+        control('agent.stream.start', { cols: 45 });
+        expect(resizes()).toEqual(['45']);
+    });
+
+    it('phone input takes the width back after the desktop used the session', () => {
+        vi.setSystemTime(1_000_000_000);
+        win.attached = 1;
+        win.activity = [999_000];
+        control('agent.stream.start', { cols: 45 });
+
+        // A key pressed on the desktop: the next renew hands the window to tmux, which sizes it to the client.
+        win.activity = [1_000_002];
+        vi.setSystemTime(1_000_005_000);
+        control('agent.stream.renew', { cols: 45 });
+        expect(tmuxCalls).toContainEqual(['set-option', '-w', '-u', '-t', '%0', 'window-size']);
+        win.width = 120;
+
+        vi.setSystemTime(1_000_010_000);
+        handleCommandInput({ subtype: 'agent.command.input', targetDeviceId: device, sessionName: SESSION, seq: 1, epoch: 1, keys: ['down'] }, () => {});
+        expect(resizes()).toEqual(['45', '45']);
+        expect(win.width).toBe(45);
+    });
+
+    it('reopening the mirror takes the width back once the desktop has been idle a minute', () => {
+        vi.setSystemTime(1_000_000_000);
+        win.attached = 1;
+        win.activity = [999_000];
+        control('agent.stream.start', { cols: 45 });
+        win.activity = [1_000_002];
+        vi.setSystemTime(1_000_005_000);
+        control('agent.stream.renew', { cols: 45 });
+        win.width = 120;
+
+        // An automatic resubscribe seconds after a desktop key press must not shrink the desktop.
+        vi.setSystemTime(1_000_010_000);
+        control('agent.stream.start', { cols: 45 });
+        expect(resizes()).toEqual(['45']);
+
+        vi.setSystemTime(1_000_062_000);
+        control('agent.stream.renew', { cols: 45 });
+        expect(resizes()).toEqual(['45', '45']);
+    });
+
+    it('hands the window back on a renew that keeps the width while several phones watch', () => {
+        vi.setSystemTime(1_000_000_000);
+        win.attached = 1;
+        win.activity = [999_000];
+        control('agent.stream.start', { cols: 45, deviceId: 'phone-a' });
+        control('agent.stream.start', { cols: 45, deviceId: 'phone-b' });
+        const unsets = () => tmuxCalls.filter((c) => c[0] === 'set-option' && c.includes('window-size')).length;
+        expect(unsets()).toBe(0);
+
+        win.activity = [1_000_002];
+        vi.setSystemTime(1_000_005_000);
+        control('agent.stream.renew', { cols: 45, deviceId: 'phone-a' });
+        expect(unsets()).toBe(1);
+    });
+
+    it('a reconnect right after phone input keeps the phone width', () => {
+        vi.setSystemTime(1_000_000_000);
+        win.attached = 1;
+        win.activity = [999_000];
+        control('agent.stream.start', { cols: 45 });
+        win.activity = [1_000_002];
+        vi.setSystemTime(1_000_005_000);
+        control('agent.stream.renew', { cols: 45 });
+        win.width = 120;
+        vi.setSystemTime(1_000_010_000);
+        handleCommandInput({ subtype: 'agent.command.input', targetDeviceId: device, sessionName: SESSION, seq: 1, epoch: 1, keys: ['down'] }, () => {});
+        const unsets = () => tmuxCalls.filter((c) => c[0] === 'set-option' && c.includes('window-size')).length;
+        const before = unsets();
+
+        vi.setSystemTime(1_000_015_000);
+        control('agent.stream.start', { cols: 45 });
+        expect(unsets()).toBe(before);
+        expect(win.width).toBe(45);
+    });
+
+    it('input from a phone at another width sizes the window to that phone', () => {
+        control('agent.stream.start', { cols: 45, deviceId: 'phone-a' });
+        control('agent.stream.start', { cols: 80, deviceId: 'phone-b' });
+        handleCommandInput({ subtype: 'agent.command.input', targetDeviceId: device, sessionName: SESSION, seq: 1, epoch: 1, deviceId: 'phone-a', keys: ['down'] }, () => {});
+
+        expect(resizes()).toEqual(['45', '80', '45']);
     });
 
     it('resizes nothing for a viewer that sends no width', () => {

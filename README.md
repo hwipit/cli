@@ -432,17 +432,22 @@ block here.
    hwip sh --detach     # create it, print its name, exit
    ```
 
-   **The mirror fits a detached session to the phone.** A pane is as wide
-   as the terminal that last drew it, so a desktop's prompt rules and
-   right-aligned clocks fold in two on a phone. While the phone watches a
-   session no terminal is attached to (a `hwip sh --detach` shell, or an
-   agent whose terminal you closed), the listener resizes its window to the
-   phone's width and gives the old width back when the phone leaves. An
-   attached session keeps its size: shrinking it would shrink your desktop
-   terminal, so the phone wraps those rows instead. A window split into
-   panes is never resized, and one a terminal attaches to while the phone
-   watches is handed back within a renew (5 s). A listener that died while
-   a window was fitted restores it the next time it starts.
+   **The mirror fits a session to the phone.** A pane is as wide as the
+   terminal that last drew it, so a desktop's prompt rules and
+   right-aligned clocks fold in two on a phone. Whoever used the session
+   last decides its width, the way tmux's `window-size latest` does: typing
+   from the phone makes the phone the latest user, and the listener resizes
+   the window to the phone's width. Opening the mirror does the same once
+   the desktop terminal has been idle for a minute, so a phone reconnecting
+   on its own never shrinks a terminal you are typing in. Pressing a key in
+   (or attaching) a desktop terminal makes it the latest user, and within a
+   renew (5 s) the window is handed back to tmux, which sizes it to that
+   terminal. While the phone holds a session, a desktop terminal still
+   attached to it shows it narrower. When the phone leaves, a session no
+   terminal is attached to gets its old width back and an attached one is
+   sized to its terminal. A window split into panes is never resized. A
+   listener that died while a window was fitted restores it the next time
+   it starts.
 
    `hwip cursor` runs **`cursor-agent`**, Cursor's terminal agent — a
    separate install from the Cursor IDE (the bare `cursor` on your PATH

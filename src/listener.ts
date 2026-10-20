@@ -772,7 +772,7 @@ const worktreeCleanup = createWorktreeCleanup({
     tmux: (args, timeoutMs) => tmuxRun(tmuxArgs(args), timeoutMs),
 });
 
-/** Sizes a watched detached window to its viewer (pane-fit.ts). */
+/** Sizes a watched window to its viewer while the phone is its latest user (pane-fit.ts). */
 const paneFitter = createPaneFitter(runTmux);
 
 // ─── Session inventory ──────────────────────────────────────────────
@@ -2739,9 +2739,9 @@ const leaseFor = (renewing: boolean): number => (renewing ? STREAM_LEASE_MS : ST
  * Live mirrors, one per (session, viewing device): every viewer keeps the whole of the machinery a
  * single viewer had — its own capture loop state, lease, nonce, epoch and seq, sealed frames — so
  * two devices watching one pane do not take each other's stream over. A viewer with no device id
- * (a web tab) shares the empty slot, one at a time, as before. The tmux pane is shared: its width
- * is whatever the last viewer to send input or `cols` asked for (pane-fit.ts), and every viewer
- * receives the pane at that width.
+ * (a web tab) shares the empty slot, one at a time, as before. The tmux pane is shared: while the
+ * phone is its latest user its width is whatever the last viewer to send input or `cols` asked for,
+ * and a desktop client used since takes it back (pane-fit.ts); every viewer receives the pane at that width.
  */
 const activeStreams = new Map<string, ActiveStream>();
 
@@ -3397,6 +3397,8 @@ export const handleStreamControl = (
             entry.cols = req.cols;
             const renewTarget = tmuxTargetFor(req.sessionName);
             if (renewTarget !== null && (colsChanged || streamsOf(req.sessionName).length === 1)) paneFitter.fit(req.sessionName, renewTarget, req.cols);
+            // Otherwise keep the width the pane has, but still notice a desktop client used since (pane-fit.ts).
+            else paneFitter.recheck(req.sessionName);
             return true;
         }
         // Addressed to us but we hold no such stream: it was reaped (lost
@@ -3437,6 +3439,8 @@ export const handleStreamControl = (
         return true;
     }
     const fitTarget = tmuxTargetFor(sessionName);
+    // Opening the mirror (or resubscribing) takes the width only from an idle desktop (pane-fit.ts).
+    paneFitter.open(sessionName);
     if (fitTarget !== null) paneFitter.fit(sessionName, fitTarget, req.cols);
     let lastContent: string | null = null;
     // The cursor's last reported place, as `line,col`. Part of the diff-gate
@@ -3907,6 +3911,21 @@ const deliverInput = (input: PendingInput): void => {
     // instead of falling back to the REST push path.
     // Only a reason that does not depend on the text: this input may be sealed.
     if (!injected) input.send(streamErrorFrame(input.sessionName, 'input_rejected', input, reason && isSessionStateRefusal(reason) ? reason : undefined));
+    else takeWidthBack(input.sessionName, input.deviceId);
+};
+
+/**
+ * Typing from the phone makes it the session's latest user again (pane-fit.ts): a window a desktop
+ * client took back is sized to the sender's width once more.
+ */
+const takeWidthBack = (sessionName: string, deviceId: string | undefined): void => {
+    paneFitter.claim(sessionName);
+    const viewer = activeStreams.get(streamKey(sessionName, deviceId)) ?? streamsOf(sessionName)[0];
+    // Already at the sender's width: the claim is enough, and a keystroke costs no tmux round trip (renew rechecks).
+    if (!viewer || paneFitter.fitted(sessionName, viewer.cols)) return;
+    const target = tmuxTargetFor(sessionName);
+    if (target === null) return;
+    paneFitter.fit(sessionName, target, viewer.cols);
 };
 
 /** Ceiling on concurrent sender lanes. The lane key includes a relay-stamped

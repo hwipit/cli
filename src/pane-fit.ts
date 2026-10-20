@@ -76,46 +76,81 @@ export const releaseStaleFits = (run: TmuxRun): number => {
     return released;
 };
 
-/** When the desktop last pressed a key, in seconds since the epoch, or null when it cannot tell. */
-export type LastKeyAt = () => number | null;
+/** When the desktop behind the tmux client `clientPid` last pressed a key, in seconds since the epoch, or null when it cannot tell. */
+export type LastKeyAt = (clientPid: number) => number | null;
 
 /**
- * The Mac's last key press, from the HID system's own clock (no Input Monitoring permission needed). Read
- * through `osascript`, at most once a second; null off macOS or when the read fails.
+ * The Mac's last key press, from the HID system's own clock (no Input Monitoring permission needed), read
+ * through `osascript` at most once a second and not again for half a minute after a failed read. A client
+ * that came in over SSH types on another machine, so the Mac's clock says nothing about it: null, as off macOS.
  */
-export const macosLastKeyAt = (now: () => number = () => Date.now()): LastKeyAt => {
-    let cached: { readAt: number; keyAt: number | null } | undefined;
-    return () => {
-        if (process.platform !== 'darwin') return null;
+export const macosLastKeyAt = (
+    now: () => number = () => Date.now(),
+    spawn: typeof spawnSync = spawnSync,
+    platform: NodeJS.Platform = process.platform,
+): LastKeyAt => {
+    let cached: { until: number; keyAt: number | null } | undefined;
+    const remote = new Map<number, boolean>();
+
+    const overSsh = (clientPid: number): boolean => {
+        const known = remote.get(clientPid);
+        if (known !== undefined) return known;
+        let found = false;
+        for (let pid = clientPid, depth = 0; pid > 1 && depth < 32; depth++) {
+            const r = spawn('ps', ['-o', 'ppid=,comm=', '-p', String(pid)], { encoding: 'utf8', timeout: 2000 });
+            const m = r.status === 0 ? /^\s*(\d+)\s+(.*)$/.exec(String(r.stdout).trim()) : null;
+            if (!m) break;
+            if (/(^|\/)sshd\b/.test(m[2])) {
+                found = true;
+                break;
+            }
+            pid = Number(m[1]);
+        }
+        remote.set(clientPid, found);
+        return found;
+    };
+
+    const keyAt = (): number | null => {
         const readAt = now();
-        if (cached && readAt - cached.readAt < 1000) return cached.keyAt;
+        if (cached && readAt < cached.until) return cached.keyAt;
         // kCGEventSourceStateHIDSystemState = 1, kCGEventKeyDown = 10.
-        const r = spawnSync('osascript', ['-l', 'JavaScript', '-e',
+        const r = spawn('osascript', ['-l', 'JavaScript', '-e',
             "ObjC.import('CoreGraphics'); $.CGEventSourceSecondsSinceLastEventType(1, 10)"],
         { encoding: 'utf8', timeout: 2000 });
-        const idle = Number(r.stdout);
-        const keyAt = r.status === 0 && r.stdout.trim() !== '' && Number.isFinite(idle) ? Math.floor((readAt / 1000) - idle) : null;
-        cached = { readAt, keyAt };
-        return keyAt;
+        const out = String(r.stdout ?? '').trim();
+        const idle = Number(out);
+        const read = r.status === 0 && out !== '' && Number.isFinite(idle) ? Math.floor(readAt / 1000 - idle) : null;
+        // A hung or failing osascript blocks the listener for its timeout: do not ask again soon.
+        cached = { until: now() + (read === null ? 30_000 : 1000), keyAt: read };
+        return read;
+    };
+
+    return (clientPid) => {
+        if (platform !== 'darwin') return null;
+        if (Number.isFinite(clientPid) && overSsh(clientPid)) return null;
+        return keyAt();
     };
 };
 
-/**
- * When a client on `target`'s session was last used (seconds), the newest among them, or null when unknown.
- * With `lastKeyAt`, a client's activity counts only up to the desktop's last key press, or when it attached:
- * a mouse move or focus change after the last key is not use.
- */
-const latestClientUse = (run: TmuxRun, target: string, lastKeyAt: LastKeyAt): number | null => {
-    const r = run(['list-clients', '-t', target, '-F', `#{client_activity}${SEP}#{client_created}`]);
+interface Client { activity: number; created: number; pid: number }
+
+/** The clients on `target`'s session, or null when tmux cannot tell. */
+const readClients = (run: TmuxRun, target: string): Client[] | null => {
+    const r = run(['list-clients', '-t', target, '-F', `#{client_activity}${SEP}#{client_created}${SEP}#{client_pid}`]);
     if (r.status !== 0) return null;
-    const keyAt = lastKeyAt();
-    const uses = r.stdout.split('\n').filter(Boolean).flatMap((line) => {
-        const [activity, created] = line.split(SEP).map(Number);
-        if (!Number.isFinite(activity)) return [];
-        if (keyAt === null) return [activity];
-        return [Math.max(Math.min(activity, keyAt), Number.isFinite(created) ? created : 0)];
+    return r.stdout.split('\n').filter(Boolean).flatMap((line) => {
+        const [activity, created, pid] = line.split(SEP).map(Number);
+        return Number.isFinite(activity) ? [{ activity, created: Number.isFinite(created) ? created : 0, pid }] : [];
     });
-    return uses.length > 0 ? Math.max(...uses) : null;
+};
+
+/**
+ * When a client was last used (seconds). With the desktop's key clock, its activity counts only up to the last
+ * key press, or when it attached: a mouse move or focus change after the last key is not use.
+ */
+const clientUse = (client: Client, lastKeyAt: LastKeyAt): number => {
+    const keyAt = lastKeyAt(client.pid);
+    return keyAt === null ? client.activity : Math.max(Math.min(client.activity, keyAt), client.created);
 };
 
 const readWindow = (run: TmuxRun, target: string): { attached: number; panes: number; width: number } | null => {
@@ -171,13 +206,19 @@ export const createPaneFitter = (run: TmuxRun, now: () => number = () => Date.no
     const notOurs = (session: string, target: string, win: { attached: number; panes: number }): boolean => {
         if (win.panes !== 1) return true;
         if (win.attached === 0) return false;
-        const clientUse = latestClientUse(run, target, lastKeyAt);
-        if (clientUse === null) return true;
+        const clients = readClients(run, target);
+        if (!clients || clients.length === 0) return true;
         const claimed = claims.get(session);
-        const typedSince = claimed?.typedAt !== undefined && clientUse < claimed.typedAt;
-        const openedOnIdle = claimed?.openedAt !== undefined && clientUse < claimed.openedAt
-            && seconds() - clientUse >= DESKTOP_IDLE_SECONDS;
-        return !typedSince && !openedOnIdle;
+        const desktops = (use: number): boolean => {
+            const typedSince = claimed?.typedAt !== undefined && use < claimed.typedAt;
+            const openedOnIdle = claimed?.openedAt !== undefined && use < claimed.openedAt
+                && seconds() - use >= DESKTOP_IDLE_SECONDS;
+            return !typedSince && !openedOnIdle;
+        };
+        // A use is never later than the raw activity: when that already leaves the window to the phone, the key
+        // clock (an osascript on macOS) is not read.
+        if (!desktops(Math.max(...clients.map((c) => c.activity)))) return false;
+        return desktops(Math.max(...clients.map((c) => clientUse(c, lastKeyAt))));
     };
 
     /** The phone left: give the window back and forget its claim. */
@@ -224,6 +265,11 @@ export const createPaneFitter = (run: TmuxRun, now: () => number = () => Date.no
         if (win && notOurs(session, held.target, win)) unfit(session);
     };
 
+    /** {@link recheck} every fitted window: a desktop key is answered within a tick, not a renew. */
+    const recheckAll = (): void => {
+        for (const session of [...fits.keys()]) recheck(session);
+    };
+
     /** Whether `session`'s window is fitted — at `cols`, when given. */
     const fitted = (session: string, cols?: unknown): boolean => {
         const held = fits.get(session);
@@ -231,5 +277,5 @@ export const createPaneFitter = (run: TmuxRun, now: () => number = () => Date.no
         return cols === undefined || held.cols === clampViewerCols(cols);
     };
 
-    return { fit, recheck, claim, open, release, fitted };
+    return { fit, recheck, recheckAll, claim, open, release, fitted };
 };

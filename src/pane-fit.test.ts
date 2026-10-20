@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { clampViewerCols, createPaneFitter, releaseStaleFits, type TmuxRun } from './pane-fit.js';
+import { clampViewerCols, createPaneFitter, macosLastKeyAt, releaseStaleFits, type TmuxRun } from './pane-fit.js';
 
 const SEP = '␟';
 
@@ -86,6 +86,54 @@ describe('createPaneFitter', () => {
             fitter.fit('s', 's', 45);
 
             expect(fitter.fitted('s')).toBe(false);
+        });
+
+        it('a client attached over SSH reclaims the window by typing, which the Mac key clock cannot see', () => {
+            const { t, fitter } = setup(1005, 950);
+            t.win.clients = [`1005${SEP}800${SEP}77`];
+            const remote = createPaneFitter(t.run, () => 1_010_000, (pid) => (pid === 77 ? null : 950));
+            remote.claim('s');
+            t.win.clients = [`900${SEP}800${SEP}77`];
+            remote.fit('s', 's', 45);
+            t.win.clients = [`1011${SEP}800${SEP}77`];
+            remote.fit('s', 's', 45);
+
+            expect(remote.fitted('s')).toBe(false);
+            expect(fitter.fitted('s')).toBe(true);
+        });
+
+        it('does not read the key clock while no desktop client moved since the phone typed', () => {
+            const t = fakeTmux({ attached: 1, panes: 1, width: 120, clients: [`900${SEP}800`] });
+            let reads = 0;
+            const fitter = createPaneFitter(t.run, fakeClock(1000).now, () => { reads++; return 950; });
+            fitter.claim('s');
+            fitter.fit('s', 's', 45);
+            fitter.recheck('s');
+
+            expect(fitter.fitted('s')).toBe(true);
+            expect(reads).toBe(0);
+        });
+
+        it('rechecks every fitted window at once, handing back only the one the desktop typed in', () => {
+            const t = fakeTmux({ attached: 1, panes: 1, width: 120 });
+            const activity: Record<string, number> = { a: 900, b: 900 };
+            const run: TmuxRun = (args) => (args[0] === 'list-clients'
+                ? { status: 0, stdout: `${activity[args[args.indexOf('-t') + 1]]}${SEP}800\n` }
+                : t.run(args));
+            const clock = fakeClock(1000);
+            const key = { at: 950 };
+            const fitter = createPaneFitter(run, clock.now, () => key.at);
+            for (const s of ['a', 'b']) {
+                fitter.claim(s);
+                fitter.fit(s, s, 45);
+            }
+            clock.seconds = 1003;
+            key.at = 1002;
+            activity.a = 1002;
+            fitter.recheckAll();
+
+            expect(fitter.fitted('a')).toBe(false);
+            expect(fitter.fitted('b')).toBe(true);
         });
 
         it('opening takes a window whose desktop only moved the mouse within the last minute', () => {
@@ -358,5 +406,67 @@ describe('releaseStaleFits', () => {
 
     it('does nothing without a tmux server', () => {
         expect(releaseStaleFits(() => ({ status: 1, stdout: '' }))).toBe(0);
+    });
+});
+
+describe('macosLastKeyAt', () => {
+    type Spawn = NonNullable<Parameters<typeof macosLastKeyAt>[1]>;
+    /** `ps` answers from `tree` (pid → [ppid, command]); `osascript` from `idle`. */
+    const fakeSpawn = (idle: { status: number | null; stdout: string }, tree: Record<number, [number, string]> = {}) => {
+        const calls: string[] = [];
+        const spawn = ((cmd: string, args: readonly string[]) => {
+            calls.push(cmd);
+            if (cmd === 'ps') {
+                const node = tree[Number(args[args.length - 1])];
+                return node ? { status: 0, stdout: `${node[0]} ${node[1]}\n` } : { status: 1, stdout: '' };
+            }
+            return idle;
+        }) as unknown as Spawn;
+        return { spawn, calls };
+    };
+    const clock = { ms: 1_000_000 };
+    const now = () => clock.ms;
+
+    it('reads when a key was last pressed, once a second', () => {
+        clock.ms = 1_000_000;
+        const s = fakeSpawn({ status: 0, stdout: '3.5\n' }, { 10: [1, 'login'] });
+        const keyAt = macosLastKeyAt(now, s.spawn, 'darwin');
+
+        expect(keyAt(10)).toBe(996);
+        clock.ms += 500;
+        expect(keyAt(10)).toBe(996);
+        expect(s.calls.filter((c) => c === 'osascript')).toHaveLength(1);
+        clock.ms += 1000;
+        keyAt(10);
+        expect(s.calls.filter((c) => c === 'osascript')).toHaveLength(2);
+    });
+
+    it('knows nothing off macOS', () => {
+        const s = fakeSpawn({ status: 0, stdout: '1\n' });
+        expect(macosLastKeyAt(now, s.spawn, 'linux')(10)).toBeNull();
+        expect(s.calls).toEqual([]);
+    });
+
+    it('knows nothing for a client that came in over SSH, and asks the process tree once per client', () => {
+        const s = fakeSpawn({ status: 0, stdout: '1\n' }, { 20: [19, 'tmux'], 19: [18, '-zsh'], 18: [1, '/usr/sbin/sshd']});
+        const keyAt = macosLastKeyAt(now, s.spawn, 'darwin');
+
+        expect(keyAt(20)).toBeNull();
+        const asked = s.calls.length;
+        expect(keyAt(20)).toBeNull();
+        expect(s.calls).toHaveLength(asked);
+    });
+
+    it('backs off for half a minute after osascript fails or says nothing', () => {
+        clock.ms = 1_000_000;
+        for (const idle of [{ status: null, stdout: '' }, { status: 0, stdout: '' }, { status: 0, stdout: 'x' }]) {
+            const s = fakeSpawn(idle, { 10: [1, 'login'] });
+            const keyAt = macosLastKeyAt(now, s.spawn, 'darwin');
+            expect(keyAt(10)).toBeNull();
+            clock.ms += 20_000;
+            keyAt(10);
+            expect(s.calls.filter((c) => c === 'osascript')).toHaveLength(1);
+            clock.ms += 20_000;
+        }
     });
 });

@@ -159,8 +159,12 @@ export const recallRun = (
 /** tmux sessions remembered per run: an `exit` and `-c` every few minutes all day stays a short list. */
 export const MAX_TMUX_RUNS_PER_RUN = 10;
 
-/** Agents whose own resume is measured to keep the conversation id: Claude Code 2.1.300's `-c` does. */
-const CONTINUING_KINDS: ReadonlySet<string> = new Set(['claude']);
+/**
+ * Agents whose own resume is measured to keep the conversation id: Claude Code 2.1.300's `-c`, opencode 2.0.29's
+ * `-c`, pi 1.2.0's `-c`, Codex 0.163.0's `resume --last`, Gemini 0.46.0's `--resume latest` and Hermes 0.20.0's
+ * `-c` (2026-10-20). Cursor's was not measured (signed out) and the others are not installed here.
+ */
+const CONTINUING_KINDS: ReadonlySet<string> = new Set(['claude', 'opencode', 'pi', 'codex', 'gemini', 'hermes']);
 
 /**
  * Which run the tmux session `tmuxRunId` of `name` is (hwip docs/session-runs.md §3).

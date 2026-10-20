@@ -87,6 +87,25 @@ describe('Hermes store, read for real', () => {
         const { detectHermesSessionName } = await import('./remote-agents.js');
         expect(detectHermesSessionName(TMP, process.pid)).toBeNull();
     });
+
+    it('finds the session `-c` carried on by its last message, not its start', async () => {
+        const started = await ownProcStart();
+        const db = join(TMP, '.hermes', 'state.db');
+        mkdirSync(join(TMP, '.hermes'), { recursive: true });
+        sqlite(db, HERMES_SCHEMA);
+        // hermes 0.20.0's columns this read touches.
+        sqlite(db, 'CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, timestamp REAL NOT NULL);');
+        sqlite(db, `INSERT INTO sessions (id, source, started_at, cwd) VALUES
+            ('20261020_171203_c60148', 'cli', ${started / 1_000 - 86_400}, '${TMP}'),
+            ('20261019_090000_aaaaaa', 'cli', ${started / 1_000 - 3_600}, '${TMP}');
+            INSERT INTO messages (session_id, timestamp) VALUES
+            ('20261020_171203_c60148', ${started / 1_000 - 86_000}),
+            ('20261020_171203_c60148', ${started / 1_000 + 1}),
+            ('20261019_090000_aaaaaa', ${started / 1_000 - 3_500});`);
+
+        const { detectHermesResumeId } = await import('./remote-agents.js');
+        expect(detectHermesResumeId(TMP, process.pid)).toBe('20261020_171203_c60148');
+    });
 });
 
 // opencode 2.0.24's own `CREATE TABLE`s (`.schema`, this machine, 2026-10-10).

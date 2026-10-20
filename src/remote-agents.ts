@@ -19,6 +19,7 @@ import { join, basename, resolve } from 'path';
 import { spawnSync } from 'child_process';
 import { projectTranscriptEntries, type TranscriptProjector, type TranscriptReader } from './transcript-tail.js';
 import { projectPiEntries } from './pi-transcript.js';
+import { createTailWatch, latestClaudeAiTitle, piNamesStep, type ProviderName } from './session-title.js';
 import { projectCodexEntries } from './codex-transcript.js';
 import { projectGeminiEntries } from './gemini-transcript.js';
 import { opencodeDbPath, opencodeSourcePath, OPENCODE_SESSION_ID, projectOpencodeEntries, readOpencodeTranscript } from './opencode-transcript.js';
@@ -80,8 +81,11 @@ export interface RemoteAgent {
      * carries this only once that agent's name store is confirmed. Cursor and
      * Gemini never will — their state files hold ids, cwds and timestamps and no
      * name at all, so there is nothing to read and the computed label stands.
+     *
+     * The answer says who chose the name (`source`) when the store can tell:
+     * the user setting that hides agent-made names hides `'auto'` only.
      */
-    resolveSessionName?: (paneCwd: string, panePid?: number) => string | null;
+    resolveSessionName?: (paneCwd: string, panePid?: number) => ProviderName | null;
     /**
      * Resolve the file this agent is writing its session transcript to, for the
      * live chat timeline (`turn-watch`).
@@ -243,6 +247,11 @@ export interface PidSessionRecord {
      * without it, and a record without a name is still a valid id match.
      */
     name?: string;
+    /**
+     * Who chose `name`: `"derived"` (from the cwd — CC's placeholder) or
+     * `"user"` (`/rename`). Absent from an older CC, which cannot say.
+     */
+    nameSource?: string;
 }
 
 const readPidSessionRecords = (): PidSessionRecord[] => {
@@ -258,6 +267,7 @@ const readPidSessionRecords = (): PidSessionRecord[] => {
                         sessionId: raw.sessionId,
                         cwd: raw.cwd,
                         ...(typeof raw.name === 'string' ? { name: raw.name } : {}),
+                        ...(typeof raw.nameSource === 'string' ? { nameSource: raw.nameSource } : {}),
                     });
                 }
             } catch { /* partial write / corrupt — skip */ }
@@ -526,17 +536,37 @@ export const detectClaudeSessionIdByPid = (
     deps: PidResolveDeps = {},
 ): string | null => detectClaudeSessionByPid(panePid, paneCwd, deps)?.sessionId ?? null;
 
+/** Claude transcripts whose latest `ai-title` the listener keeps, read incrementally. */
+const claudeTitles = createTailWatch(latestClaudeAiTitle);
+
 /**
- * The name of the session running in this pane. No mtime fallback exists here:
- * the transcript filenames the heuristic walks carry a UUID and nothing else,
- * so an older CC without `~/.claude/sessions` yields no name and the phone
- * keeps the computed label.
+ * What the phone should call the Claude Code session in this pane, and who
+ * chose it.
+ *
+ * A `/rename` (`nameSource: "user"`) wins. Otherwise the newest `ai-title` CC
+ * wrote into the transcript — its own summary of the work, which is what tells
+ * parallel sessions apart. A derived name (`hybrid-shell-8f`, from the cwd)
+ * is never sent: it says no more than the tmux name the phone falls back to.
+ * A record from an older CC carries a name but no `nameSource`; that one is
+ * sent as before, with no source, ahead of any ai-title, since it may be the
+ * user's rename. No mtime
+ * fallback: only the pid match says which session this pane is.
  */
-export const detectClaudeSessionNameByPid = (
+export const detectClaudeProviderName = (
     panePid: number,
     paneCwd: string | null,
-    deps: PidResolveDeps = {},
-): string | null => nonBlank(detectClaudeSessionByPid(panePid, paneCwd, deps)?.name);
+    deps: PidResolveDeps & { transcriptOf?: (cwd: string, sessionId: string) => string | null } = {},
+): ProviderName | null => {
+    const record = detectClaudeSessionByPid(panePid, paneCwd, deps);
+    if (!record) return null;
+    const recordName = nonBlank(record.name);
+    if (recordName && record.nameSource === 'user') return { name: recordName, source: 'user' };
+    if (recordName && record.nameSource === undefined) return { name: recordName };
+
+    const transcript = (deps.transcriptOf ?? claudeConversationFile)(record.cwd, record.sessionId);
+    const title = transcript ? claudeTitles.read(transcript) : undefined;
+    return title ? { name: title, source: 'auto' } : null;
+};
 
 /**
  * The transcript file for the Claude Code session running in a tmux pane.
@@ -692,6 +722,27 @@ export const piTranscriptPath = (paneCwd: string | null, panePid?: number): stri
     return piSessionCache.set(key, doDetectPiTranscript(paneCwd));
 };
 
+const piNames = createTailWatch(piNamesStep);
+
+/**
+ * The name a pi pane's session goes by, and who chose it: the newest
+ * `session_info` name, which is the agent's (`'auto'`) when the hwip
+ * extension's tool set it — the tool leaves a marker entry with the same name
+ * (`PI_TITLE_MARKER`) — and the user's (`/name`) otherwise. Read from the
+ * transcript tail, so a name written before the last 256 KB of a session the
+ * listener first meets late is not found until the next one is written.
+ */
+export const detectPiSessionName = (
+    paneCwd: string,
+    panePid: number | undefined,
+    transcriptOf: (paneCwd: string, panePid?: number) => string | null = piTranscriptPath,
+): ProviderName | null => {
+    const file = transcriptOf(paneCwd, panePid);
+    const names = file ? piNames.read(file) : undefined;
+    if (!names?.name) return null;
+    return { name: names.name, source: names.marked === names.name ? 'auto' : 'user' };
+};
+
 // ── Agents whose session store keeps no pid ──────────────────────
 //
 // Hermes and Codex both record a session per cwd with a creation timestamp and
@@ -844,7 +895,7 @@ export const detectHermesSessionName = (
     paneCwd: string,
     panePid?: number,
     deps: StoreResolveDeps = {},
-): string | null => {
+): ProviderName | null => {
     // Without the pane's pid there is no process tree to match against, and this
     // store offers no other key — no name is the only honest answer.
     if (panePid === undefined) return null;
@@ -860,8 +911,13 @@ export const detectHermesSessionName = (
         deps.descendants ?? collectDescendantPids(panePid),
     );
     // The auto-title is written asynchronously after the first response, so an
-    // untitled row is a young session, not a broken one.
-    return nonBlank(row?.title ?? undefined) ?? nonBlank(row?.display_name ?? undefined);
+    // untitled row is a young session, not a broken one. `title` is Hermes'
+    // own; `display_name` comes from outside its titler (a gateway fills it
+    // from the chat it serves), so it is never one to hide.
+    const title = nonBlank(row?.title ?? undefined);
+    if (title) return { name: title, source: 'auto' };
+    const display = nonBlank(row?.display_name ?? undefined);
+    return display ? { name: display, source: 'user' } : null;
 };
 
 /**
@@ -977,7 +1033,7 @@ export const detectCodexSessionName = (
     paneCwd: string,
     panePid?: number,
     deps: StoreResolveDeps = {},
-): string | null => {
+): ProviderName | null => {
     if (panePid === undefined) return null;
     const raw = deps.rows !== undefined ? deps.rows : readCodexThreads();
     if (raw === null) return null;
@@ -990,7 +1046,12 @@ export const detectCodexSessionName = (
         deps.startTimes ?? psStartTimes(),
         deps.descendants ?? collectDescendantPids(panePid),
     );
-    return nonBlank(row?.name ?? undefined) ?? nonBlank(row?.title ?? undefined);
+    // `name` is what the user typed (`/rename`); `title` is Codex's own —
+    // the first prompt, verbatim.
+    const name = nonBlank(row?.name ?? undefined);
+    if (name) return { name, source: 'user' };
+    const title = nonBlank(row?.title ?? undefined);
+    return title ? { name: title, source: 'auto' } : null;
 };
 
 /**
@@ -1362,7 +1423,7 @@ const REMOTE_AGENT_TABLE = [
             (panePid !== undefined ? detectClaudeSessionIdByPid(panePid, paneCwd) : null)
             ?? detectClaudeSessionId(paneCwd),
         resolveSessionName: (paneCwd, panePid) =>
-            panePid !== undefined ? detectClaudeSessionNameByPid(panePid, paneCwd) : null,
+            panePid !== undefined ? detectClaudeProviderName(panePid, paneCwd) : null,
         resolveTranscript: (paneCwd, panePid) => claudeTranscriptPath(paneCwd, panePid),
         projectTranscript: projectTranscriptEntries,
         // The pid match alone: the mtime fallback above can name another
@@ -1430,6 +1491,7 @@ const REMOTE_AGENT_TABLE = [
         resolveTranscript: (paneCwd, panePid) => piTranscriptPath(paneCwd, panePid),
         projectTranscript: projectPiEntries,
         resolveResumeId: (paneCwd, panePid) => paneTranscriptId(piTranscriptPath(paneCwd, panePid), panePid),
+        resolveSessionName: (paneCwd, panePid) => detectPiSessionName(paneCwd, panePid),
     },
     {
         kind: 'opencode',
@@ -1439,7 +1501,11 @@ const REMOTE_AGENT_TABLE = [
         // Typed into a 2.0.24 TUI pane: `/exit` + Enter closed it.
         quitCommand: '/exit',
         resolveSessionId: (paneCwd, panePid) => detectOpencodeSession(paneCwd, panePid)?.id ?? null,
-        resolveSessionName: (paneCwd, panePid) => detectOpencodeSession(paneCwd, panePid)?.title ?? null,
+        // opencode titles a session itself after the first exchange.
+        resolveSessionName: (paneCwd, panePid) => {
+            const title = detectOpencodeSession(paneCwd, panePid)?.title;
+            return title ? { name: title, source: 'auto' } : null;
+        },
         resolveTranscript: (paneCwd, panePid) => opencodeTranscriptPath(paneCwd, panePid),
         projectTranscript: projectOpencodeEntries,
         readTranscript: (path, prev) => readOpencodeTranscript(path, prev, { query: queryOpencodeTranscript }),

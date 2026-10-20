@@ -571,6 +571,7 @@ const loadExtension = (env: Record<string, string | undefined> = {}, herdrOption
     const handlers: Record<string, Handler> = {};
     (mod.exports.default as (pi: unknown) => void)({
         on: (name: string, handler: Handler) => (handlers[name] = handler),
+        registerTool: () => {},
     });
     const ctx = { cwd: '/work/dou-app', ...ctxExtra };
     const emit = (name: string, event: Record<string, unknown> = {}) => handlers[name]({ type: name, ...event }, ctx);

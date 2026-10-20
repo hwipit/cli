@@ -15,14 +15,16 @@
  *    `[mcp_servers.hwip.tools.hwip_ask]` when the user picks "always allow".
  *    Removal takes them along (a child of a deleted server is dead config);
  *    re-install keeps them, since they are the user's answer, not ours.
- *  - **Only `command` and `args` are ours.** Any other key in the table —
- *    `cwd`, `startup_timeout_sec`, a comment — survives a re-install.
+ *  - **Only `command`, `args` and the `HWIP_AUTONAME` env pair are ours.** Any
+ *    other key in the table — `cwd`, `startup_timeout_sec`, a comment, the
+ *    user's own env pairs — survives a re-install; the flag joins whichever
+ *    env the user already keeps.
  *  - **Comments before the next table belong to that table**, not to ours, so
  *    the region we replace or delete stops short of them.
  *
  * Install, uninstall and verify all go through here so this is stated once.
  */
-import { MCP_LAUNCH_ARGV } from './mcp-command.js';
+import { AUTONAME_ENV, MCP_LAUNCH_ARGV } from './mcp-command.js';
 
 const [MCP_BIN, ...MCP_SUBCOMMAND] = MCP_LAUNCH_ARGV;
 
@@ -30,6 +32,8 @@ const [MCP_BIN, ...MCP_SUBCOMMAND] = MCP_LAUNCH_ARGV;
 const HWIP_TABLE_HEADER = /^\[mcp_servers\.(?:hwip|"hwip")\]$/;
 /** A sub-table of ours: `[mcp_servers.hwip.tools.hwip_ask]` and friends. */
 const HWIP_SUBTABLE_HEADER = /^\[mcp_servers\.(?:hwip|"hwip")\..+\]$/;
+/** The user's own env table for hwip — where the flag goes when they keep one. */
+const HWIP_ENV_SUBTABLE_HEADER = /^\[mcp_servers\.(?:hwip|"hwip")\.(?:env|"env")\]$/;
 /**
  * The dotted/inline form — `mcp_servers.hwip = { command = "npx", … }` — which
  * is valid TOML and which older hand-written configs use. It has to be found,
@@ -47,13 +51,86 @@ const OWNED_KEY = /^(?:command|args)\s*=/;
 
 const commandLine = `command = "${MCP_BIN}"`;
 const argsLine = `args = [${MCP_SUBCOMMAND.map((a) => `"${a}"`).join(', ')}]`;
+const flagPair = `${AUTONAME_ENV} = "1"`;
+const envLine = `env = { ${flagPair} }`;
 
-/** The table hwip writes into a config that has none. No `env` block, unlike
- *  the Cursor/Windsurf JSON entry: codex is a terminal app, so the server
- *  inherits the shell's `HWIP_API_KEY`, and an unexpanded `"${HWIP_API_KEY}"`
- *  literal would shadow the ~/.hwip/config.json fallback with junk (the same
- *  reasoning as opencode's). */
-export const CODEX_MCP_TABLE = ['[mcp_servers.hwip]', commandLine, argsLine].join('\n');
+/** `env = { … }` in hwip's table — known by its key, so a comment after it cannot hide it. */
+const INLINE_ENV = /^env\s*=\s*\{/;
+/** `env.KEY = …`, the dotted spelling of the same table. */
+const DOTTED_ENV = /^env\./;
+/** The flag's key, bare or quoted: TOML reads all three as one key. */
+const FLAG = `(?:${AUTONAME_ENV}|"${AUTONAME_ENV}"|'${AUTONAME_ENV}')`;
+const FLAG_KEY = new RegExp(`^${FLAG}\\s*=`);
+const DOTTED_FLAG_KEY = new RegExp(`^env\\.${FLAG}\\s*=`);
+const FLAG_ON = new RegExp(`(?:^|[\\s{,.])${FLAG}\\s*=\\s*["']1["']`);
+
+/** The table hwip writes into a config that has none. Its `env` holds only the
+ *  auto-name flag, unlike the Cursor/Windsurf JSON entry: codex is a terminal
+ *  app, so the server inherits the shell's `HWIP_API_KEY`, and an unexpanded
+ *  `"${HWIP_API_KEY}"` literal would shadow the ~/.hwip/config.json fallback
+ *  with junk (the same reasoning as opencode's). */
+export const CODEX_MCP_TABLE = ['[mcp_servers.hwip]', commandLine, argsLine, envLine].join('\n');
+
+/**
+ * Walks a line of TOML outside its strings: `at(i, depth)` sees every character that is not
+ * inside one, with the brace depth before it, and stops the walk by returning true.
+ */
+const walkOutsideStrings = (text: string, from: number, at: (i: number, depth: number) => boolean): void => {
+    let depth = 0;
+    let quote: string | null = null;
+    for (let i = from; i < text.length; i += 1) {
+        const ch = text[i];
+        if (quote) {
+            if (ch === '\\' && quote === '"') i += 1;
+            else if (ch === quote) quote = null;
+            continue;
+        }
+        if (ch === '"' || ch === "'") {
+            quote = ch;
+            continue;
+        }
+        if (at(i, depth)) return;
+        if (ch === '{' || ch === '[') depth += 1;
+        else if (ch === '}' || ch === ']') depth -= 1;
+    }
+};
+
+/** The inline table's inside and what follows its closing brace (a comment), or null when it does
+ *  not close on this line. */
+const inlineParts = (line: string): { inner: string; tail: string } | null => {
+    const open = line.indexOf('{');
+    let parts: { inner: string; tail: string } | null = null;
+    walkOutsideStrings(line, open, (i, depth) => {
+        if (line[i] !== '}' || depth !== 1) return false;
+        parts = { inner: line.slice(open + 1, i), tail: line.slice(i + 1) };
+        return true;
+    });
+    return parts;
+};
+
+/** The pairs of an inline table, split at its own commas — never one inside a string or a nested value. */
+const inlinePairs = (inner: string): string[] => {
+    const pairs: string[] = [];
+    let start = 0;
+    walkOutsideStrings(inner, 0, (i, depth) => {
+        if (inner[i] === ',' && depth === 0) {
+            pairs.push(inner.slice(start, i));
+            start = i + 1;
+        }
+        return false;
+    });
+    pairs.push(inner.slice(start));
+    return pairs.map((pair) => pair.trim()).filter(Boolean);
+};
+
+/** An inline env table with the flag on and first, the user's pairs and comment kept. One that
+ *  cannot be read is left alone: writing a second `env` beside it would break the whole file. */
+const withFlag = (line: string): string => {
+    const parts = inlineParts(line);
+    if (!parts) return line;
+    const rest = inlinePairs(parts.inner).filter((pair) => !FLAG_KEY.test(pair));
+    return `env = { ${[flagPair, ...rest].join(', ')} }${parts.tail}`;
+};
 
 /** CRLF in, CRLF out — a Windows config must not come back with mixed endings. */
 const eolOf = (config: string): string => (config.includes('\r\n') ? '\r\n' : '\n');
@@ -122,16 +199,45 @@ export const upsertHwipMcpTable = (config: string): string => {
         return rejoin([...lines.slice(0, start), ...table, ...lines.slice(start + 1)], eol);
     }
 
+    // A key defined twice makes codex refuse the whole file, so the flag goes
+    // into whichever env the user already keeps, and gets one only if none.
+    const envTable = lines.slice(bodyEnd(lines, start), entryEnd(lines, start))
+        .findIndex((line) => HWIP_ENV_SUBTABLE_HEADER.test(line.trim()));
+    const after = [...lines];
+    if (envTable !== -1) {
+        const header = bodyEnd(lines, start) + envTable;
+        const tableEnd = bodyEnd(lines, header);
+        const rows = lines.slice(header + 1, tableEnd).filter((line) => !FLAG_KEY.test(line.trim()));
+        after.splice(header, tableEnd - header, lines[header], flagPair, ...rows);
+    }
+
     const end = withoutTrailingPreamble(lines, start, bodyEnd(lines, start));
-    const kept = lines.slice(start + 1, end).filter((line) => !OWNED_KEY.test(line.trim()));
+    const kept = lines.slice(start + 1, end)
+        .filter((line) => !OWNED_KEY.test(line.trim()) && !DOTTED_FLAG_KEY.test(line.trim()));
+    const inline = kept.findIndex((line) => INLINE_ENV.test(line.trim()));
+    if (inline !== -1) kept[inline] = withFlag(kept[inline].trim());
+    const ours = envTable !== -1 || inline !== -1 ? []
+        : kept.some((line) => DOTTED_ENV.test(line.trim())) ? [`env.${flagPair}`]
+        : [envLine];
     return rejoin([
-        ...lines.slice(0, start),
+        ...after.slice(0, start),
         '[mcp_servers.hwip]',
         commandLine,
         argsLine,
+        ...ours,
         ...kept,
-        ...lines.slice(end),
+        ...after.slice(end),
     ], eol);
+};
+
+/** Whether hwip's entry turns auto names on — what verify checks to tell an
+ *  install from before the flag existed. */
+export const hasHwipAutoName = (config: string): boolean => {
+    const lines = splitLines(config);
+    const start = definitionIndex(lines);
+    if (start === -1) return false;
+    const end = HWIP_INLINE_ENTRY.test(lines[start].trim()) ? start + 1 : entryEnd(lines, start);
+    return lines.slice(start, end).some((line) => !line.trim().startsWith('#') && FLAG_ON.test(line.trim()));
 };
 
 /** The config with hwip's entry and its sub-tables gone, or null when it was

@@ -131,7 +131,7 @@ describe('detectHermesSessionName', () => {
 
     it('reads the auto-title of the session running in this pane', () => {
         const rows = [{ cwd: '/proj', title: 'Fix listener race', display_name: null, started_at: STARTED_SEC }];
-        expect(detectHermesSessionName('/proj', 90, deps(rows))).toBe('Fix listener race');
+        expect(detectHermesSessionName('/proj', 90, deps(rows))).toEqual({ name: 'Fix listener race', source: 'auto' });
     });
 
     /**
@@ -143,7 +143,7 @@ describe('detectHermesSessionName', () => {
         // Same instant expressed as ms would be ~1.8e12; as seconds ~1.8e9. If
         // the implementation skipped the scale, this row would miss by 56 years.
         const rows = [{ cwd: '/proj', title: 'Scaled', display_name: null, started_at: STARTED_SEC }];
-        expect(detectHermesSessionName('/proj', 90, deps(rows))).toBe('Scaled');
+        expect(detectHermesSessionName('/proj', 90, deps(rows))).toEqual({ name: 'Scaled', source: 'auto' });
     });
 
     it('ignores rows from another directory', () => {
@@ -153,7 +153,7 @@ describe('detectHermesSessionName', () => {
 
     it('falls back to display_name, then to nothing', () => {
         const withDisplay = [{ cwd: '/proj', title: null, display_name: 'Named by hand', started_at: STARTED_SEC }];
-        expect(detectHermesSessionName('/proj', 90, deps(withDisplay))).toBe('Named by hand');
+        expect(detectHermesSessionName('/proj', 90, deps(withDisplay))).toEqual({ name: 'Named by hand', source: 'user' });
         const untitled = [{ cwd: '/proj', title: null, display_name: null, started_at: STARTED_SEC }];
         expect(detectHermesSessionName('/proj', 90, deps(untitled))).toBeNull();
     });
@@ -192,12 +192,12 @@ describe('detectCodexSessionName', () => {
 
     it('prefers the name the user set over the generated title', () => {
         const rows = [{ cwd: '/proj', name: 'deploy audit', title: 'Investigate flaky deploy', archived: 0, created_at_ms: CREATED_MS, created_at: null }];
-        expect(detectCodexSessionName('/proj', 90, deps(rows))).toBe('deploy audit');
+        expect(detectCodexSessionName('/proj', 90, deps(rows))).toEqual({ name: 'deploy audit', source: 'user' });
     });
 
     it('uses the generated title when no name was set', () => {
         const rows = [{ cwd: '/proj', name: null, title: 'Investigate flaky deploy', archived: 0, created_at_ms: CREATED_MS, created_at: null }];
-        expect(detectCodexSessionName('/proj', 90, deps(rows))).toBe('Investigate flaky deploy');
+        expect(detectCodexSessionName('/proj', 90, deps(rows))).toEqual({ name: 'Investigate flaky deploy', source: 'auto' });
     });
 
     /**
@@ -207,7 +207,7 @@ describe('detectCodexSessionName', () => {
      */
     it('falls back to the older seconds column when created_at_ms is NULL', () => {
         const rows = [{ cwd: '/proj', name: 'legacy row', title: '', archived: 0, created_at_ms: null, created_at: CREATED_MS / 1_000 }];
-        expect(detectCodexSessionName('/proj', 90, deps(rows))).toBe('legacy row');
+        expect(detectCodexSessionName('/proj', 90, deps(rows))).toEqual({ name: 'legacy row', source: 'user' });
     });
 
     // `title` is NOT NULL but has no default, so '' is reachable — and an empty

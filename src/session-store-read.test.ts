@@ -68,7 +68,7 @@ describe('Hermes store, read for real', () => {
             ('20260814_112441_5d0c6f', 'cli', ${started / 1_000 - 3_600}, '${TMP}', 'An hour earlier');`);
 
         const { detectHermesSessionName } = await import('./remote-agents.js');
-        expect(detectHermesSessionName(TMP, process.pid)).toBe('Fix listener race');
+        expect(detectHermesSessionName(TMP, process.pid)).toEqual({ name: 'Fix listener race', source: 'auto' });
     });
 
     it('returns null when the store has no row for this directory', async () => {
@@ -160,7 +160,7 @@ describe('opencode store, read for real', () => {
         // What the report sends: the row's own resolvers, id and title each in its place.
         const row = REMOTE_AGENTS.find((a) => a.kind === 'opencode');
         expect(row?.resolveSessionId?.(TMP, process.pid)).toBe('ses_main1');
-        expect(row?.resolveSessionName?.(TMP, process.pid)).toBe('Ping test check-in');
+        expect(row?.resolveSessionName?.(TMP, process.pid)).toEqual({ name: 'Ping test check-in', source: 'auto' });
     });
 
     // C140: the recorder follows the session through the real reader and SQL, a step rewritten in
@@ -232,7 +232,7 @@ describe('Codex store, read for real', () => {
             VALUES ('new', '${TMP}', 'Investigate flaky deploy', 0, ${started}, 'deploy audit');`);
 
         const { detectCodexSessionName } = await import('./remote-agents.js');
-        expect(detectCodexSessionName(TMP, process.pid)).toBe('deploy audit');
+        expect(detectCodexSessionName(TMP, process.pid)).toEqual({ name: 'deploy audit', source: 'user' });
     });
 
     it('reads the generated title when the thread was never named', async () => {
@@ -246,7 +246,7 @@ describe('Codex store, read for real', () => {
             VALUES ('t', '${TMP}', 'Investigate flaky deploy', ${Math.floor(started / 1_000)}, NULL);`);
 
         const { detectCodexSessionName } = await import('./remote-agents.js');
-        expect(detectCodexSessionName(TMP, process.pid)).toBe('Investigate flaky deploy');
+        expect(detectCodexSessionName(TMP, process.pid)).toEqual({ name: 'Investigate flaky deploy', source: 'auto' });
     });
 
     it('returns null when codex was never installed here', async () => {

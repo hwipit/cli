@@ -16,18 +16,27 @@ export const MCP_LAUNCH_ARGV = ['hwip', 'mcp'] as const;
 const [MCP_BIN, ...MCP_SUBCOMMAND] = MCP_LAUNCH_ARGV;
 
 /**
+ * Turns on the MCP server's `hwip_session_title` (mcp-server config `autoName`),
+ * so an agent with no title of its own names its session after its task. Set
+ * for Codex, Cursor, Windsurf and Gemini only: Claude Code and opencode title
+ * their sessions themselves, and the instruction would cost every turn.
+ */
+export const AUTONAME_ENV = 'HWIP_AUTONAME';
+
+/**
  * `mcpServers.hwip` — what the installer writes for Cursor and Windsurf.
  * The env block is deliberate: both spawn the MCP server from a graphical
  * context that may not inherit shell env, so the key is passed through
  * explicitly rather than left to inheritance.
  *
  * `hwipit/plugin`'s `.mcp.json` holds the same shape but is a HAND-KEPT COPY —
- * it lives in another repo and cannot import this. Change one, change both.
+ * it lives in another repo and cannot import this. Change one, change both —
+ * except AUTONAME_ENV, which the plugin (Claude Code) leaves out on purpose.
  */
 export const MCP_SERVERS_ENTRY = {
     command: MCP_BIN,
     args: [...MCP_SUBCOMMAND],
-    env: { HWIP_API_KEY: '${HWIP_API_KEY}' },
+    env: { HWIP_API_KEY: '${HWIP_API_KEY}', [AUTONAME_ENV]: '1' },
 };
 
 /**
@@ -47,7 +56,13 @@ export const OPENCODE_MCP_ENTRY = {
 // server NAME and the BINARY are both "hwip" here, so the doubled word below
 // is correct, not a copy-paste slip. Default scope is "project" (cwd-local
 // .gemini/), so user scope is pinned for a machine-wide install.
-export const GEMINI_MCP_ADD = `gemini mcp add -s user hwip ${MCP_BIN} -- ${MCP_SUBCOMMAND.join(' ')}`;
+// `-e` lands in the entry's env. That a reinstall replaces an existing hwip entry whole, and so
+// adds the flag to it, is unverified (gemini CLI behaviour); `hwip verify` reports it if not.
+export const GEMINI_MCP_ADD = `gemini mcp add -s user -e ${AUTONAME_ENV}=1 hwip ${MCP_BIN} -- ${MCP_SUBCOMMAND.join(' ')}`;
 
 /** Older gemini CLIs only accept `mcp add <name> -- <command…>`, with no scope flag. */
-export const GEMINI_MCP_ADD_LEGACY = `gemini mcp add hwip -- ${MCP_LAUNCH_ARGV.join(' ')}`;
+export const GEMINI_MCP_ADD_LEGACY = `gemini mcp add -e ${AUTONAME_ENV}=1 hwip -- ${MCP_LAUNCH_ARGV.join(' ')}`;
+
+/** The legacy form without `-e`, last: should a gemini that old refuse `-e`, the tools still load,
+ *  and `hwip verify` says auto session names are off. */
+export const GEMINI_MCP_ADD_BARE = `gemini mcp add hwip -- ${MCP_LAUNCH_ARGV.join(' ')}`;

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readTranscriptDelta } from './transcript-tail.js';
-import { detectClaudeSessionIdByPid, detectClaudeSessionNameByPid, findAgentBySubcommand, matchAgentByPaneCommand, REMOTE_AGENTS } from './remote-agents.js';
+import { detectClaudeProviderName, detectClaudeSessionIdByPid, findAgentBySubcommand, matchAgentByPaneCommand, REMOTE_AGENTS } from './remote-agents.js';
 
 // Top-level CLI commands the registry's subcommands must never collide
 // with — dispatch checks the registry BEFORE the switch, so a collision
@@ -120,7 +120,7 @@ describe('remote-agents.ts: table invariants', () => {
      * `resolveSessionName` leaves the whole feature dead with a green suite.
      */
     it('every agent with a readable name store is wired to its resolver', () => {
-        for (const kind of ['claude', 'hermes', 'codex', 'opencode'] as const) {
+        for (const kind of ['claude', 'hermes', 'codex', 'opencode', 'pi'] as const) {
             const row = REMOTE_AGENTS.find((a) => a.kind === kind);
             expect(typeof row?.resolveSessionName, `${kind} row lost its name resolver`).toBe('function');
         }
@@ -501,9 +501,12 @@ describe('collectDescendantPids caching', () => {
     });
 });
 
-describe('detectClaudeSessionNameByPid', () => {
+describe('detectClaudeProviderName — record match', () => {
     // Names as Claude Code actually writes them: `<cwd-basename>-<hex2>` when
-    // derived, free text when the session was named.
+    // derived, free text when the session was named. These records carry no
+    // `nameSource` (an older CC), so the name goes out with no source; the
+    // nameSource and ai-title rules live in session-name-source.test.ts.
+    const noTranscript = () => null;
     const records = [
         { pid: 100, sessionId: 'sess-tmux', cwd: '/proj', name: 'proj-95' },
         { pid: 200, sessionId: 'sess-plain', cwd: '/proj', name: 'cleanup-pr-rules' },
@@ -511,26 +514,26 @@ describe('detectClaudeSessionNameByPid', () => {
     ];
 
     it('returns the name of the session inside the pane process tree', () => {
-        expect(detectClaudeSessionNameByPid(90, '/proj', {
-            records, descendants: new Set([90, 95, 100]),
-        })).toBe('proj-95');
+        expect(detectClaudeProviderName(90, '/proj', {
+            records, transcriptOf: noTranscript, descendants: new Set([90, 95, 100]),
+        })).toEqual({ name: 'proj-95' });
     });
 
     it('reads the same record the id resolver picked (one lookup, two fields)', () => {
-        const deps = { records, descendants: new Set([90, 95, 200]) };
+        const deps = { records, transcriptOf: noTranscript, descendants: new Set([90, 95, 200]) };
         expect(detectClaudeSessionIdByPid(90, '/proj', deps)).toBe('sess-plain');
-        expect(detectClaudeSessionNameByPid(90, '/proj', deps)).toBe('cleanup-pr-rules');
+        expect(detectClaudeProviderName(90, '/proj', deps)).toEqual({ name: 'cleanup-pr-rules' });
     });
 
     it('returns null when the matched record carries no name (older CC)', () => {
-        expect(detectClaudeSessionNameByPid(90, null, {
-            records, descendants: new Set([90, 300]),
+        expect(detectClaudeProviderName(90, null, {
+            records, transcriptOf: noTranscript, descendants: new Set([90, 300]),
         })).toBeNull();
     });
 
     it('returns null when no record matches the tree', () => {
-        expect(detectClaudeSessionNameByPid(90, '/proj', {
-            records, descendants: new Set([90]),
+        expect(detectClaudeProviderName(90, '/proj', {
+            records, transcriptOf: noTranscript, descendants: new Set([90]),
         })).toBeNull();
     });
 
@@ -539,8 +542,8 @@ describe('detectClaudeSessionNameByPid', () => {
     // ride along as a meaningless "change".
     it('normalizes blank and whitespace-only names to null', () => {
         const blank = [{ pid: 100, sessionId: 's', cwd: '/proj', name: '   ' }];
-        expect(detectClaudeSessionNameByPid(90, '/proj', {
-            records: blank, descendants: new Set([90, 100]),
+        expect(detectClaudeProviderName(90, '/proj', {
+            records: blank, transcriptOf: noTranscript, descendants: new Set([90, 100]),
         })).toBeNull();
     });
 });

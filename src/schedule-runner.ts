@@ -202,9 +202,10 @@ export const createScheduleRunner = (deps: ScheduleRunnerDeps): ScheduleRunner =
         for (const schedule of schedules) {
             // No record of a schedule in a damaged file may mean "nothing ran" or "the record was lost": start from now, so
             // neither a pile of old runs is counted as missed nor a run that already happened is started again.
-            state[schedule.id] = previous[schedule.id] ?? { cursor: file.damaged ? tickNow : scheduleAnchor(schedule) };
             // An edit restarts the count: the times before it belong to the schedule as it was.
-            state[schedule.id]!.cursor = Math.max(state[schedule.id]!.cursor, scheduleAnchor(schedule));
+            const prior = previous[schedule.id];
+            const anchor = scheduleAnchor(schedule);
+            state[schedule.id] = { ...prior, cursor: Math.max(prior?.cursor ?? (file.damaged ? tickNow : anchor), anchor) };
         }
         // A state entry whose schedule file is gone is dropped — but only when the list is whole: a file that could not be
         // read this time is still there, and losing its cursor would repeat or miscount runs. A session that ended on its own is no longer running.

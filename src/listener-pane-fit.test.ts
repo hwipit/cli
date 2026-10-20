@@ -120,7 +120,7 @@ describe('stream — a watched window fits the phone while it is the latest user
         expect(win.width).toBe(45);
     });
 
-    it('reopening the mirror takes the width back after the desktop used the session', () => {
+    it('reopening the mirror takes the width back once the desktop has been idle a minute', () => {
         vi.setSystemTime(1_000_000_000);
         win.attached = 1;
         win.activity = [999_000];
@@ -130,8 +130,13 @@ describe('stream — a watched window fits the phone while it is the latest user
         control('agent.stream.renew', { cols: 45 });
         win.width = 120;
 
+        // An automatic resubscribe seconds after a desktop key press must not shrink the desktop.
         vi.setSystemTime(1_000_010_000);
         control('agent.stream.start', { cols: 45 });
+        expect(resizes()).toEqual(['45']);
+
+        vi.setSystemTime(1_000_062_000);
+        control('agent.stream.renew', { cols: 45 });
         expect(resizes()).toEqual(['45', '45']);
     });
 
@@ -148,6 +153,34 @@ describe('stream — a watched window fits the phone while it is the latest user
         vi.setSystemTime(1_000_005_000);
         control('agent.stream.renew', { cols: 45, deviceId: 'phone-a' });
         expect(unsets()).toBe(1);
+    });
+
+    it('a reconnect right after phone input keeps the phone width', () => {
+        vi.setSystemTime(1_000_000_000);
+        win.attached = 1;
+        win.activity = [999_000];
+        control('agent.stream.start', { cols: 45 });
+        win.activity = [1_000_002];
+        vi.setSystemTime(1_000_005_000);
+        control('agent.stream.renew', { cols: 45 });
+        win.width = 120;
+        vi.setSystemTime(1_000_010_000);
+        handleCommandInput({ subtype: 'agent.command.input', targetDeviceId: device, sessionName: SESSION, seq: 1, epoch: 1, keys: ['down'] }, () => {});
+        const unsets = () => tmuxCalls.filter((c) => c[0] === 'set-option' && c.includes('window-size')).length;
+        const before = unsets();
+
+        vi.setSystemTime(1_000_015_000);
+        control('agent.stream.start', { cols: 45 });
+        expect(unsets()).toBe(before);
+        expect(win.width).toBe(45);
+    });
+
+    it('input from a phone at another width sizes the window to that phone', () => {
+        control('agent.stream.start', { cols: 45, deviceId: 'phone-a' });
+        control('agent.stream.start', { cols: 80, deviceId: 'phone-b' });
+        handleCommandInput({ subtype: 'agent.command.input', targetDeviceId: device, sessionName: SESSION, seq: 1, epoch: 1, deviceId: 'phone-a', keys: ['down'] }, () => {});
+
+        expect(resizes()).toEqual(['45', '80', '45']);
     });
 
     it('resizes nothing for a viewer that sends no width', () => {

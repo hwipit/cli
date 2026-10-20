@@ -3439,8 +3439,8 @@ export const handleStreamControl = (
         return true;
     }
     const fitTarget = tmuxTargetFor(sessionName);
-    // Opening the mirror is using the session: the phone is its latest user (pane-fit.ts).
-    paneFitter.claim(sessionName);
+    // Opening the mirror (or resubscribing) takes the width only from an idle desktop (pane-fit.ts).
+    paneFitter.open(sessionName);
     if (fitTarget !== null) paneFitter.fit(sessionName, fitTarget, req.cols);
     let lastContent: string | null = null;
     // The cursor's last reported place, as `line,col`. Part of the diff-gate
@@ -3920,9 +3920,11 @@ const deliverInput = (input: PendingInput): void => {
  */
 const takeWidthBack = (sessionName: string, deviceId: string | undefined): void => {
     paneFitter.claim(sessionName);
-    const target = tmuxTargetFor(sessionName);
     const viewer = activeStreams.get(streamKey(sessionName, deviceId)) ?? streamsOf(sessionName)[0];
-    if (target === null || !viewer) return;
+    // Already at the sender's width: the claim is enough, and a keystroke costs no tmux round trip (renew rechecks).
+    if (!viewer || paneFitter.fitted(sessionName, viewer.cols)) return;
+    const target = tmuxTargetFor(sessionName);
+    if (target === null) return;
     paneFitter.fit(sessionName, target, viewer.cols);
 };
 

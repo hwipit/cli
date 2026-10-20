@@ -51,7 +51,7 @@ describe('createPaneFitter', () => {
     });
 
     it('fits an attached window whose clients have been idle since the phone claimed it', () => {
-        const t = fakeTmux({ attached: 1, panes: 1, width: 120, activity: [900, 990] });
+        const t = fakeTmux({ attached: 1, panes: 1, width: 120, activity: [900, 930] });
         const clock = fakeClock(1000);
         const fitter = createPaneFitter(t.run, clock.now);
         fitter.fit('hwip-hwip', 'hwip-hwip', 45);
@@ -95,6 +95,76 @@ describe('createPaneFitter', () => {
 
         expect(t.resizes()).toEqual(['45', '45']);
         expect(fitter.fitted('s')).toBe(true);
+    });
+
+    it('opening leaves a desktop used within the last minute alone, and takes the window once it has been idle a minute', () => {
+        const t = fakeTmux({ attached: 1, panes: 1, width: 120, activity: [990] });
+        const clock = fakeClock(1000);
+        const fitter = createPaneFitter(t.run, clock.now);
+        fitter.open('s');
+        fitter.fit('s', 's', 45);
+        expect(t.resizes()).toEqual([]);
+
+        clock.seconds = 1049;
+        fitter.fit('s', 's', 45);
+        expect(t.resizes()).toEqual([]);
+
+        clock.seconds = 1050;
+        fitter.fit('s', 's', 45);
+        expect(t.resizes()).toEqual(['45']);
+    });
+
+    it('phone input takes the window even from a desktop used seconds ago', () => {
+        const t = fakeTmux({ attached: 1, panes: 1, width: 120, activity: [990] });
+        const clock = fakeClock(1000);
+        const fitter = createPaneFitter(t.run, clock.now);
+        fitter.open('s');
+        fitter.fit('s', 's', 45);
+        fitter.claim('s');
+        fitter.fit('s', 's', 45);
+
+        expect(t.resizes()).toEqual(['45']);
+    });
+
+    it('keeps a typed claim when the mirror is opened again', () => {
+        const t = fakeTmux({ attached: 1, panes: 1, width: 120, activity: [1002] });
+        const clock = fakeClock(1010);
+        const fitter = createPaneFitter(t.run, clock.now);
+        fitter.claim('s');
+        fitter.fit('s', 's', 45);
+        clock.seconds = 1015;
+        fitter.open('s');
+        fitter.fit('s', 's', 45);
+
+        expect(fitter.fitted('s')).toBe(true);
+        expect(t.calls.filter((c) => c.includes('window-size'))).toEqual([]);
+    });
+
+    it('opening takes the window from a desktop idle a minute even after the phone once typed', () => {
+        const t = fakeTmux({ attached: 1, panes: 1, width: 120, activity: [900] });
+        const clock = fakeClock(1000);
+        const fitter = createPaneFitter(t.run, clock.now);
+        fitter.claim('s');
+        fitter.fit('s', 's', 45);
+        t.win.activity = [1010];
+        clock.seconds = 1011;
+        fitter.fit('s', 's', 45);
+        expect(fitter.fitted('s')).toBe(false);
+
+        t.win.width = 120;
+        clock.seconds = 1200;
+        fitter.open('s');
+        fitter.fit('s', 's', 45);
+        expect(t.resizes()).toEqual(['45', '45']);
+    });
+
+    it('tells a fit at another width apart', () => {
+        const t = fakeTmux({ attached: 0, panes: 1, width: 120 });
+        const fitter = createPaneFitter(t.run);
+        fitter.fit('s', 's', 45);
+
+        expect(fitter.fitted('s', 45)).toBe(true);
+        expect(fitter.fitted('s', 80)).toBe(false);
     });
 
     it('gives a tie in the same second to the desktop', () => {

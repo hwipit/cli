@@ -435,9 +435,11 @@ block here.
    **The mirror fits a session to the phone.** A pane is as wide as the
    terminal that last drew it, so a desktop's prompt rules and
    right-aligned clocks fold in two on a phone. Whoever used the session
-   last decides its width, the way tmux's `window-size latest` does: opening
-   the mirror or typing from the phone makes the phone the latest user, and
-   the listener resizes the window to the phone's width; pressing a key in
+   last decides its width, the way tmux's `window-size latest` does: typing
+   from the phone makes the phone the latest user, and the listener resizes
+   the window to the phone's width. Opening the mirror does the same once
+   the desktop terminal has been idle for a minute, so a phone reconnecting
+   on its own never shrinks a terminal you are typing in. Pressing a key in
    (or attaching) a desktop terminal makes it the latest user, and within a
    renew (5 s) the window is handed back to tmux, which sizes it to that
    terminal. While the phone holds a session, a desktop terminal still

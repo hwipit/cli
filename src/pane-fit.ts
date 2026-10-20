@@ -10,9 +10,12 @@
  *
  * A window with a desktop client attached is shared, and whoever used it last
  * decides its width — the rule tmux's own `window-size latest` follows. The
- * phone uses a window when it starts watching or types into it ({@link claim});
- * a client uses it when it attaches or a key is pressed in it, which is what
- * `#{client_activity}` records. While the phone is the later of the two, the
+ * phone uses a window when it types into it ({@link claim}); a client uses it
+ * when it attaches or a key is pressed in it, which is what
+ * `#{client_activity}` records. Opening the mirror ({@link open}) is a weaker
+ * claim: it also covers an automatic resubscribe nobody asked for, so it only
+ * takes a window whose desktop has been idle for {@link DESKTOP_IDLE_SECONDS}.
+ * While the phone is the later of the two, the
  * window is the phone's width (the desktop terminal shows it narrower); once a
  * client is newer, the next check hands the window back to tmux, which sizes
  * it to that client. A window split into panes is left alone, since the
@@ -27,6 +30,8 @@
 export type TmuxRun = (args: string[]) => { status: number | null; stdout: string };
 
 export const PANE_FIT_MIN_COLS = 20;
+/** How long a desktop client must sit idle before opening the mirror takes its window. */
+export const DESKTOP_IDLE_SECONDS = 60;
 export const PANE_FIT_MAX_COLS = 400;
 
 /** A viewer's column count, or null when it did not send a usable one. */
@@ -85,13 +90,21 @@ const readWindow = (run: TmuxRun, target: string): { attached: number; panes: nu
 /** `now` is in ms, as `Date.now`; tmux reports client use in whole seconds. */
 export const createPaneFitter = (run: TmuxRun, now: () => number = () => Date.now()) => {
     const fits = new Map<string, Fit>();
-    /** When the phone last used each session, in tmux's seconds. */
-    const claims = new Map<string, number>();
+    /** When the phone last typed into and last opened each session, in tmux's seconds. */
+    const claims = new Map<string, { typedAt?: number; openedAt?: number }>();
     const seconds = (): number => Math.floor(now() / 1000);
 
-    /** The phone used `session` just now: it is the latest user until a client is used after it. */
+    /** The phone typed into `session` just now: it is the latest user until a client is used after it. */
     const claim = (session: string): void => {
-        claims.set(session, seconds());
+        claims.set(session, { ...claims.get(session), typedAt: seconds() });
+    };
+
+    /**
+     * The phone opened the mirror of `session` just now: it takes the window once the desktop is idle. The time
+     * the phone last typed is kept: a reconnect is not a reason to hand an untouched desktop its width back.
+     */
+    const open = (session: string): void => {
+        claims.set(session, { ...claims.get(session), openedAt: seconds() });
     };
 
     /**
@@ -112,14 +125,19 @@ export const createPaneFitter = (run: TmuxRun, now: () => number = () => Date.no
 
     /**
      * The window is not the phone's to size: it is split, or an attached client was used at or after the
-     * phone's claim. A tie goes to the desktop: tmux counts in whole seconds, and shrinking a terminal in
-     * use is the worse mistake.
+     * phone's claim, or — when the phone only opened the mirror — within the last {@link DESKTOP_IDLE_SECONDS}.
+     * A tie goes to the desktop: tmux counts in whole seconds, and shrinking a terminal in use is the worse mistake.
      */
     const notOurs = (session: string, target: string, win: { attached: number; panes: number }): boolean => {
         if (win.panes !== 1) return true;
         if (win.attached === 0) return false;
         const clientUse = latestClientUse(run, target);
-        return clientUse === null || clientUse >= (claims.get(session) ?? 0);
+        if (clientUse === null) return true;
+        const claimed = claims.get(session);
+        const typedSince = claimed?.typedAt !== undefined && clientUse < claimed.typedAt;
+        const openedOnIdle = claimed?.openedAt !== undefined && clientUse < claimed.openedAt
+            && seconds() - clientUse >= DESKTOP_IDLE_SECONDS;
+        return !typedSince && !openedOnIdle;
     };
 
     /** The phone left: give the window back and forget its claim. */
@@ -133,7 +151,7 @@ export const createPaneFitter = (run: TmuxRun, now: () => number = () => Date.no
      * after every attached client. Safe to call on every renew: an unchanged
      * width costs one display-message (and one list-clients when attached), and
      * a window a client used since is handed back. The first call for a session
-     * counts as the phone's use when nothing claimed it yet.
+     * counts as opening the mirror when nothing claimed it yet.
      */
     const fit = (session: string, target: string, cols: unknown): void => {
         const want = clampViewerCols(cols);
@@ -141,7 +159,7 @@ export const createPaneFitter = (run: TmuxRun, now: () => number = () => Date.no
         const win = readWindow(run, target);
         if (!win) return;
         const held = fits.get(session);
-        if (!claims.has(session)) claim(session);
+        if (!claims.has(session)) open(session);
         if (notOurs(session, target, win)) {
             // Only the fit goes: the claim stays, so the desktop keeps the window until the phone uses it again.
             if (held) unfit(session);
@@ -166,5 +184,12 @@ export const createPaneFitter = (run: TmuxRun, now: () => number = () => Date.no
         if (win && notOurs(session, held.target, win)) unfit(session);
     };
 
-    return { fit, recheck, claim, release, fitted: (session: string): boolean => fits.has(session) };
+    /** Whether `session`'s window is fitted — at `cols`, when given. */
+    const fitted = (session: string, cols?: unknown): boolean => {
+        const held = fits.get(session);
+        if (!held) return false;
+        return cols === undefined || held.cols === clampViewerCols(cols);
+    };
+
+    return { fit, recheck, claim, open, release, fitted };
 };

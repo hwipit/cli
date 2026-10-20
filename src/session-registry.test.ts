@@ -454,3 +454,25 @@ describe('the conversation a run last had', () => {
         expect(row?.agentSessionId).toBeUndefined();
     });
 });
+
+describe('session registry: run title', () => {
+    it('run title: a file entry keeps its run but loses a name or source that is not what it expects', () => {
+        const path = knownSessionsPath();
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(
+            path,
+            JSON.stringify([
+                { name: 'hwip-a', cwd: '/w/a', agentKind: 'claude', lastSeenAt: '2026-08-01T00:00:00.000Z', providerSessionName: 42, providerSessionNameSource: 'user' },
+                { name: 'hwip-b', cwd: '/w/b', agentKind: 'claude', lastSeenAt: '2026-08-01T00:00:00.000Z', providerSessionName: 'Fix login', providerSessionNameSource: 'robot' },
+                { name: 'hwip-c', cwd: '/w/c', agentKind: 'claude', lastSeenAt: '2026-08-01T00:00:00.000Z', providerSessionName: 'Ship it', providerSessionNameSource: 'auto' },
+            ]),
+        );
+
+        const byName = new Map(knownSessions(T0).map((e) => [e.name, e]));
+        expect(byName.get('hwip-a')).not.toHaveProperty('providerSessionName');
+        expect(byName.get('hwip-a')).not.toHaveProperty('providerSessionNameSource');
+        expect(byName.get('hwip-b')).toMatchObject({ providerSessionName: 'Fix login' });
+        expect(byName.get('hwip-b')).not.toHaveProperty('providerSessionNameSource');
+        expect(byName.get('hwip-c')).toMatchObject({ providerSessionName: 'Ship it', providerSessionNameSource: 'auto' });
+    });
+});

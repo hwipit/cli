@@ -198,3 +198,72 @@ describe('separate runs: the run id', () => {
         expect(runIdOfEpoch('0')).toBeUndefined();
     });
 });
+
+describe('the run title an ended run keeps (hwip docs/session-runs.md Q39)', () => {
+    beforeEach(() => {
+        rmSync(join(TMP, 'state'), { recursive: true, force: true });
+    });
+    const at = (sec: number) => new Date(sec * 1000).toISOString();
+    const R1 = 1_790_000_000;
+    const R2 = R1 + 3600;
+    const sweep = (runId: number, seenAt: number, name?: { providerSessionName?: string | null; providerSessionNameSource?: 'user' | 'auto' }) =>
+        rememberSessions([{ name: 'hwip-api', cwd: '/work/api', agentKind: 'claude', runId: String(runId), startedAt: at(runId), ...name }], seenAt * 1000);
+    const endedRun = () => knownSessionsToReport([{ ...live('hwip-api'), runId: String(R2) }], (R2 + 60) * 1000)
+        .find((k) => k.runId === String(R1));
+
+    it('run title: reports the last name the agent gave the run, and who gave it', () => {
+        sweep(R1, R1 + 10, { providerSessionName: 'Fix login', providerSessionNameSource: 'auto' });
+        sweep(R1, R1 + 20, { providerSessionName: 'Fix login redirect', providerSessionNameSource: 'user' });
+        sweep(R2, R2 + 10);
+
+        expect(endedRun()).toMatchObject({ providerSessionName: 'Fix login redirect', providerSessionNameSource: 'user' });
+    });
+
+    it('run title: a sweep that read no name keeps the one the run had', () => {
+        sweep(R1, R1 + 10, { providerSessionName: 'Fix login', providerSessionNameSource: 'auto' });
+        sweep(R1, R1 + 20, { providerSessionName: null });
+        sweep(R1, R1 + 30);
+        sweep(R2, R2 + 10, { providerSessionName: 'Another run' });
+
+        expect(endedRun()).toMatchObject({ providerSessionName: 'Fix login', providerSessionNameSource: 'auto' });
+    });
+
+    it('run title: a run never named reports none', () => {
+        sweep(R1, R1 + 10);
+        sweep(R2, R2 + 10, { providerSessionName: 'Another run' });
+
+        const run = endedRun();
+        expect(run).toBeDefined();
+        expect(run).not.toHaveProperty('providerSessionName');
+        expect(run).not.toHaveProperty('providerSessionNameSource');
+    });
+
+    it('run title: a name without a source is reported without one', () => {
+        sweep(R1, R1 + 10, { providerSessionName: 'Fix login' });
+        sweep(R2, R2 + 10);
+
+        const run = endedRun();
+        expect(run).toMatchObject({ providerSessionName: 'Fix login' });
+        expect(run).not.toHaveProperty('providerSessionNameSource');
+    });
+
+    it('run title: a run carried on in a new tmux session keeps its name', () => {
+        const T2 = R1 + 600;
+        sweep(R1, R1 + 10, { providerSessionName: 'Fix login', providerSessionNameSource: 'user' });
+        // `exit`, then `hwip cc -c`: the first sweep of the new tmux session has not read the conversation yet…
+        rememberSessions([{ name: 'hwip-api', cwd: '/work/api', agentKind: 'claude', runId: String(T2), startedAt: at(T2), tmuxRunId: String(T2) }], (T2 + 5) * 1000);
+        // …the next knows it is R1 again, before the agent has named anything.
+        rememberSessions([{ name: 'hwip-api', cwd: '/work/api', agentKind: 'claude', runId: String(R1), startedAt: at(T2), tmuxRunId: String(T2) }], (T2 + 10) * 1000);
+        sweep(R2, R2 + 10);
+
+        expect(endedRun()).toMatchObject({ providerSessionName: 'Fix login', providerSessionNameSource: 'user' });
+    });
+
+    it('run title: a new name alone changes the fingerprint', () => {
+        const base = { name: 'hwip-api', agentKind: 'claude', runId: String(R1), lastSeenAt: at(R1) };
+        expect(knownSessionsFingerprint([{ ...base, providerSessionName: 'A' }]))
+            .not.toBe(knownSessionsFingerprint([{ ...base, providerSessionName: 'B' }]));
+        expect(knownSessionsFingerprint([{ ...base, providerSessionName: 'A', providerSessionNameSource: 'auto' }]))
+            .not.toBe(knownSessionsFingerprint([{ ...base, providerSessionName: 'A', providerSessionNameSource: 'user' }]));
+    });
+});

@@ -441,6 +441,9 @@ export interface ReportedKnownSession {
     lastSeq?: number;
     /** The later tmux sessions the run went on in (Q35): the server ends another run's push window at their start. */
     tmuxRunIds?: string[];
+    /** The last name the agent gave the run, and who gave it (hwip docs/session-runs.md Q39): what the phone calls it once ended. */
+    providerSessionName?: string;
+    providerSessionNameSource?: ProviderNameSource;
     lastSeenAt: string;
 }
 
@@ -474,12 +477,14 @@ export const knownSessionsToReport = (
             ...(e.startedAt ? { startedAt: e.startedAt } : {}),
             ...(e.runId ? seqs.get(runSeqsKey(e.name, e.runId)) : undefined),
             ...(e.tmuxRunIds?.length ? { tmuxRunIds: e.tmuxRunIds } : {}),
+            ...(e.providerSessionName ? { providerSessionName: e.providerSessionName } : {}),
+            ...(e.providerSessionName && e.providerSessionNameSource ? { providerSessionNameSource: e.providerSessionNameSource } : {}),
             lastSeenAt: e.lastSeenAt,
         }));
 };
 
 export const knownSessionsFingerprint = (known: ReportedKnownSession[]): string =>
-    known.map((k) => `${k.name} ${k.agentKind} ${k.runId ?? ''} ${k.lastSeenAt} ${k.firstSeq ?? ''} ${k.lastSeq ?? ''} ${k.tmuxRunIds?.join(',') ?? ''}`).sort().join('|');
+    known.map((k) => `${k.name} ${k.agentKind} ${k.runId ?? ''} ${k.lastSeenAt} ${k.firstSeq ?? ''} ${k.lastSeq ?? ''} ${k.tmuxRunIds?.join(',') ?? ''} ${k.providerSessionNameSource ?? ''} ${k.providerSessionName ?? ''}`).sort().join('|');
 
 export const sessionsFingerprint = (sessions: AgentSession[]): string =>
     sessions
@@ -4506,6 +4511,8 @@ export const collectSessionsVerbose = (): CollectResult => {
             startedAt: s.createdAt,
             tmuxRunId: runIdOfIso(s.createdAt),
             agentSessionId: ownResumeId(s.name),
+            providerSessionName: s.providerSessionName,
+            providerSessionNameSource: s.providerSessionNameSource,
         })),
     );
     return { sessions, rejected, targets, subagentTranscripts, recordable };

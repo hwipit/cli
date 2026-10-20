@@ -191,6 +191,18 @@ describe('collectSessionsVerbose — what the sweep does today', () => {
             expect(recallSession('hwip-conv')?.agentSessionId).toBe('conv-exact');
         });
 
+        // The registry is where an ended run's title comes from (hwip docs/session-runs.md Q39):
+        // a sweep that reads the agent's name must write it down, or the run ends nameless.
+        it('run title: records the name the agent gave the session, and who gave it', () => {
+            const claude = REMOTE_AGENTS.find((a) => a.kind === 'claude')!;
+            vi.spyOn(claude, 'resolveSessionName').mockReturnValue({ name: 'Fix login', source: 'user' });
+            listPanes = answer(paneRow({ session: 'hwip-named' }));
+
+            listener.collectSessionsVerbose();
+
+            expect(recallSession('hwip-named')).toMatchObject({ providerSessionName: 'Fix login', providerSessionNameSource: 'user' });
+        });
+
         it('records no conversation that two panes both answer to', () => {
             // opencode resolves the busiest session in the folder, so two panes
             // there can both name one conversation — resuming either would

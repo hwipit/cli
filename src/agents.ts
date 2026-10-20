@@ -19,10 +19,21 @@ import { delimiter, join } from 'path';
  * pi 0.85.1): global is `~/.pi/agent/skills/` and `~/.agents/skills/`, while
  * `.pi/skills/` is the PROJECT dir — scanning `~/.pi/skills` found only three
  * dangling symlinks and reported pi as having no skills at all.
+ *
+ * codex reads `$CODEX_HOME/skills` and `~/.agents/skills` (codex-rs
+ * `ext/skills/src/host_roots.rs`), and keeps its bundled skills in the hidden
+ * `.codex/skills/.system`, which the scanner's dot-skip would otherwise pass
+ * over. opencode reads the claude and agents dirs as well as its own
+ * (opencode `docs/skills.mdx § Discovery`, 2.0.29). Measured against the agents'
+ * own reports on 2026-10-20: codex 59 of `codex app-server` `skills/list` 59;
+ * opencode 87 of `opencode serve` `/api/skill` 91 — the rest are two built-ins
+ * and two skills it reads out of `~/.claude/skills/.trash/`, which the scanner's
+ * dot-skip leaves out on purpose.
  */
 export const AGENT_SKILL_DIRS: Record<string, string[]> = {
     claude: ['.claude/skills'],
-    codex: ['.codex/skills'],
+    codex: ['.codex/skills', '.codex/skills/.system', '.agents/skills'],
+    opencode: ['.claude/skills', '.agents/skills', '.config/opencode/skills'],
     pi: ['.pi/agent/skills', '.agents/skills'],
 };
 

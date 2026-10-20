@@ -8,8 +8,9 @@ import { AGENT_SKILL_DIRS } from './agents.js';
  * Payload discipline (plan PLAN-13-16-18): paths never leave this machine, so
  * the output carries skill names and nothing else.
  *
- * An entry is the slash command itself, so it carries whatever prefix the agent
- * registers the skill under (`AGENT_SKILL_PREFIX`, plugin names for Claude Code).
+ * An entry is the invocation token itself, so it carries whatever prefix the
+ * agent registers the skill under (`AGENT_SKILL_PREFIX`, plugin names for Claude
+ * Code) — including the `$`/`@` mention sigil of agents that take no slash.
  *
  * Names come from the directory, not from the file — an ASSUMPTION, not a rule
  * the agents enforce: pi resolves a skill's name as `frontmatter.name` and only
@@ -28,7 +29,10 @@ import { AGENT_SKILL_DIRS } from './agents.js';
  */
 
 export interface AgentCommandEntry {
-    /** What the user types after `/` — see `AGENT_SKILL_PREFIX`. */
+    /**
+     * What the user types to run the skill: after a `/`, unless it starts with a
+     * mention sigil (`$`, `@`), which is typed as is — see `AGENT_SKILL_PREFIX`.
+     */
     name: string;
 }
 
@@ -41,13 +45,25 @@ export interface AgentCommandEntry {
  * pi session was observed to abort rather than run the skill (2026-09-13).
  * Claude Code's user skills are `/<name>`; its PLUGIN skills are
  * `/<plugin>:<name>`, so those get their prefix from the install entry instead.
+ *
+ * codex and opencode do not run skills as slash commands at all. codex takes a
+ * `$name` mention (codex-rs `skills/src/selection.rs`; its `/skills` only opens a
+ * picker), and opencode 2.0 an `@name` mention (`docs/skills.mdx § Loading`; its
+ * `/api/command` lists no skills). Their entries carry that sigil, and a client
+ * inserts a name starting with `$` or `@` as typed, without the `/`.
  */
 const AGENT_SKILL_PREFIX: Record<string, string> = {
+    codex: '$',
+    opencode: '@',
     pi: 'skill:',
 };
 
-/** Agents that register skills filed under grouping folders — see `scanSkillDir`. */
-const AGENT_SKILL_RECURSIVE = new Set(['pi']);
+/**
+ * Agents that register skills filed under grouping folders — see `scanSkillDir`.
+ * opencode walks them too: it lists `~/.claude/skills/synced/<id>/<name>`, which
+ * Claude Code itself does not register (`/api/skill`, 2026-10-20).
+ */
+const AGENT_SKILL_RECURSIVE = new Set(['opencode', 'pi']);
 
 /** agentKind -> skill entries; agents with no skills are omitted. */
 export type AgentCommandCatalog = Record<string, AgentCommandEntry[]>;
@@ -128,26 +144,63 @@ const scanSkillDir = (dir: string, recursive = false, depth = 1): string[] => {
     return names;
 };
 
+/** A plain JSON object, as opposed to an array, a scalar or null. */
+const isObject = (value: unknown): value is Record<string, unknown> =>
+    typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/** The object under `key` in a JSON file, or an empty one when the file is missing, not JSON, or holds another shape there. */
+const readJsonObject = (file: string, key: string): Record<string, unknown> => {
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(readFileSync(file, 'utf-8'));
+    } catch {
+        return {};
+    }
+    const value = isObject(parsed) ? parsed[key] : undefined;
+    return isObject(value) ? value : {};
+};
+
 /**
- * Plugin skills live at `<installPath>/skills/<name>/SKILL.md`. Only install paths
- * listed in `installed_plugins.json` are scanned — the plugin cache also holds
- * uninstalled marketplace entries (514 of 710 on this machine) that must not
- * appear.
+ * Plugin keys Claude Code loads: `enabledPlugins[key] === true` in the user's
+ * `~/.claude/settings.json`. Installed is not enabled — a key set to `false`, or
+ * absent, registers nothing (`claude -p` init `slash_commands`, 2026-10-20: 71
+ * skills of two disabled plugins and one unlisted plugin were missing). A
+ * project's own settings can enable more, but the catalog is device-level.
+ */
+const enabledClaudePlugins = (home: string): Set<string> => {
+    const enabled = readJsonObject(join(home, '.claude', 'settings.json'), 'enabledPlugins');
+    return new Set(Object.entries(enabled).filter(([, on]) => on === true).map(([key]) => key));
+};
+
+/** Command files of a plugin: `<installPath>/commands/<name>.md`. */
+const scanCommandFiles = (dir: string): string[] =>
+    entriesOf(dir)
+        .filter((entry) => entry.endsWith('.md') && !entry.startsWith('.'))
+        .map((entry) => entry.slice(0, -'.md'.length));
+
+/**
+ * Plugin commands are `<installPath>/skills/<name>/SKILL.md` and
+ * `<installPath>/commands/<name>.md`, both registered as `/<plugin>:<name>`. Only
+ * install paths listed in `installed_plugins.json` are scanned — the plugin cache
+ * also holds uninstalled marketplace entries (514 of 710 on this machine) that
+ * must not appear — and of those only the enabled ones.
  */
 const scanClaudePlugins = (home: string): string[] => {
-    let parsed: { plugins?: Record<string, Array<{ installPath?: string }>> };
-    try {
-        parsed = JSON.parse(readFileSync(join(home, '.claude', 'plugins', 'installed_plugins.json'), 'utf-8'));
-    } catch {
-        return [];
-    }
+    const installed = readJsonObject(join(home, '.claude', 'plugins', 'installed_plugins.json'), 'plugins');
+    const enabled = enabledClaudePlugins(home);
     const names: string[] = [];
-    for (const [key, installs] of Object.entries(parsed.plugins ?? {})) {
+    for (const [key, installs] of Object.entries(installed)) {
+        if (!enabled.has(key) || !Array.isArray(installs)) continue;
         // Key is `<plugin>@<marketplace>`; the command prefix is the plugin half.
         const plugin = key.split('@')[0];
-        for (const install of installs ?? []) {
-            if (!install.installPath) continue;
-            names.push(...scanSkillDir(join(install.installPath, 'skills')).map((name) => `${plugin}:${name}`));
+        for (const install of installs) {
+            const installPath = isObject(install) ? install.installPath : undefined;
+            if (typeof installPath !== 'string' || !installPath) continue;
+            const commands = [
+                ...scanSkillDir(join(installPath, 'skills')),
+                ...scanCommandFiles(join(installPath, 'commands')),
+            ];
+            names.push(...commands.map((name) => `${plugin}:${name}`));
         }
     }
     return names;

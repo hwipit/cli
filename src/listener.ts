@@ -69,6 +69,7 @@ import {
     type KnownSession,
 } from './session-registry.js';
 import { foregroundAgentFor, REMOTE_AGENTS, type AgentKind, type RegisteredRemoteAgent } from './remote-agents.js';
+import type { ProviderNameSource } from './session-title.js';
 import {
     initialSubagentScanState,
     SUBAGENT_CATCH_UP_BYTES,
@@ -322,6 +323,12 @@ interface AgentSession {
      * word for both would put the ambiguity in the type.
      */
     providerSessionName?: string | null;
+    /**
+     * Who chose `providerSessionName`: a person in the agent (`'user'`) or the
+     * agent itself (`'auto'`). Omitted when the agent's store cannot say. The
+     * account setting that hides agent-made names hides `'auto'` only.
+     */
+    providerSessionNameSource?: ProviderNameSource;
     createdAt?: string;
     /**
      * Which run of the name this is (hwip docs/session-runs.md): tmux
@@ -478,7 +485,7 @@ export const sessionsFingerprint = (sessions: AgentSession[]): string =>
     sessions
         .map((s) => JSON.stringify([
             s.name, s.attached, s.agentKind, s.agentSessionId ?? null,
-            s.project, s.label ?? null, s.providerSessionName ?? null, s.createdAt ?? null, s.runId ?? null, s.firstSeq ?? null,
+            s.project, s.label ?? null, s.providerSessionName ?? null, s.providerSessionNameSource ?? null, s.createdAt ?? null, s.runId ?? null, s.firstSeq ?? null,
             s.lastActivityAt ?? null, s.state ?? null,
             s.stateChangedAt ?? null, s.stateRuleId ?? null,
             s.blockedPrompt?.id ?? null, s.blockedPrompt?.at ?? null,
@@ -4341,7 +4348,7 @@ export const collectSessionsVerbose = (): CollectResult => {
         const agentSessionId = info.currentPath
             ? (main.agent.resolveSessionId?.(info.currentPath, info.panePid ?? undefined) ?? null)
             : null;
-        const providerSessionName = info.currentPath
+        const providerName = info.currentPath
             ? (main.agent.resolveSessionName?.(info.currentPath, info.panePid ?? undefined) ?? null)
             : null;
         if (info.currentPath) paneCwdOf.set(name, info.currentPath);
@@ -4357,7 +4364,8 @@ export const collectSessionsVerbose = (): CollectResult => {
             agentSessionId,
             project: parsed.project,
             label: parsed.label,
-            providerSessionName,
+            providerSessionName: providerName?.name ?? null,
+            ...(providerName?.source ? { providerSessionNameSource: providerName.source } : {}),
             createdAt: epochToIso(group.created),
             runId: runIdOfEpoch(group.created),
             lastActivityAt: epochToIso(group.activity),

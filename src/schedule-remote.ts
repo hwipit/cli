@@ -12,6 +12,7 @@ import {
     nextOccurrence,
     readScheduleState,
     removeSchedule,
+    scheduleAnchor,
     validateSchedule,
     type Schedule,
     type ScheduleOutcome,
@@ -84,7 +85,7 @@ export const phoneScheduleList = (now: number, promptChars: number = LIST_PROMPT
             when: schedule.when,
             ...(schedule.prompt !== undefined && promptChars > 0 ? { prompt: clip(schedule.prompt, promptChars) } : {}),
             maxRuntimeMin: schedule.maxRuntimeMin,
-            nextAt: isoOrNull(nextOccurrence(schedule.when, now, Date.parse(schedule.createdAt))),
+            nextAt: isoOrNull(nextOccurrence(schedule.when, now, scheduleAnchor(schedule))),
             ...(last && lastAt ? { last: { outcome: last.outcome, at: lastAt } } : {}),
         };
     });

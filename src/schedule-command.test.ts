@@ -1,7 +1,7 @@
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
-import { describeWhen, runSchedule, type ScheduleCommandDeps } from './schedule-command.js';
+import { describe, expect, it, vi } from 'vitest';
+import { describeWhen, onStderr, runSchedule, type ScheduleCommandDeps } from './schedule-command.js';
 import { schedulesDir, scheduleStatePath, type Schedule } from './schedule.js';
 import { withTmpStateDir } from './test-state-dir.js';
 
@@ -25,6 +25,7 @@ const rig = (over: Partial<ScheduleCommandDeps> = {}): Rig => {
         validBranch: async (_root, name) => !name.includes('..') && !name.includes(' '),
         listenerRunning: () => true,
         promptKinds: () => ['claude', 'pi'],
+        refreshListener: async () => undefined,
         out: (line) => out.push(line),
         err: (line) => err.push(line),
         ...over,
@@ -306,6 +307,95 @@ describe('hwip schedule rm', () => {
         const r = rig();
         expect(await runSchedule(['rm', '../x'], r.deps)).toBe(2);
         expect(await runSchedule(['rm'], r.deps)).toBe(2);
+    });
+});
+
+describe('hwip schedule edit [F8-edit]', () => {
+    const LATER = NOW + 60 * 60_000;
+
+    it('changes the time, prompt and run time of a schedule and keeps the rest', async () => {
+        await runSchedule(['add', 'cc', '--at', '09:00', '--days', 'weekdays', '--prompt', 'old'], rig().deps);
+        const before = only();
+        const r = rig({ now: () => LATER });
+        expect(await runSchedule(['edit', before.id, '--every', '30m', '--prompt', 'new', '--max-runtime', '20m'], r.deps)).toBe(0);
+        const after = only();
+        expect(after).toMatchObject({
+            id: before.id, session: before.session, label: before.label, cwd: before.cwd, createdAt: before.createdAt,
+            updatedAt: new Date(LATER).toISOString(), when: { kind: 'every', minutes: 30 }, prompt: 'new', maxRuntimeMin: 20,
+        });
+        expect(r.out.join('\n')).toContain(`updated ${before.id}`);
+        expect(r.out.join('\n')).toContain('every 30m');
+        const listed = rig({ now: () => LATER });
+        await runSchedule(['list', '--json'], listed.deps);
+        expect(JSON.parse(listed.out[0]!)[0].nextAt).toBe(new Date(LATER + 30 * 60_000).toISOString());
+    });
+
+    it('says what the listener refresh does on stderr, so --json output stays one JSON line', async () => {
+        const out = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+        const err = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+        try {
+            await onStderr(async () => { console.log('hwip: listener 0.1.3 is stale — restarting on 0.1.4'); });
+            expect(out).not.toHaveBeenCalled();
+            expect(err).toHaveBeenCalledWith('hwip: listener 0.1.3 is stale — restarting on 0.1.4');
+            expect(console.log).toBe(out);
+        } finally {
+            vi.restoreAllMocks();
+        }
+    });
+
+    it('keeps the days when only --at changes, and the time when only --days changes', async () => {
+        await runSchedule(['add', 'cc', '--at', '09:00', '--days', 'weekdays'], rig().deps);
+        const { id } = only();
+        expect(await runSchedule(['edit', id, '--at', '10:30'], rig().deps)).toBe(0);
+        expect(only().when).toEqual({ kind: 'daily', at: '10:30', days: [1, 2, 3, 4, 5] });
+        expect(await runSchedule(['edit', id, '--days', 'mon,wed'], rig().deps)).toBe(0);
+        expect(only().when).toEqual({ kind: 'daily', at: '10:30', days: [1, 3] });
+    });
+
+    it('refuses --days alone on an --every schedule, and --at with --every', async () => {
+        await runSchedule(['add', 'cc', '--every', '1h'], rig().deps);
+        const { id } = only();
+        const r = rig();
+        expect(await runSchedule(['edit', id, '--days', 'mon'], r.deps)).toBe(2);
+        expect(await runSchedule(['edit', id, '--at', '09:00', '--every', '1h'], r.deps)).toBe(2);
+        expect(only().when).toEqual({ kind: 'every', minutes: 60 });
+    });
+
+    it('refuses nothing to change, flags that cannot be edited, an empty prompt and a prompt the agent cannot take', async () => {
+        await runSchedule(['add', 'codex', '--at', '09:00'], rig().deps);
+        const { id } = only();
+        const r = rig();
+        expect(await runSchedule(['edit', id], r.deps)).toBe(2);
+        expect(await runSchedule(['edit', id, '--label', 'x'], r.deps)).toBe(2);
+        expect(await runSchedule(['edit', id, '--wt', 'feat/x'], r.deps)).toBe(2);
+        expect(await runSchedule(['edit', id, '--prompt', ' '], r.deps)).toBe(2);
+        expect(await runSchedule(['edit', id, '--prompt', 'go'], r.deps)).toBe(2);
+        expect(r.err.join('\n')).toContain('cannot take a scheduled --prompt');
+        expect(only().updatedAt).toBeUndefined();
+    });
+
+    it('refuses a change that does not validate and leaves the schedule as it was', async () => {
+        await runSchedule(['add', 'cc', '--every', '1h', '--max-runtime', '60m'], rig().deps);
+        const { id } = only();
+        const r = rig();
+        expect(await runSchedule(['edit', id, '--every', '30m'], r.deps)).toBe(2);
+        expect(r.err.join('\n')).toContain('maxRuntimeMin');
+        expect(only().when).toEqual({ kind: 'every', minutes: 60 });
+    });
+
+    it('exits 1 for a schedule that is not there and 2 for an id that is not one or none', async () => {
+        expect(await runSchedule(['edit', 'abc123', '--at', '09:00'], rig().deps)).toBe(1);
+        expect(await runSchedule(['edit', '../x', '--at', '09:00'], rig().deps)).toBe(2);
+        expect(await runSchedule(['edit'], rig().deps)).toBe(2);
+    });
+
+    it('has a drifted listener replaced before the edited file is written, since an old one would skip it', async () => {
+        await runSchedule(['add', 'cc', '--at', '09:00'], rig().deps);
+        const { id } = only();
+        const order: string[] = [];
+        const r = rig({ refreshListener: async () => { order.push(only().updatedAt ?? 'unedited'); } });
+        expect(await runSchedule(['edit', id, '--at', '10:00'], r.deps)).toBe(0);
+        expect(order).toEqual(['unedited']);
     });
 });
 

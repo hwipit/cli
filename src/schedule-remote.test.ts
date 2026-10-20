@@ -58,6 +58,13 @@ describe('phoneScheduleList', () => {
     });
 });
 
+describe('phoneScheduleList after an edit [F8-edit]', () => {
+    it('gives the next run counted from the edit', () => {
+        put('aaaaaa', { updatedAt: '2026-10-03T00:20:00.000Z' });
+        expect(phoneScheduleList(Date.parse('2026-10-03T00:30:00.000Z'))!.schedules[0]!.nextAt).toBe('2026-10-03T01:20:00.000Z');
+    });
+});
+
 describe('applyPhoneSchedule', () => {
     const entry = { name: 'hwip-api', cwd: '/work/api', agentKind: 'claude', lastSeenAt: '2026-10-01T00:00:00.000Z' };
     const deps = (over: Partial<PhoneScheduleDeps> = {}): PhoneScheduleDeps => ({

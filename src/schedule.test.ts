@@ -13,8 +13,10 @@ import {
     parseWhen,
     readScheduleState,
     removeSchedule,
+    scheduleAnchor,
     scheduleStatePath,
     schedulesDir,
+    updateSchedule,
     validateSchedule,
     type Schedule,
     type ScheduleWhen,
@@ -428,5 +430,61 @@ describe('readScheduleState', () => {
     it('is not damaged when every entry is well formed', () => {
         write({ v: 1, schedules: { abc123: { cursor: 5 } } });
         expect(readScheduleState()).toEqual({ v: 1, schedules: { abc123: { cursor: 5 } } });
+    });
+});
+
+describe('updateSchedule [F8-edit]', () => {
+    const NOW = Date.parse('2026-10-20T12:00:00.000Z');
+
+    it('changes when, prompt and run time in place, keeping the id, the session and the creation time', () => {
+        addSchedule((id) => make(id, { prompt: 'old' }), () => 'abc123');
+        const r = updateSchedule('abc123', { when: { kind: 'every', minutes: 60 }, prompt: 'new', maxRuntimeMin: 45 }, NOW);
+        expect(r.ok).toBe(true);
+        const file = JSON.parse(readFileSync(join(schedulesDir(), 'abc123.json'), 'utf8'));
+        expect(file).toMatchObject({
+            id: 'abc123',
+            session: 'hwip-app-sched-abc123',
+            createdAt: '2026-10-01T00:00:00.000Z',
+            updatedAt: new Date(NOW).toISOString(),
+            when: { kind: 'every', minutes: 60 },
+            prompt: 'new',
+            maxRuntimeMin: 45,
+        });
+        expect(statSync(join(schedulesDir(), 'abc123.json')).mode & 0o777).toBe(0o600);
+        expect(listSchedules().schedules.map((s) => s.id)).toEqual(['abc123']);
+    });
+
+    it('leaves what the change does not name as it was, and keeps the count where it was when the time is not changed', () => {
+        addSchedule((id) => make(id, { prompt: 'keep' }), () => 'abc123');
+        expect(updateSchedule('abc123', { maxRuntimeMin: 20, prompt: 'new' }, NOW).ok).toBe(true);
+        const file = JSON.parse(readFileSync(join(schedulesDir(), 'abc123.json'), 'utf8'));
+        expect(file).toMatchObject({ prompt: 'new', when: { kind: 'every', minutes: 30 }, maxRuntimeMin: 20 });
+        expect(file.updatedAt).toBeUndefined();
+    });
+
+    it('refuses a change that would not validate, and leaves the file as it was', () => {
+        addSchedule((id) => make(id), () => 'abc123');
+        const before = readFileSync(join(schedulesDir(), 'abc123.json'), 'utf8');
+        const r = updateSchedule('abc123', { when: { kind: 'every', minutes: 15 } }, NOW);
+        expect(r).toMatchObject({ ok: false, failure: 'invalid' });
+        expect(readFileSync(join(schedulesDir(), 'abc123.json'), 'utf8')).toBe(before);
+    });
+
+    it('refuses an empty change, a schedule that is not there, and an id that names no file', () => {
+        addSchedule((id) => make(id), () => 'abc123');
+        expect(updateSchedule('abc123', {}, NOW)).toMatchObject({ ok: false, failure: 'invalid' });
+        expect(updateSchedule('zzzzzz', { maxRuntimeMin: 20 }, NOW)).toMatchObject({ ok: false, failure: 'missing' });
+        expect(updateSchedule('../x', { maxRuntimeMin: 20 }, NOW)).toMatchObject({ ok: false, failure: 'invalid' });
+    });
+
+    it('accepts updatedAt in a file and refuses one that is not a date', () => {
+        expect(validateSchedule(make('abc123', { updatedAt: '2026-10-20T00:00:00.000Z' })).ok).toBe(true);
+        expect(validateSchedule({ ...make('abc123'), updatedAt: 'yesterday' }).ok).toBe(false);
+        expect(validateSchedule(make('abc123', { updatedAt: '2026-09-30T00:00:00.000Z' })).ok).toBe(false);
+    });
+
+    it('counts from the edit when there was one, else from the creation', () => {
+        expect(scheduleAnchor(make('abc123'))).toBe(Date.parse('2026-10-01T00:00:00.000Z'));
+        expect(scheduleAnchor(make('abc123', { updatedAt: '2026-10-20T00:00:00.000Z' }))).toBe(Date.parse('2026-10-20T00:00:00.000Z'));
     });
 });

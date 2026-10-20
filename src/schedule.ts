@@ -25,6 +25,8 @@ export interface Schedule {
     /** Lowercase base36, 6 characters. It becomes a file name, so nothing else is accepted. */
     id: string;
     createdAt: string;
+    /** Set by `updateSchedule` when an edit changes `when`: the schedule counts its runs from here, not from `createdAt` (see `scheduleAnchor`). */
+    updatedAt?: string;
     source: 'cli' | 'phone';
     /** `REMOTE_AGENTS` kind. Checked against the table when it runs, not here: a hand-edited file is the runner's to refuse. */
     agentKind: string;
@@ -194,9 +196,9 @@ export const nextOccurrence = (when: ScheduleWhen, after: number, anchor: number
 const SCHEDULE_ID = /^[a-z0-9]{6}$/;
 const LABEL = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const AGENT_KIND = /^[A-Za-z0-9_-]{1,32}$/;
-const KEYS = new Set(['v', 'id', 'createdAt', 'source', 'agentKind', 'cwd', 'label', 'session', 'wt', 'agentArgs', 'prompt', 'when', 'maxRuntimeMin']);
+const KEYS = new Set(['v', 'id', 'createdAt', 'updatedAt', 'source', 'agentKind', 'cwd', 'label', 'session', 'wt', 'agentArgs', 'prompt', 'when', 'maxRuntimeMin']);
 
-const isScheduleId = (value: unknown): value is string => typeof value === 'string' && SCHEDULE_ID.test(value);
+export const isScheduleId = (value: unknown): value is string => typeof value === 'string' && SCHEDULE_ID.test(value);
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
     typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -236,11 +238,14 @@ export const validateSchedule = (input: unknown): Checked<Schedule> => {
     if (!isRecord(input)) return fail('a schedule must be an object');
     const unknownKey = Object.keys(input).find((k) => !KEYS.has(k));
     if (unknownKey !== undefined) return fail(`schedule has a field it does not know: ${unknownKey}`);
-    const { v, id, createdAt, source, agentKind, cwd, label, session, wt, agentArgs, prompt, when, maxRuntimeMin } = input;
+    const { v, id, createdAt, updatedAt, source, agentKind, cwd, label, session, wt, agentArgs, prompt, when, maxRuntimeMin } = input;
 
     if (v !== 1) return fail('schedule.v must be 1');
     if (!isScheduleId(id)) return fail('schedule.id must be 6 lowercase letters or digits');
     if (typeof createdAt !== 'string' || createdAt.length > 40 || !Number.isFinite(Date.parse(createdAt))) return fail('schedule.createdAt must be a date');
+    if (updatedAt !== undefined && (typeof updatedAt !== 'string' || updatedAt.length > 40 || !Number.isFinite(Date.parse(updatedAt)))) return fail('schedule.updatedAt must be a date');
+    // Before the schedule existed, it would count runs from a time it was not there for.
+    if (typeof updatedAt === 'string' && Date.parse(updatedAt) < Date.parse(createdAt)) return fail('schedule.updatedAt cannot be before createdAt');
     if (source !== 'cli' && source !== 'phone') return fail("schedule.source must be 'cli' or 'phone'");
     if (typeof agentKind !== 'string' || !AGENT_KIND.test(agentKind)) return fail('schedule.agentKind is not an agent kind');
     if (typeof cwd !== 'string' || !isAbsolute(cwd) || cwd.length > 4096 || !noControl(cwd)) return fail('schedule.cwd must be an absolute path');
@@ -371,6 +376,43 @@ export const addSchedule = (make: (id: string) => Schedule, newId: () => string 
     }
     return { ok: false, error: 'could not find a free schedule id', failure: 'io' };
 };
+
+/** What an edit may change. Everything else — the session, the directory, the agent — is what the schedule is. */
+export interface ScheduleChange {
+    when?: ScheduleWhen;
+    prompt?: string;
+    maxRuntimeMin?: number;
+}
+
+/** `missing` — no such schedule; `invalid` — the id or the changed schedule was refused; `io` — the file could not be written. */
+export type UpdateResult = { ok: true; schedule: Schedule } | { ok: false; error: string; failure: 'missing' | 'invalid' | 'io' };
+
+/**
+ * Change a schedule in place. The result passes `validateSchedule` before it is written, and is written whole (a
+ * listener reading it at the same time sees the old file or the new one). A change of `when` sets `updatedAt` to `now`:
+ * the runner counts the edited schedule's runs from then, so the times it had before are neither run nor counted as
+ * missed. A change of the prompt or the run time only keeps the count where it was — an hourly run stays on its hour.
+ */
+export const updateSchedule = (id: string, change: ScheduleChange, now: number): UpdateResult => {
+    if (!isScheduleId(id)) return { ok: false, error: 'not a schedule id', failure: 'invalid' };
+    if (change.when === undefined && change.prompt === undefined && change.maxRuntimeMin === undefined) {
+        return { ok: false, error: 'nothing to change', failure: 'invalid' };
+    }
+    const current = readOne(id);
+    if (!current) return { ok: false, error: `no schedule ${id}`, failure: 'missing' };
+    const next: Schedule = { ...current, ...change, ...(change.when === undefined ? {} : { updatedAt: new Date(now).toISOString() }) };
+    const checked = validateSchedule(next);
+    if (!checked.ok) return { ok: false, error: checked.error, failure: 'invalid' };
+    try {
+        replaceFile(schedulePath(id), `${JSON.stringify(next, null, 2)}\n`, undefined, 0o600);
+        return { ok: true, schedule: next };
+    } catch (err) {
+        return { ok: false, error: `could not write the schedule: ${err instanceof Error ? err.message : String(err)}`, failure: 'io' };
+    }
+};
+
+/** The time a schedule's runs are counted from: its last edit, else its creation. */
+export const scheduleAnchor = (schedule: Schedule): number => Date.parse(schedule.updatedAt ?? schedule.createdAt);
 
 /** `invalid` means the id could not name a schedule file; nothing was touched. */
 export type RemoveResult = 'removed' | 'missing' | 'invalid';

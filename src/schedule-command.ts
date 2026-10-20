@@ -1,5 +1,5 @@
 /**
- * `hwip schedule` — add, list and remove scheduled sessions (F8).
+ * `hwip schedule` — add, list, edit and remove scheduled sessions (F8).
  *
  * This only writes and reads the files in `schedule.ts`. The listener starts the sessions
  * (`schedule-runner.ts`), so nothing here needs a running listener except the sessions firing.
@@ -11,24 +11,28 @@ import {
     ALL_DAYS,
     DAY_NAMES,
     defaultMaxRuntimeMin,
+    isScheduleId,
     listSchedules,
     nextOccurrence,
     parseDuration,
     parseWhen,
     readScheduleState,
     removeSchedule,
+    scheduleAnchor,
     schedulesDir,
+    updateSchedule,
     validateSchedule,
     WEEKDAYS,
     type Checked,
     type Schedule,
+    type ScheduleChange,
     type ScheduleWhen,
 } from './schedule.js';
 import { checkoutOf } from './config.js';
 import { runningListenerPid } from './listener-process.js';
 import { findAgentBySubcommand, REMOTE_AGENTS } from './remote-agents.js';
 import { promptableScheduleKinds } from './schedule-ready.js';
-import { detectProjectDir, safeBasename, sanitizeLabel, tmuxSessionName } from './wrapper.js';
+import { detectProjectDir, ensureListenerRunning, safeBasename, sanitizeLabel, tmuxSessionName } from './wrapper.js';
 import { isValidBranchName, worktreeDirName } from './worktree.js';
 
 export interface ScheduleCommandDeps {
@@ -42,11 +46,14 @@ export interface ScheduleCommandDeps {
     listenerRunning: () => boolean;
     /** The agent kinds a prompt can be scheduled for: those whose detection rules can say `idle` (`schedule-ready.ts`). */
     promptKinds: () => readonly string[];
+    /** Has a running listener of an older build replaced (`ensureListenerRunning`): an old one would skip a file it cannot read. */
+    refreshListener: () => Promise<void>;
     out: (line: string) => void;
     err: (line: string) => void;
 }
 
 const USAGE = "usage: hwip schedule add <agent> (--at HH:MM [--days daily|weekdays|mon,wed,…] | --every <N>m|<N>h) [--prompt <text>] [--label <x>] [--wt <branch>] [--max-runtime <N>m|<N>h] [-- <agent args…>]\n"
+    + '       hwip schedule edit <id> [--at HH:MM] [--days …] [--every <N>m|<N>h] [--prompt <text>] [--max-runtime <N>m|<N>h]\n'
     + '       hwip schedule [list] [--json]\n'
     + '       hwip schedule rm <id>';
 
@@ -176,7 +183,7 @@ const handleAdd = async (words: string[], json: boolean, deps: ScheduleCommandDe
         return 2;
     }
     const { schedule } = added;
-    const next = nextOccurrence(schedule.when, deps.now(), Date.parse(schedule.createdAt));
+    const next = nextOccurrence(schedule.when, deps.now(), scheduleAnchor(schedule));
     if (json) {
         deps.out(JSON.stringify({ ...schedule, nextAt: isoOrNull(next) }));
     } else {
@@ -192,7 +199,7 @@ const handleList = (json: boolean, deps: ScheduleCommandDeps): number => {
     const state = readScheduleState().schedules;
     const now = deps.now();
     const rows = schedules.map((schedule) => {
-        const next = nextOccurrence(schedule.when, now, Date.parse(schedule.createdAt));
+        const next = nextOccurrence(schedule.when, now, scheduleAnchor(schedule));
         const last = state[schedule.id]?.last;
         return { schedule, next, last, running: state[schedule.id]?.running !== undefined };
     });
@@ -247,6 +254,96 @@ const handleRemove = (id: string | undefined, deps: ScheduleCommandDeps): number
     return 0;
 };
 
+/**
+ * Runs `work` with what it prints going to stderr: the listener refresh reports on stdout (`ensureListenerRunning`),
+ * and `hwip schedule edit --json` promises one JSON line there.
+ */
+export const onStderr = async (work: () => Promise<void>): Promise<void> => {
+    const log = console.log;
+    console.log = console.error;
+    try {
+        await work();
+    } finally {
+        console.log = log;
+    }
+};
+
+/** The schedule's new `when` from the flags given: what is not given is kept, so `--at` keeps the days and `--days` the time. */
+const editedWhen = (current: ScheduleWhen, at: string | undefined, days: string | undefined, every: string | undefined): Checked<ScheduleWhen | undefined> => {
+    if (at === undefined && days === undefined && every === undefined) return { ok: true, value: undefined };
+    if (every !== undefined || at !== undefined) {
+        const keptDays = current.kind === 'daily' ? current.days.map((day) => DAY_NAMES[day]).join(',') : undefined;
+        return parseWhen({ at, every, days: days ?? (every === undefined ? keptDays : undefined) });
+    }
+    if (current.kind !== 'daily') return { ok: false, error: '--days needs --at HH:MM for a schedule that runs --every' };
+    return parseWhen({ at: current.at, days });
+};
+
+const buildChange = (current: Schedule, flags: Flags, deps: ScheduleCommandDeps): Checked<ScheduleChange> => {
+    if (flags._arg1) return { ok: false, error: `unexpected word '${String(flags._arg1)}'` };
+    const fixed = ['label', 'wt'].find((name) => flags[name] !== undefined);
+    if (fixed) return { ok: false, error: `--${fixed} cannot be edited: the session is named for it; remove the schedule and add it again` };
+    const read = (name: string): Checked<string | undefined> => flagText(flags, name);
+    const [at, days, every, prompt, maxRuntime] = ['at', 'days', 'every', 'prompt', 'max-runtime'].map(read);
+    const bad = [at, days, every, prompt, maxRuntime].find((r) => !r.ok);
+    if (bad && !bad.ok) return bad;
+    const value = (r: Checked<string | undefined>): string | undefined => (r.ok ? r.value : undefined);
+
+    const when = editedWhen(current.when, value(at), value(days), value(every));
+    if (!when.ok) return when;
+    const change: ScheduleChange = when.value === undefined ? {} : { when: when.value };
+    const text = value(prompt);
+    if (text !== undefined) {
+        if (text.trim() === '') return { ok: false, error: '--prompt must not be empty' };
+        if (!deps.promptKinds().includes(current.agentKind)) {
+            return { ok: false, error: `${current.agentKind} cannot take a scheduled --prompt: hwip has no rule that tells when it is idle` };
+        }
+        change.prompt = text;
+    }
+    if (value(maxRuntime) !== undefined) {
+        const parsed = parseDuration(value(maxRuntime)!, '--max-runtime', '90m or 2h');
+        if (!parsed.ok) return parsed;
+        change.maxRuntimeMin = parsed.value;
+    }
+    if (Object.keys(change).length === 0) return { ok: false, error: 'edit needs --at, --days, --every, --prompt or --max-runtime' };
+    return { ok: true, value: change };
+};
+
+const handleEdit = async (words: string[], json: boolean, deps: ScheduleCommandDeps): Promise<number> => {
+    // `parseArgs` reads the words after the program name and script; the first word is the id.
+    const flags = parseArgs(['node', 'hwip', ...words]);
+    const id = flags._command === undefined ? '' : String(flags._command);
+    if (!isScheduleId(id)) {
+        deps.err(id ? `hwip schedule: '${id}' is not a schedule id` : 'hwip schedule: edit needs a schedule id');
+        return 2;
+    }
+    const current = listSchedules().schedules.find((schedule) => schedule.id === id);
+    if (!current) {
+        deps.err(`hwip schedule: no schedule ${id}`);
+        return 1;
+    }
+    const change = buildChange(current, flags, deps);
+    if (!change.ok) {
+        deps.err(`hwip schedule: ${change.error}`);
+        return 2;
+    }
+    if (deps.listenerRunning()) await deps.refreshListener();
+    const updated = updateSchedule(id, change.value, deps.now());
+    if (!updated.ok) {
+        deps.err(`hwip schedule: ${updated.error}`);
+        return updated.failure === 'missing' ? 1 : 2;
+    }
+    const { schedule } = updated;
+    const next = nextOccurrence(schedule.when, deps.now(), scheduleAnchor(schedule));
+    if (json) {
+        deps.out(JSON.stringify({ ...schedule, nextAt: isoOrNull(next) }));
+    } else {
+        deps.out(`updated ${schedule.id}: ${describeWhen(schedule.when)}${next === null ? '' : `, next ${formatTime(next)}`} (ends after ${schedule.maxRuntimeMin}m)`);
+    }
+    if (!deps.listenerRunning()) deps.err(LISTENER_NOTE);
+    return 0;
+};
+
 const JSON_ON = new Set(['--json', '--json=true', '--json=1', '--json=yes']);
 
 /** `words`: argv after `schedule`. Returns the exit code. */
@@ -261,6 +358,8 @@ export const runSchedule = async (words: string[], deps: ScheduleCommandDeps): P
     switch (sub) {
         case 'add':
             return handleAdd(rest, json, deps);
+        case 'edit':
+            return handleEdit(rest, json, deps);
         case 'list':
             if (rest.length > 0) break;
             return handleList(json, deps);
@@ -282,6 +381,7 @@ export const liveScheduleDeps = (): ScheduleCommandDeps => ({
     validBranch: (root, name) => isValidBranchName(root, name),
     listenerRunning: () => runningListenerPid() !== null,
     promptKinds: () => promptableScheduleKinds(REMOTE_AGENTS.map((a) => a.kind)),
+    refreshListener: () => onStderr(() => ensureListenerRunning(false)),
     out: (line) => console.log(line),
     err: (line) => console.error(line),
 });

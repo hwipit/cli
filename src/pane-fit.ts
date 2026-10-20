@@ -221,9 +221,15 @@ export const createPaneFitter = (run: TmuxRun, now: () => number = () => Date.no
         return desktops(Math.max(...clients.map((c) => clientUse(c, lastKeyAt))));
     };
 
-    /** The phone left: give the window back and forget its claim. */
+    /**
+     * The phone left: give the window back. When it typed, that is kept: the phone comes and goes (a screen
+     * locks, the app is left a moment, the mirror resubscribes), and on its return it is still the latest user
+     * unless the desktop was used since — the same test a renew applies.
+     */
     const release = (session: string): void => {
-        claims.delete(session);
+        const typedAt = claims.get(session)?.typedAt;
+        if (typedAt === undefined) claims.delete(session);
+        else claims.set(session, { typedAt });
         unfit(session);
     };
 
@@ -277,5 +283,8 @@ export const createPaneFitter = (run: TmuxRun, now: () => number = () => Date.no
         return cols === undefined || held.cols === clampViewerCols(cols);
     };
 
-    return { fit, recheck, recheckAll, claim, open, release, fitted };
+    /** Test hook: forget every claim, as a new listener starts with none. */
+    const forgetClaims = (): void => claims.clear();
+
+    return { fit, recheck, recheckAll, claim, open, release, fitted, forgetClaims };
 };

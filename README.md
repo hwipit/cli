@@ -437,7 +437,9 @@ block here.
    right-aligned clocks fold in two on a phone. Whoever used the session
    last decides its width, the way tmux's `window-size latest` does: typing
    from the phone makes the phone the latest user, and the listener resizes
-   the window to the phone's width. Opening the mirror does the same once
+   the window to the phone's width, and coming back to the mirror later
+   (a locked screen, a resubscribe) takes it again unless the desktop was
+   used since. Opening the mirror without typing does the same once
    the desktop terminal has been idle for a minute, so a phone reconnecting
    on its own never shrinks a terminal you are typing in. Pressing a key in
    (or attaching) a desktop terminal makes it the latest user, and within a

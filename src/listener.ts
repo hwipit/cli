@@ -774,6 +774,8 @@ const worktreeCleanup = createWorktreeCleanup({
 
 /** Sizes a watched window to its viewer while the phone is its latest user (pane-fit.ts). */
 const paneFitter = createPaneFitter(runTmux, undefined, macosLastKeyAt());
+/** Test hook. */
+export const resetPaneFitClaims = (): void => paneFitter.forgetClaims();
 /** How often fitted windows are checked for a desktop that took them back; idle windows cost nothing. */
 const PANE_FIT_RECHECK_MS = 1_000;
 

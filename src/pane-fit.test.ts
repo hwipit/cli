@@ -299,6 +299,38 @@ describe('createPaneFitter', () => {
         expect(fitter.fitted('s')).toBe(false);
     });
 
+    it('a phone that typed, left and came back takes the width again while the desktop stayed unused', () => {
+        const t = fakeTmux({ attached: 1, panes: 1, width: 120, activity: [995] });
+        const clock = fakeClock(1000);
+        const fitter = createPaneFitter(t.run, clock.now);
+        fitter.claim('s');
+        fitter.fit('s', 's', 45);
+        clock.seconds = 1010;
+        fitter.release('s');
+        expect(fitter.fitted('s')).toBe(false);
+
+        // Back 10 s later: the desktop was used 25 s ago, before the phone typed, so the phone is still its latest user.
+        clock.seconds = 1020;
+        fitter.open('s');
+        fitter.fit('s', 's', 45);
+        expect(fitter.fitted('s')).toBe(true);
+    });
+
+    it('a phone that comes back after the desktop typed waits for the desktop to go idle', () => {
+        const t = fakeTmux({ attached: 1, panes: 1, width: 120, activity: [995] });
+        const clock = fakeClock(1000);
+        const fitter = createPaneFitter(t.run, clock.now);
+        fitter.claim('s');
+        fitter.fit('s', 's', 45);
+        fitter.release('s');
+        t.win.activity = [1005];
+        clock.seconds = 1020;
+        fitter.open('s');
+        fitter.fit('s', 's', 45);
+
+        expect(fitter.fitted('s')).toBe(false);
+    });
+
     it('leaves an attached window to a client that attached after the phone claimed it', () => {
         const t = fakeTmux({ attached: 1, panes: 1, width: 120, activity: [1001] });
         const fitter = createPaneFitter(t.run, fakeClock(1000).now);

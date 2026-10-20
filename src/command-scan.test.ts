@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -23,6 +23,29 @@ const skill = (dir: string, name: string, body = 'anything at all') => {
 };
 
 const names = (entries: Array<{ name: string }> | undefined) => (entries ?? []).map((e) => e.name);
+
+/** `~/.claude/settings.json` `enabledPlugins` — Claude Code loads a plugin only when its key is `true` there. */
+const enablePlugins = (enabled: Record<string, boolean>) => {
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify({ enabledPlugins: enabled }));
+};
+
+/** Registers `<key>` in `installed_plugins.json` with an install dir of its own, and returns that dir. */
+const installPlugin = (key: string): string => {
+    const plugins = join(home, '.claude', 'plugins');
+    const install = join(plugins, 'cache', 'mkt', key.split('@')[0], '1.0.0');
+    mkdirSync(install, { recursive: true });
+    const file = join(plugins, 'installed_plugins.json');
+    let parsed: { version: number; plugins: Record<string, unknown> } = { version: 2, plugins: {} };
+    try {
+        parsed = JSON.parse(readFileSync(file, 'utf-8'));
+    } catch {
+        // first plugin of the fixture
+    }
+    parsed.plugins[key] = [{ scope: 'user', installPath: install }];
+    writeFileSync(file, JSON.stringify(parsed));
+    return install;
+};
 
 beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), 'cmdscan-'));
@@ -139,6 +162,7 @@ describe('scanAgentCommands', () => {
             join(plugins, 'installed_plugins.json'),
             JSON.stringify({ version: 2, plugins: { 'shipper@official': [{ scope: 'user', installPath: install }] } }),
         );
+        enablePlugins({ 'shipper@official': true });
         // Different commands: `/ship` is the user skill, `/shipper:ship` the plugin's.
         expect(names(scanAgentCommands(home).catalog.claude).sort()).toEqual(['ship', 'shipper:ship']);
     });
@@ -155,6 +179,7 @@ describe('scanAgentCommands', () => {
             join(plugins, 'installed_plugins.json'),
             JSON.stringify({ version: 2, plugins: { 'installed-plugin@official': [{ scope: 'user', installPath: cache }] } }),
         );
+        enablePlugins({ 'installed-plugin@official': true });
         const found = names(scanAgentCommands(home).catalog.claude);
         expect(found).toContain('installed-plugin:plugin-skill');
         expect(found).not.toContain('installed-plugin:orphan-skill');
@@ -208,6 +233,54 @@ describe('scanAgentCommands', () => {
         const { catalog } = scanAgentCommands(home);
         expect(names(catalog.claude)).toEqual(['shared']);
         expect(names(catalog.pi)).toEqual(['skill:shared']);
+    });
+});
+
+// Each agent's catalog, measured against the agent's own report on 2026-10-20: `codex app-server`
+// `skills/list`, `opencode serve` `/api/skill`, `claude -p` init `slash_commands`.
+describe('agent catalog', () => {
+    it('lists codex skills from ~/.agents/skills and its own dirs as $mentions', () => {
+        skill(join(home, '.agents', 'skills'), 'tdd');
+        skill(join(home, '.codex', 'skills'), 'mine');
+        // Codex ships its system skills in a hidden folder and registers them all the same.
+        skill(join(home, '.codex', 'skills', '.system'), 'imagegen');
+        expect(names(scanAgentCommands(home).catalog.codex).sort()).toEqual(['$imagegen', '$mine', '$tdd']);
+    });
+
+    it('lists opencode skills from the claude, agents and opencode dirs as @mentions, once each', () => {
+        skill(join(home, '.claude', 'skills'), 'plan');
+        skill(join(home, '.agents', 'skills'), 'plan');
+        skill(join(home, '.agents', 'skills'), 'tdd');
+        skill(join(home, '.config', 'opencode', 'skills'), 'local');
+        expect(names(scanAgentCommands(home).catalog.opencode).sort()).toEqual(['@local', '@plan', '@tdd']);
+    });
+
+    it('finds an opencode skill filed under grouping folders, which claude does not register', () => {
+        // Claude Code's synced skills land in `~/.claude/skills/synced/<id>/<name>`; opencode walks into them.
+        skill(join(home, '.claude', 'skills', 'synced', 'abc'), 'pdf');
+        const { catalog } = scanAgentCommands(home);
+        expect(names(catalog.opencode)).toEqual(['@pdf']);
+        expect(catalog.claude).toBeUndefined();
+    });
+
+    it('leaves out the skills of a claude plugin that is installed but not enabled', () => {
+        skill(join(installPlugin('on@mkt'), 'skills'), 'a');
+        skill(join(installPlugin('off@mkt'), 'skills'), 'b');
+        skill(join(installPlugin('unlisted@mkt'), 'skills'), 'c');
+        enablePlugins({ 'on@mkt': true, 'off@mkt': false });
+        expect(names(scanAgentCommands(home).catalog.claude)).toEqual(['on:a']);
+    });
+
+    it('lists a claude plugin command file as a plugin command, once when a skill shares its name', () => {
+        const install = installPlugin('cave@mkt');
+        skill(join(install, 'skills'), 'cave');
+        mkdirSync(join(install, 'commands'), { recursive: true });
+        writeFileSync(join(install, 'commands', 'cave.md'), 'body');
+        writeFileSync(join(install, 'commands', 'cave-init.md'), 'body');
+        // A sibling of another format is not a Claude Code command.
+        writeFileSync(join(install, 'commands', 'cave-init.toml'), 'body');
+        enablePlugins({ 'cave@mkt': true });
+        expect(names(scanAgentCommands(home).catalog.claude).sort()).toEqual(['cave:cave', 'cave:cave-init']);
     });
 });
 

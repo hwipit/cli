@@ -454,6 +454,14 @@ describe('updateSchedule [F8-edit]', () => {
         expect(listSchedules().schedules.map((s) => s.id)).toEqual(['abc123']);
     });
 
+    it('keeps the count where it was when the time sent is the time it had', () => {
+        addSchedule((id) => make(id), () => 'abc123');
+        expect(updateSchedule('abc123', { when: { kind: 'every', minutes: 30 }, maxRuntimeMin: 20 }, NOW).ok).toBe(true);
+        const file = JSON.parse(readFileSync(join(schedulesDir(), 'abc123.json'), 'utf8'));
+        expect(file.updatedAt).toBeUndefined();
+        expect(file.maxRuntimeMin).toBe(20);
+    });
+
     it('leaves what the change does not name as it was, and keeps the count where it was when the time is not changed', () => {
         addSchedule((id) => make(id, { prompt: 'keep' }), () => 'abc123');
         expect(updateSchedule('abc123', { maxRuntimeMin: 20, prompt: 'new' }, NOW).ok).toBe(true);

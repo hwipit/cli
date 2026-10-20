@@ -392,7 +392,7 @@ export type UpdateResult = { ok: true; schedule: Schedule } | { ok: false; error
 
 /**
  * Change a schedule in place. The result passes `validateSchedule` before it is written, and is written whole (a
- * listener reading it at the same time sees the old file or the new one). A change of `when` sets `updatedAt` to `now`:
+ * listener reading it at the same time sees the old file or the new one). A new `when` sets `updatedAt` to `now`:
  * the runner counts the edited schedule's runs from then, so the times it had before are neither run nor counted as
  * missed. A change of the prompt or the run time only keeps the count where it was — an hourly run stays on its hour.
  */
@@ -403,7 +403,9 @@ export const updateSchedule = (id: string, change: UncheckedScheduleChange, now:
     }
     const current = readOne(id);
     if (!current) return { ok: false, error: `no schedule ${id}`, failure: 'missing' };
-    const checked = validateSchedule({ ...current, ...change, ...(change.when === undefined ? {} : { updatedAt: new Date(now).toISOString() }) });
+    // The same time sent again (an app sends the sheet's) is not a new one: the count stays where it was.
+    const retimed = change.when !== undefined && JSON.stringify(change.when) !== JSON.stringify(current.when);
+    const checked = validateSchedule({ ...current, ...change, ...(retimed ? { updatedAt: new Date(now).toISOString() } : {}) });
     if (!checked.ok) return { ok: false, error: checked.error, failure: 'invalid' };
     try {
         replaceFile(schedulePath(id), `${JSON.stringify(checked.value, null, 2)}\n`, undefined, 0o600);

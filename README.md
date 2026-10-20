@@ -442,7 +442,11 @@ block here.
    on its own never shrinks a terminal you are typing in. Pressing a key in
    (or attaching) a desktop terminal makes it the latest user, and within a
    renew (5 s) the window is handed back to tmux, which sizes it to that
-   terminal. While the phone holds a session, a desktop terminal still
+   terminal. Moving the mouse over a desktop pane or clicking another
+   pane is not using it: on macOS the listener reads when a key was last
+   pressed (the HID system clock, no permission needed) and counts a
+   desktop terminal as used no later than that key or its attach. Elsewhere
+   any tmux client activity counts. While the phone holds a session, a desktop terminal still
    attached to it shows it narrower. When the phone leaves, a session no
    terminal is attached to gets its old width back and an attached one is
    sized to its terminal. A window split into panes is never resized. A

@@ -7,14 +7,16 @@ const SEP = '␟';
  * A tmux with one window per target, answering display-message from state.
  * `activity` is each attached client's `#{client_activity}`, in seconds.
  */
-const fakeTmux = (win: { attached: number; panes: number; width: number; activity?: number[] }) => {
+const fakeTmux = (win: { attached: number; panes: number; width: number; activity?: number[]; clients?: string[] }) => {
     const calls: string[][] = [];
     const run: TmuxRun = (args) => {
         calls.push(args);
         if (args[0] === 'display-message') {
             return { status: 0, stdout: `${win.attached}${SEP}${win.panes}${SEP}${win.width}\n` };
         }
-        if (args[0] === 'list-clients') return { status: 0, stdout: (win.activity ?? []).map((a) => `${a}\n`).join('') };
+        if (args[0] === 'list-clients') {
+            return { status: 0, stdout: (win.clients ?? (win.activity ?? []).map(String)).map((c) => `${c}\n`).join('') };
+        }
         if (args[0] === 'resize-window') win.width = Number(args[args.indexOf('-x') + 1]);
         return { status: 0, stdout: '' };
     };
@@ -40,6 +42,69 @@ describe('clampViewerCols', () => {
 });
 
 describe('createPaneFitter', () => {
+    describe('with the desktop key clock', () => {
+        /** A desktop whose client attached at 800 and was last active (mouse, focus or key) at `activity`. */
+        const setup = (activity: number, keyAt: number) => {
+            const t = fakeTmux({ attached: 1, panes: 1, width: 120, clients: [`900${SEP}800`] });
+            const clock = fakeClock(1000);
+            const key = { at: keyAt as number | null };
+            const fitter = createPaneFitter(t.run, clock.now, () => key.at);
+            fitter.claim('s');
+            fitter.fit('s', 's', 45);
+            clock.seconds = 1010;
+            t.win.clients = [`${activity}${SEP}800`];
+            return { t, clock, key, fitter };
+        };
+
+        it('keeps the phone width when the desktop only moved the mouse or focus since the phone typed', () => {
+            const { t, fitter } = setup(1005, 950);
+            fitter.fit('s', 's', 45);
+
+            expect(fitter.fitted('s')).toBe(true);
+            expect(t.calls).not.toContainEqual(['set-option', '-w', '-u', '-t', 's', 'window-size']);
+        });
+
+        it('hands the window back once a key is pressed on the desktop after the phone typed', () => {
+            const { fitter, key } = setup(1006, 950);
+            key.at = 1006;
+            fitter.fit('s', 's', 45);
+
+            expect(fitter.fitted('s')).toBe(false);
+        });
+
+        it('counts a key pressed just before the mouse moved over the window', () => {
+            const { fitter, key } = setup(1007, 950);
+            key.at = 1005;
+            fitter.fit('s', 's', 45);
+
+            expect(fitter.fitted('s')).toBe(false);
+        });
+
+        it('hands the window back to a client that attached after the phone typed, key or not', () => {
+            const { t, fitter } = setup(1005, 950);
+            t.win.clients = [`1005${SEP}1005`];
+            fitter.fit('s', 's', 45);
+
+            expect(fitter.fitted('s')).toBe(false);
+        });
+
+        it('opening takes a window whose desktop only moved the mouse within the last minute', () => {
+            const t = fakeTmux({ attached: 1, panes: 1, width: 120, clients: [`995${SEP}800`] });
+            const fitter = createPaneFitter(t.run, fakeClock(1000).now, () => 900);
+            fitter.fit('s', 's', 45);
+
+            expect(fitter.fitted('s')).toBe(true);
+        });
+
+        it('opening still leaves a desktop that typed within the last minute alone', () => {
+            const t = fakeTmux({ attached: 1, panes: 1, width: 120, clients: [`995${SEP}800`] });
+            const fitter = createPaneFitter(t.run, fakeClock(1000).now, () => 990);
+            fitter.fit('s', 's', 45);
+
+            expect(fitter.fitted('s')).toBe(false);
+        });
+    });
+
     it('fits a detached single-pane window to the viewer and marks its old width', () => {
         const t = fakeTmux({ attached: 0, panes: 1, width: 120 });
         const fitter = createPaneFitter(t.run);

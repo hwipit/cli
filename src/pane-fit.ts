@@ -1,3 +1,5 @@
+import { spawnSync } from 'child_process';
+
 /**
  * Fit a tmux window to the phone that is watching it.
  *
@@ -12,7 +14,11 @@
  * decides its width — the rule tmux's own `window-size latest` follows. The
  * phone uses a window when it types into it ({@link claim}); a client uses it
  * when it attaches or a key is pressed in it, which is what
- * `#{client_activity}` records. Opening the mirror ({@link open}) is a weaker
+ * `#{client_activity}` records. tmux also moves that time on a mouse move
+ * over the window and on a focus change (herdr sends one to a pane whenever
+ * another pane is clicked), which are not using it. Where the time of the
+ * desktop's last key press is known ({@link macosLastKeyAt}), a client counts
+ * as used no later than that key, or than when it attached. Opening the mirror ({@link open}) is a weaker
  * claim: it also covers an automatic resubscribe nobody asked for, so it only
  * takes a window whose desktop has been idle for {@link DESKTOP_IDLE_SECONDS}.
  * While the phone is the later of the two, the
@@ -70,11 +76,45 @@ export const releaseStaleFits = (run: TmuxRun): number => {
     return released;
 };
 
-/** The newest `#{client_activity}` (seconds) among the clients on `target`'s session, or null when unknown. */
-const latestClientUse = (run: TmuxRun, target: string): number | null => {
-    const r = run(['list-clients', '-t', target, '-F', '#{client_activity}']);
+/** When the desktop last pressed a key, in seconds since the epoch, or null when it cannot tell. */
+export type LastKeyAt = () => number | null;
+
+/**
+ * The Mac's last key press, from the HID system's own clock (no Input Monitoring permission needed). Read
+ * through `osascript`, at most once a second; null off macOS or when the read fails.
+ */
+export const macosLastKeyAt = (now: () => number = () => Date.now()): LastKeyAt => {
+    let cached: { readAt: number; keyAt: number | null } | undefined;
+    return () => {
+        if (process.platform !== 'darwin') return null;
+        const readAt = now();
+        if (cached && readAt - cached.readAt < 1000) return cached.keyAt;
+        // kCGEventSourceStateHIDSystemState = 1, kCGEventKeyDown = 10.
+        const r = spawnSync('osascript', ['-l', 'JavaScript', '-e',
+            "ObjC.import('CoreGraphics'); $.CGEventSourceSecondsSinceLastEventType(1, 10)"],
+        { encoding: 'utf8', timeout: 2000 });
+        const idle = Number(r.stdout);
+        const keyAt = r.status === 0 && r.stdout.trim() !== '' && Number.isFinite(idle) ? Math.floor((readAt / 1000) - idle) : null;
+        cached = { readAt, keyAt };
+        return keyAt;
+    };
+};
+
+/**
+ * When a client on `target`'s session was last used (seconds), the newest among them, or null when unknown.
+ * With `lastKeyAt`, a client's activity counts only up to the desktop's last key press, or when it attached:
+ * a mouse move or focus change after the last key is not use.
+ */
+const latestClientUse = (run: TmuxRun, target: string, lastKeyAt: LastKeyAt): number | null => {
+    const r = run(['list-clients', '-t', target, '-F', `#{client_activity}${SEP}#{client_created}`]);
     if (r.status !== 0) return null;
-    const uses = r.stdout.split('\n').filter(Boolean).map(Number).filter(Number.isFinite);
+    const keyAt = lastKeyAt();
+    const uses = r.stdout.split('\n').filter(Boolean).flatMap((line) => {
+        const [activity, created] = line.split(SEP).map(Number);
+        if (!Number.isFinite(activity)) return [];
+        if (keyAt === null) return [activity];
+        return [Math.max(Math.min(activity, keyAt), Number.isFinite(created) ? created : 0)];
+    });
     return uses.length > 0 ? Math.max(...uses) : null;
 };
 
@@ -88,7 +128,7 @@ const readWindow = (run: TmuxRun, target: string): { attached: number; panes: nu
 };
 
 /** `now` is in ms, as `Date.now`; tmux reports client use in whole seconds. */
-export const createPaneFitter = (run: TmuxRun, now: () => number = () => Date.now()) => {
+export const createPaneFitter = (run: TmuxRun, now: () => number = () => Date.now(), lastKeyAt: LastKeyAt = () => null) => {
     const fits = new Map<string, Fit>();
     /** When the phone last typed into and last opened each session, in tmux's seconds. */
     const claims = new Map<string, { typedAt?: number; openedAt?: number }>();
@@ -131,7 +171,7 @@ export const createPaneFitter = (run: TmuxRun, now: () => number = () => Date.no
     const notOurs = (session: string, target: string, win: { attached: number; panes: number }): boolean => {
         if (win.panes !== 1) return true;
         if (win.attached === 0) return false;
-        const clientUse = latestClientUse(run, target);
+        const clientUse = latestClientUse(run, target, lastKeyAt);
         if (clientUse === null) return true;
         const claimed = claims.get(session);
         const typedSince = claimed?.typedAt !== undefined && clientUse < claimed.typedAt;

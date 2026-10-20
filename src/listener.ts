@@ -125,7 +125,7 @@ import { createLanTransfer, type LanTransfer } from './lan-transfer.js';
 import { createDeviceKeyRegistration, type DeviceKeyRegistration } from './device-presence.js';
 import { PAYLOAD_LIMIT_BYTES, scanAgentCommands, type AgentCommandCatalog, type ScanResult } from './command-scan.js';
 import { hashListenerId, readMachineId, readStickyListenerId, rememberListenerId } from './listener-device-id.js';
-import { createPaneFitter, releaseStaleFits } from './pane-fit.js';
+import { createPaneFitter, macosLastKeyAt, releaseStaleFits } from './pane-fit.js';
 import { log, silenceListenerLog } from './listener-log.js';
 import { invalidateTmuxSocketCache, tmuxArgs } from './tmux-socket.js';
 import {
@@ -773,7 +773,7 @@ const worktreeCleanup = createWorktreeCleanup({
 });
 
 /** Sizes a watched window to its viewer while the phone is its latest user (pane-fit.ts). */
-const paneFitter = createPaneFitter(runTmux);
+const paneFitter = createPaneFitter(runTmux, undefined, macosLastKeyAt());
 
 // ─── Session inventory ──────────────────────────────────────────────
 

@@ -3397,6 +3397,8 @@ export const handleStreamControl = (
             entry.cols = req.cols;
             const renewTarget = tmuxTargetFor(req.sessionName);
             if (renewTarget !== null && (colsChanged || streamsOf(req.sessionName).length === 1)) paneFitter.fit(req.sessionName, renewTarget, req.cols);
+            // Otherwise keep the width the pane has, but still notice a desktop client used since (pane-fit.ts).
+            else paneFitter.recheck(req.sessionName);
             return true;
         }
         // Addressed to us but we hold no such stream: it was reaped (lost
@@ -3437,6 +3439,8 @@ export const handleStreamControl = (
         return true;
     }
     const fitTarget = tmuxTargetFor(sessionName);
+    // Opening the mirror is using the session: the phone is its latest user (pane-fit.ts).
+    paneFitter.claim(sessionName);
     if (fitTarget !== null) paneFitter.fit(sessionName, fitTarget, req.cols);
     let lastContent: string | null = null;
     // The cursor's last reported place, as `line,col`. Part of the diff-gate
@@ -3907,6 +3911,19 @@ const deliverInput = (input: PendingInput): void => {
     // instead of falling back to the REST push path.
     // Only a reason that does not depend on the text: this input may be sealed.
     if (!injected) input.send(streamErrorFrame(input.sessionName, 'input_rejected', input, reason && isSessionStateRefusal(reason) ? reason : undefined));
+    else takeWidthBack(input.sessionName, input.deviceId);
+};
+
+/**
+ * Typing from the phone makes it the session's latest user again (pane-fit.ts): a window a desktop
+ * client took back is sized to the sender's width once more.
+ */
+const takeWidthBack = (sessionName: string, deviceId: string | undefined): void => {
+    paneFitter.claim(sessionName);
+    const target = tmuxTargetFor(sessionName);
+    const viewer = activeStreams.get(streamKey(sessionName, deviceId)) ?? streamsOf(sessionName)[0];
+    if (target === null || !viewer) return;
+    paneFitter.fit(sessionName, target, viewer.cols);
 };
 
 /** Ceiling on concurrent sender lanes. The lane key includes a relay-stamped

@@ -176,6 +176,21 @@ describe('createPaneFitter', () => {
         expect(fitter.fitted('s')).toBe(false);
     });
 
+    it('rechecks a held window, handing it back to a client used since without resizing', () => {
+        const t = fakeTmux({ attached: 1, panes: 1, width: 120, activity: [900] });
+        const clock = fakeClock(1000);
+        const fitter = createPaneFitter(t.run, clock.now);
+        fitter.fit('s', 's', 45);
+        fitter.recheck('s');
+        expect(t.resizes()).toEqual(['45']);
+        expect(fitter.fitted('s')).toBe(true);
+
+        t.win.activity = [1005];
+        clock.seconds = 1006;
+        fitter.recheck('s');
+        expect(fitter.fitted('s')).toBe(false);
+    });
+
     it('releases nothing it never fitted', () => {
         const t = fakeTmux({ attached: 0, panes: 1, width: 120 });
         createPaneFitter(t.run).release('s');

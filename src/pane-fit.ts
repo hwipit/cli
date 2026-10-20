@@ -83,7 +83,7 @@ const readWindow = (run: TmuxRun, target: string): { attached: number; panes: nu
 };
 
 /** `now` is in ms, as `Date.now`; tmux reports client use in whole seconds. */
-export const createPaneFitter = (run: TmuxRun, now: () => number = Date.now) => {
+export const createPaneFitter = (run: TmuxRun, now: () => number = () => Date.now()) => {
     const fits = new Map<string, Fit>();
     /** When the phone last used each session, in tmux's seconds. */
     const claims = new Map<string, number>();
@@ -110,6 +110,18 @@ export const createPaneFitter = (run: TmuxRun, now: () => number = Date.now) => 
         run(['set-option', '-w', '-u', '-t', fit.target, FIT_MARK]);
     };
 
+    /**
+     * The window is not the phone's to size: it is split, or an attached client was used at or after the
+     * phone's claim. A tie goes to the desktop: tmux counts in whole seconds, and shrinking a terminal in
+     * use is the worse mistake.
+     */
+    const notOurs = (session: string, target: string, win: { attached: number; panes: number }): boolean => {
+        if (win.panes !== 1) return true;
+        if (win.attached === 0) return false;
+        const clientUse = latestClientUse(run, target);
+        return clientUse === null || clientUse >= (claims.get(session) ?? 0);
+    };
+
     /** The phone left: give the window back and forget its claim. */
     const release = (session: string): void => {
         claims.delete(session);
@@ -130,10 +142,7 @@ export const createPaneFitter = (run: TmuxRun, now: () => number = Date.now) => 
         if (!win) return;
         const held = fits.get(session);
         if (!claims.has(session)) claim(session);
-        const clientUse = win.attached > 0 ? latestClientUse(run, target) : null;
-        // A tie goes to the desktop: tmux counts in whole seconds, and shrinking a terminal in use is the worse mistake.
-        const clientIsLatest = win.attached > 0 && (clientUse === null || clientUse >= (claims.get(session) ?? 0));
-        if (clientIsLatest || win.panes !== 1) {
+        if (notOurs(session, target, win)) {
             // Only the fit goes: the claim stays, so the desktop keeps the window until the phone uses it again.
             if (held) unfit(session);
             return;
@@ -149,5 +158,13 @@ export const createPaneFitter = (run: TmuxRun, now: () => number = Date.now) => 
         fits.set(session, { target, width, cols: want });
     };
 
-    return { fit, claim, release, fitted: (session: string): boolean => fits.has(session) };
+    /** Hand a held window back if a client was used since or it was split, without touching its width otherwise. */
+    const recheck = (session: string): void => {
+        const held = fits.get(session);
+        if (!held) return;
+        const win = readWindow(run, held.target);
+        if (win && notOurs(session, held.target, win)) unfit(session);
+    };
+
+    return { fit, recheck, claim, release, fitted: (session: string): boolean => fits.has(session) };
 };

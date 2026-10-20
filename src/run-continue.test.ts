@@ -89,6 +89,11 @@ describe('continue: which run a new tmux session is', () => {
         expect(continuedRunId(knownSessions(), 'hwip-web', 'claude', T, CONVERSATION)).toBe(T);
     });
 
+    it.each(['opencode', 'pi', 'codex', 'gemini', 'hermes'])('carries on a %s run whose conversation a resume picked back up', (kind) => {
+        rememberSessions([sighting(A, { agentKind: kind })], Date.now() - 60_000);
+        expect(continuedRunId(knownSessions(), NAME, kind, T, CONVERSATION)).toBe(A);
+    });
+
     it('never takes a later run', () => {
         rememberSessions([sighting(T)], Date.now() - 60_000);
         expect(continuedRunId(knownSessions(), NAME, 'claude', A, CONVERSATION)).toBe(A);

@@ -734,6 +734,44 @@ export const pickRowByProcStart = <T>(
 };
 
 /**
+ * How far before the pane's start a write may land and still be the pane's: `ps` `lstart` is whole seconds. Not
+ * {@link PROC_MATCH_TOLERANCE_MS} — the last sitting's final write lands seconds before an `exit` and a fresh
+ * start, and a margin that wide would read the fresh pane as carrying it on.
+ */
+const PANE_WRITE_MARGIN_MS = 2_000;
+
+/**
+ * From when a conversation written to is this pane's: its earliest process start, less {@link PANE_WRITE_MARGIN_MS}. A
+ * resume writes to the conversation it picked back up, so that one is written to after the start; a fresh start
+ * has not written yet, so the folder's older conversations are all before it. Null when no start is known.
+ */
+export const paneSince = (panePid: number, deps: StoreResolveDeps = {}): number | null => {
+    const startTimes = deps.startTimes ?? psStartTimes();
+    const starts = [...(deps.descendants ?? collectDescendantPids(panePid))]
+        .map((pid) => startTimes.get(pid))
+        .filter((t): t is number => t !== undefined && Number.isFinite(t));
+    return starts.length === 0 ? null : Math.min(...starts) - PANE_WRITE_MARGIN_MS;
+};
+
+/**
+ * The conversation a transcript file holds — its name without `.jsonl` — when it was written to since `since`.
+ * For the agents whose resume appends to the file it picks back up (pi `-c`, Codex `resume`, Gemini `--resume`,
+ * measured 2026-10-20): the file is the conversation.
+ */
+export const transcriptIdSince = (path: string | null, since: number | null): string | null => {
+    if (!path || since === null) return null;
+    try {
+        return statSync(path).mtimeMs >= since ? basename(path, '.jsonl') : null;
+    } catch {
+        return null;
+    }
+};
+
+/** {@link transcriptIdSince} for a pane: what `resolveResumeId` answers for an agent whose transcript is a file. */
+const paneTranscriptId = (path: string | null, panePid: number | undefined): string | null =>
+    panePid === undefined ? null : transcriptIdSince(path, paneSince(panePid));
+
+/**
  * Read rows from a SQLite file as JSON. Null on every failure — no `sqlite3` on
  * PATH, a locked or corrupt database, a schema that moved — because a missing
  * name costs the computed label and nothing else.
@@ -824,6 +862,47 @@ export const detectHermesSessionName = (
     // The auto-title is written asynchronously after the first response, so an
     // untitled row is a young session, not a broken one.
     return nonBlank(row?.title ?? undefined) ?? nonBlank(row?.display_name ?? undefined);
+};
+
+/**
+ * A CLI session and when it was last messaged (seconds) — not `last_activity_at`: a `-c` that carried the session
+ * on wrote messages and left that column where the first sitting put it (measured on 0.20.0). Its own query, so a
+ * store without `messages` costs this read and not the names.
+ */
+interface HermesActiveRow {
+    id?: string | null;
+    cwd?: string | null;
+    active?: number | null;
+}
+
+const readHermesActive = ttlMemo(SNAPSHOT_TTL_MS, (): unknown[] | null => sqliteJson(
+    HERMES_STATE_DB,
+    `SELECT s.id AS id, s.cwd AS cwd, (SELECT max(m.timestamp) FROM messages m WHERE m.session_id = s.id) AS active
+     FROM sessions s WHERE s.source = 'cli' ORDER BY s.started_at DESC LIMIT ${STORE_ROW_LIMIT}`,
+));
+
+/**
+ * The Hermes session this pane carries on: in its directory, with a message since the pane started — the newest.
+ * A `-c` picks back up a session started long before the pane, which the start-time match above cannot see.
+ */
+export const detectHermesResumeId = (
+    paneCwd: string,
+    panePid?: number,
+    deps: StoreResolveDeps = {},
+): string | null => {
+    if (panePid === undefined) return null;
+    const raw = deps.rows !== undefined ? deps.rows : readHermesActive();
+    if (raw === null) return null;
+    const since = paneSince(panePid, deps);
+    if (since === null) return null;
+    let best: HermesActiveRow | null = null;
+    // The query's own columns; each is checked with typeof below before it is used.
+    for (const row of raw as HermesActiveRow[]) {
+        if (row.cwd !== paneCwd || typeof row.id !== 'string' || !row.id) continue;
+        if (typeof row.active !== 'number' || row.active * 1_000 < since) continue;
+        if (!best || row.active > (best.active ?? 0)) best = row;
+    }
+    return best?.id ?? null;
 };
 
 // ── Codex ────────────────────────────────────────────────────────
@@ -1241,12 +1320,8 @@ export const detectOpencodeSession = (
     if (panePid === undefined) return null;
     const raw = deps.rows !== undefined ? deps.rows : readOpencodeSessions();
     if (raw === null) return null;
-    const startTimes = deps.startTimes ?? psStartTimes();
-    const starts = [...(deps.descendants ?? collectDescendantPids(panePid))]
-        .map((pid) => startTimes.get(pid))
-        .filter((t): t is number => t !== undefined && Number.isFinite(t));
-    if (starts.length === 0) return null;
-    const since = Math.min(...starts) - PROC_MATCH_TOLERANCE_MS;
+    const since = paneSince(panePid, deps);
+    if (since === null) return null;
 
     const dir = realDir(paneCwd);
     let best: OpencodeSessionRow | null = null;
@@ -1307,6 +1382,8 @@ const REMOTE_AGENT_TABLE = [
         resolveSessionName: detectCodexSessionName,
         resolveTranscript: (paneCwd, panePid) => codexTranscriptPath(paneCwd, panePid),
         projectTranscript: projectCodexEntries,
+        // Read only to tell a resumed conversation's run (no `resumeArgs`): the rollout a resume appends to.
+        resolveResumeId: (paneCwd, panePid) => paneTranscriptId(codexTranscriptPath(paneCwd, panePid), panePid),
     },
     {
         // The pane binary is `cursor-agent`, Cursor's terminal TUI — NOT the
@@ -1327,6 +1404,7 @@ const REMOTE_AGENT_TABLE = [
         // limit pi has (newest file wins).
         resolveTranscript: (paneCwd, panePid) => geminiTranscriptPath(paneCwd, panePid),
         projectTranscript: projectGeminiEntries,
+        resolveResumeId: (paneCwd, panePid) => paneTranscriptId(geminiTranscriptPath(paneCwd, panePid), panePid),
     },
     {
         // `hermes` on PATH is a bash script that execs a venv Python, so the
@@ -1342,6 +1420,7 @@ const REMOTE_AGENT_TABLE = [
         // No `resolveSessionId` counterpart: the store's own id is a
         // `<timestamp>_<hash>` string, and nothing on the wire consumes it yet.
         resolveSessionName: detectHermesSessionName,
+        resolveResumeId: detectHermesResumeId,
     },
     {
         kind: 'pi',
@@ -1350,6 +1429,7 @@ const REMOTE_AGENT_TABLE = [
         subcommands: ['pi'],
         resolveTranscript: (paneCwd, panePid) => piTranscriptPath(paneCwd, panePid),
         projectTranscript: projectPiEntries,
+        resolveResumeId: (paneCwd, panePid) => paneTranscriptId(piTranscriptPath(paneCwd, panePid), panePid),
     },
     {
         kind: 'opencode',

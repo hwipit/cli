@@ -1,18 +1,22 @@
 /**
- * Fit a detached tmux window to the phone that is watching it.
+ * Fit a tmux window to the phone that is watching it.
  *
  * A pane is as wide as the terminal that last drew it, usually a desktop's
  * 120-odd columns. The phone mirror shows about 45, so every full-width row a
  * prompt or TUI draws (a rule, a right-aligned clock, a status line) folds into
- * two. Nobody else sees a DETACHED window, so while a phone watches one it is
- * resized to the phone's width and the program redraws to fit; when the phone
- * leaves, the old width comes back.
+ * two. So while a phone watches a window it is resized to the phone's width
+ * and the program redraws to fit; when the phone leaves, the old width comes
+ * back.
  *
- * An attached window is left alone: shrinking it would shrink the desktop
- * terminal of whoever is attached. A window split into panes is left alone
- * too, since the window width is not any one pane's width. And when a client
- * attaches while the phone is watching, the next check hands the window back
- * to tmux, which sizes it to that client.
+ * A window with a desktop client attached is shared, and whoever used it last
+ * decides its width — the rule tmux's own `window-size latest` follows. The
+ * phone uses a window when it starts watching or types into it ({@link claim});
+ * a client uses it when it attaches or a key is pressed in it, which is what
+ * `#{client_activity}` records. While the phone is the later of the two, the
+ * window is the phone's width (the desktop terminal shows it narrower); once a
+ * client is newer, the next check hands the window back to tmux, which sizes
+ * it to that client. A window split into panes is left alone, since the
+ * window width is not any one pane's width.
  *
  * A fitted window carries its old width in `@hwip_fit_width`. A listener that
  * died without releasing (a crash, a SIGKILL) leaves that mark behind, and
@@ -61,6 +65,14 @@ export const releaseStaleFits = (run: TmuxRun): number => {
     return released;
 };
 
+/** The newest `#{client_activity}` (seconds) among the clients on `target`'s session, or null when unknown. */
+const latestClientUse = (run: TmuxRun, target: string): number | null => {
+    const r = run(['list-clients', '-t', target, '-F', '#{client_activity}']);
+    if (r.status !== 0) return null;
+    const uses = r.stdout.split('\n').filter(Boolean).map(Number).filter(Number.isFinite);
+    return uses.length > 0 ? Math.max(...uses) : null;
+};
+
 const readWindow = (run: TmuxRun, target: string): { attached: number; panes: number; width: number } | null => {
     const r = run(['display-message', '-p', '-t', target,
         `#{session_attached}${SEP}#{window_panes}${SEP}#{window_width}`]);
@@ -70,8 +82,17 @@ const readWindow = (run: TmuxRun, target: string): { attached: number; panes: nu
     return { attached, panes, width };
 };
 
-export const createPaneFitter = (run: TmuxRun) => {
+/** `now` is in ms, as `Date.now`; tmux reports client use in whole seconds. */
+export const createPaneFitter = (run: TmuxRun, now: () => number = Date.now) => {
     const fits = new Map<string, Fit>();
+    /** When the phone last used each session, in tmux's seconds. */
+    const claims = new Map<string, number>();
+    const seconds = (): number => Math.floor(now() / 1000);
+
+    /** The phone used `session` just now: it is the latest user until a client is used after it. */
+    const claim = (session: string): void => {
+        claims.set(session, seconds());
+    };
 
     /**
      * Give the window back: restore its width if nobody is attached, then drop
@@ -79,7 +100,7 @@ export const createPaneFitter = (run: TmuxRun) => {
      * it again. With a client attached, dropping the option alone resizes it to
      * that client.
      */
-    const release = (session: string): void => {
+    const unfit = (session: string): void => {
         const fit = fits.get(session);
         if (!fit) return;
         fits.delete(session);
@@ -89,10 +110,18 @@ export const createPaneFitter = (run: TmuxRun) => {
         run(['set-option', '-w', '-u', '-t', fit.target, FIT_MARK]);
     };
 
+    /** The phone left: give the window back and forget its claim. */
+    const release = (session: string): void => {
+        claims.delete(session);
+        unfit(session);
+    };
+
     /**
-     * Size `session`'s window to `cols` if it is detached and unsplit. Safe to
-     * call on every renew: an unchanged width costs one display-message, and a
-     * window that gained a client since is released.
+     * Size `session`'s window to `cols` if it is unsplit and the phone used it
+     * after every attached client. Safe to call on every renew: an unchanged
+     * width costs one display-message (and one list-clients when attached), and
+     * a window a client used since is handed back. The first call for a session
+     * counts as the phone's use when nothing claimed it yet.
      */
     const fit = (session: string, target: string, cols: unknown): void => {
         const want = clampViewerCols(cols);
@@ -100,8 +129,13 @@ export const createPaneFitter = (run: TmuxRun) => {
         const win = readWindow(run, target);
         if (!win) return;
         const held = fits.get(session);
-        if (win.attached > 0 || win.panes !== 1) {
-            if (held) release(session);
+        if (!claims.has(session)) claim(session);
+        const clientUse = win.attached > 0 ? latestClientUse(run, target) : null;
+        // A tie goes to the desktop: tmux counts in whole seconds, and shrinking a terminal in use is the worse mistake.
+        const clientIsLatest = win.attached > 0 && (clientUse === null || clientUse >= (claims.get(session) ?? 0));
+        if (clientIsLatest || win.panes !== 1) {
+            // Only the fit goes: the claim stays, so the desktop keeps the window until the phone uses it again.
+            if (held) unfit(session);
             return;
         }
         if (held && held.cols === want && win.width === want) return;
@@ -115,5 +149,5 @@ export const createPaneFitter = (run: TmuxRun) => {
         fits.set(session, { target, width, cols: want });
     };
 
-    return { fit, release, fitted: (session: string): boolean => fits.has(session) };
+    return { fit, claim, release, fitted: (session: string): boolean => fits.has(session) };
 };

@@ -603,6 +603,15 @@ export const claudeTranscriptPath = (paneCwd: string | null, panePid?: number): 
     return claudeConversationFile(paneCwd, sessionId);
 };
 
+/** A regular file is there: what a resume flag needs before it names one. */
+const isFileAt = (path: string): boolean => {
+    try {
+        return statSync(path).isFile();
+    } catch {
+        return false;
+    }
+};
+
 /**
  * Where Claude Code keeps conversation `sessionId` begun in `cwd`, or null
  * when no such file is there. Proven, not computed: the pid path never touches
@@ -611,11 +620,7 @@ export const claudeTranscriptPath = (paneCwd: string | null, panePid?: number): 
  */
 const claudeConversationFile = (cwd: string, sessionId: string): string | null => {
     const path = join(CLAUDE_PROJECTS_DIR, claudeProjectDirName(cwd), `${sessionId}.jsonl`);
-    try {
-        return statSync(path).isFile() ? path : null;
-    } catch {
-        return null;
-    }
+    return isFileAt(path) ? path : null;
 };
 
 // ── pi ───────────────────────────────────────────────────────────
@@ -671,11 +676,7 @@ const piSessionDirName = (cwd: string): string => {
 /** `--session <file>` for a pi session still on disk, or null. */
 const piSessionFile = (cwd: string, id: string): string[] | null => {
     const path = join(piSessionsDir(), piSessionDirName(cwd), `${id}.jsonl`);
-    try {
-        return statSync(path).isFile() ? ['--session', path] : null;
-    } catch {
-        return null;
-    }
+    return isFileAt(path) ? ['--session', path] : null;
 };
 
 /**
@@ -1086,11 +1087,7 @@ const CODEX_ROLLOUT = /^rollout-(\d{4})-(\d{2})-(\d{2})T[\d-]+-([0-9a-f]{8}-[0-9
 const codexRolloutThread = (rolloutId: string): string | null => {
     const m = CODEX_ROLLOUT.exec(rolloutId);
     if (!m) return null;
-    try {
-        return statSync(join(codexSessionsDir(), m[1], m[2], m[3], `${rolloutId}.jsonl`)).isFile() ? m[4] : null;
-    } catch {
-        return null;
-    }
+    return isFileAt(join(codexSessionsDir(), m[1], m[2], m[3], `${rolloutId}.jsonl`)) ? m[4] : null;
 };
 
 /**

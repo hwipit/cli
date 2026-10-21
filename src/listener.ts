@@ -2153,6 +2153,28 @@ export interface ScreenHistorySnapshot {
     capturedAt: string;
 }
 
+/**
+ * What a sealed history page's envelope holds (as JSON): the page and every
+ * number a viewer pages by, bound to the request it answers and to the
+ * subscription it was sealed for. On a sealed stream the snapshot carries
+ * only `requestId` (for routing) beside this — a relay that hands an earlier
+ * page back under a new request, or rewrites where it sits, is caught on open.
+ */
+export type SealedHistoryPage = {
+    sessionName: string;
+    requestId: string;
+    nonce?: string;
+    epoch: number;
+    before: number;
+    lines: number;
+    hasMore: boolean;
+    truncated: boolean;
+    /** The pane's history size when this page was captured, so the viewer can
+     *  tell how much the history grew between its request and the capture. */
+    historySize: number;
+    content: string;
+};
+
 /** These become tmux argv and page arithmetic; a fractional, negative or
  *  non-numeric one has no sensible coercion, so it is refused. */
 const isPageOffset = (v: unknown): v is number =>
@@ -2261,11 +2283,11 @@ export const handleScreenHistoryRequest = (
 
     // Everything below this line the caller already has.
     const held = before;
-    // Scrolled past the oldest line. An empty page rather than an error — the
-    // view stops, and stopping is not a failure. Nothing to seal either.
-    if (depth <= held) return reply({ before, content: '', lines: 0, hasMore: false });
-
-    const captured = capturePaneRange(req.sessionName, -(held + lines), -(held + 1));
+    // Scrolled past the oldest line: an empty page rather than an error — the
+    // view stops, and stopping is not a failure.
+    const captured = depth <= held
+        ? { content: '', truncated: false }
+        : capturePaneRange(req.sessionName, -(held + lines), -(held + 1));
     if (!captured) return reply({ error: 'capture_failed' });
 
     const returned = countLines(captured.content);
@@ -2277,11 +2299,21 @@ export const handleScreenHistoryRequest = (
     };
     if (!stream.subscriberPublicKey) return reply({ ...page, content: captured.content });
 
-    // Encrypted stream: the page rides ONLY inside the envelope, and a failed
-    // seal is an error rather than a plaintext page — the same rule the frame
-    // path follows when its encrypt fails.
-    sealV2('screen.history', captured.content, stream.subscriberPublicKey, req.sessionName)
-        .then((encrypted) => send({ ...base, ...page, encrypted }))
+    // Encrypted stream: the page and its numbers ride ONLY inside the envelope
+    // — the empty last page too, or a relay could end the paging with one — and
+    // a failed seal is an error rather than a plaintext page, the same rule the
+    // frame path follows when its encrypt fails.
+    const sealed: SealedHistoryPage = {
+        sessionName: req.sessionName,
+        requestId: req.requestId,
+        ...(stream.nonce ? { nonce: stream.nonce } : {}),
+        epoch: stream.epoch,
+        ...page,
+        historySize: depth,
+        content: captured.content,
+    };
+    sealV2('screen.history', JSON.stringify(sealed), stream.subscriberPublicKey, req.sessionName)
+        .then((encrypted) => send({ ...base, encrypted }))
         .catch((err) => {
             log(`⧉ history ${req.sessionName}: seal failed (${err instanceof Error ? err.message : err})`);
             send({ ...base, error: 'encrypt_failed' });

@@ -397,10 +397,57 @@ describe('agent.screen.history.request — one page of scrollback above the live
       expect(reply?.encrypted).toBeDefined();
       const ciphertext = (reply?.encrypted as { ciphertext: string }).ciphertext;
       expect(ciphertext).not.toContain('line-');
-      // The page metadata still rides in the clear, exactly as the frames do:
-      // a line count without the lines says nothing.
-      expect(reply?.lines).toBe(10);
-      expect(reply?.hasMore).toBe(true);
+      // Where the page sits rides only inside the envelope: a relay that could
+      // rewrite it would move where the next page is asked for.
+      expect(reply?.requestId).toBe('r1');
+      expect(reply?.before).toBeUndefined();
+      expect(reply?.lines).toBeUndefined();
+      expect(reply?.hasMore).toBeUndefined();
+    });
+
+    it('binds the page to the request, the subscription and where it sits', async () => {
+      const { initDeviceCrypto, getDevicePublicKey, openV2, isSealedV2 } = await import('./crypto.js');
+      await initDeviceCrypto();
+      const self = getDevicePublicKey() ?? '';
+      handleStreamControl(
+        { subtype: 'agent.stream.start', targetDeviceId: device, sessionName: 'hwip-a', renew: true,
+          subscriberPublicKey: self, subscriberNonce: 'nonce-a' },
+        send,
+      );
+      sent = [];
+      await admissionSettled();
+
+      handleScreenHistoryRequest(request({ before: 200, lines: 10 }), send);
+      await flush();
+
+      const envelope = replies().at(-1)?.encrypted;
+      if (!isSealedV2(envelope)) throw new Error('not a v2 envelope');
+      const page = JSON.parse(await openV2('screen.history', envelope, self, 'hwip-a'));
+      expect(page).toMatchObject({
+        sessionName: 'hwip-a', requestId: 'r1', nonce: 'nonce-a',
+        before: 200, lines: 10, hasMore: true, truncated: false, historySize: STREAM_CAPTURE_LINES + 100,
+      });
+      expect(typeof page.epoch).toBe('number');
+      expect(page.content).toContain('line-');
+    });
+
+    it('seals the empty last page too, so a relay cannot end the paging', async () => {
+      const { initDeviceCrypto, getDevicePublicKey, openV2, isSealedV2 } = await import('./crypto.js');
+      await initDeviceCrypto();
+      const self = getDevicePublicKey() ?? '';
+      openStream(self);
+      await admissionSettled();
+
+      handleScreenHistoryRequest(request({ before: STREAM_CAPTURE_LINES + 100, lines: 10 }), send);
+      await flush();
+
+      const reply = replies().at(-1);
+      expect(reply?.hasMore).toBeUndefined();
+      expect(reply?.content).toBeUndefined();
+      if (!isSealedV2(reply?.encrypted)) throw new Error('not a v2 envelope');
+      const page = JSON.parse(await openV2('screen.history', reply.encrypted, self, 'hwip-a'));
+      expect(page).toMatchObject({ lines: 0, hasMore: false, content: '' });
+      expect(historyCaptures()).toHaveLength(0);
     });
 
     it('seals the page as that session\'s history, which opens as nothing else', async () => {
@@ -415,7 +462,7 @@ describe('agent.screen.history.request — one page of scrollback above the live
 
       const envelope = replies().at(-1)?.encrypted;
       if (!isSealedV2(envelope)) throw new Error('not a v2 envelope');
-      expect(await openV2('screen.history', envelope, self, 'hwip-a')).toContain('line-');
+      expect(JSON.parse(await openV2('screen.history', envelope, self, 'hwip-a')).content).toContain('line-');
       await expect(openV2('stream.frame', envelope, self, 'hwip-a')).rejects.toThrow();
     });
 

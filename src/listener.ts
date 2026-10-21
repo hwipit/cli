@@ -1785,6 +1785,21 @@ const resumableConversation = (
     return args ? { id, args } : null;
 };
 
+/**
+ * A live session is on this run's conversation already: the run started beside
+ * its name before, or the live run under it picked the conversation up. The
+ * ended entry stays in the registry, so without this every tap on it would
+ * start one more agent on one transcript.
+ */
+const conversationRunning = (known: KnownSession, live: ReadonlySet<string>): boolean => {
+    const id = known.agentSessionId;
+    if (!id) return false;
+    return [...live].some((name) => {
+        const current = recallSession(name);
+        return current?.agentKind === known.agentKind && current.agentSessionId === id;
+    });
+};
+
 /** What the report says about a run: the same answer a resume of it would act on. */
 const isResumable = (known: KnownSession): boolean => {
     const agent = REMOTE_AGENTS.find((a) => a.kind === known.agentKind);
@@ -1857,7 +1872,7 @@ export const handleSessionResumeRequest = (
         : runId !== undefined
             ? familyNames(familyBase(sessionName)).find((name) => !live.has(name))
             : undefined;
-    if (!target) return reply({ error: 'already_running' });
+    if (!target || conversationRunning(known, live)) return reply({ error: 'already_running' });
     if (!sessionDirectoryExists(known)) {
         log(`✗ resume ${sessionName}: ${known.cwd} is gone`);
         return reply({ error: 'missing_directory' });

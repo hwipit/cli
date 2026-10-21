@@ -399,6 +399,7 @@ describe('agent.session.resume.request — the run it names', () => {
     const device = computeListenerDeviceId();
     const OLD = '1b5f3c8e-1d2a-4c6b-9e7f-123456789abc';
     const NEW = '2c6f3c8e-1d2a-4c6b-9e7f-123456789abc';
+    const THIRD = '3d6f3c8e-1d2a-4c6b-9e7f-123456789abc';
     let sent: Array<Record<string, unknown>>;
     const send = (data: Record<string, unknown>) => { sent.push(data); };
     const ask = (fields: Record<string, unknown>) => {
@@ -429,6 +430,7 @@ describe('agent.session.resume.request — the run it names', () => {
         rmSync(join(TMP, '.claude'), { recursive: true, force: true });
         claudeTranscript(OLD);
         claudeTranscript(NEW);
+        claudeTranscript(THIRD);
         const t0 = Date.now() - 60_000;
         rememberSessions([{ name: 'hwip-runs', cwd: PROJECT_DIR, agentKind: 'claude', runId: '1785542400', agentSessionId: OLD }], t0);
         rememberSessions([{ name: 'hwip-runs', cwd: PROJECT_DIR, agentKind: 'claude', runId: '1785546000', agentSessionId: NEW }], t0 + 1000);
@@ -479,15 +481,25 @@ describe('agent.session.resume.request — the run it names', () => {
     });
 
     it('next free name: two resumes in a row do not take the same name', () => {
+        rememberSessions([{ name: 'hwip-runs', cwd: PROJECT_DIR, agentKind: 'claude', runId: '1785544000', agentSessionId: THIRD }], Date.now() - 59_500);
         liveSessions = ['hwip-runs'];
         expect(ask({ runId: '1785542400' })).toMatchObject({ resumed: true, sessionName: 'hwip-runs-2' });
-        expect(ask({ runId: '1785546000' })).toMatchObject({ resumed: true, sessionName: 'hwip-runs-3' });
+        expect(ask({ runId: '1785544000' })).toMatchObject({ resumed: true, sessionName: 'hwip-runs-3' });
     });
 
     it('next free name: counts from the family base, not from a suffixed name', () => {
-        rememberSessions([{ name: 'hwip-runs-2', cwd: PROJECT_DIR, agentKind: 'claude', runId: '1785547000', agentSessionId: OLD }]);
+        rememberSessions([{ name: 'hwip-runs-2', cwd: PROJECT_DIR, agentKind: 'claude', runId: '1785547000', agentSessionId: OLD }], Date.now() - 30_000);
+        rememberSessions([{ name: 'hwip-runs-2', cwd: PROJECT_DIR, agentKind: 'claude', runId: '1785548000', agentSessionId: THIRD }]);
         liveSessions = ['hwip-runs', 'hwip-runs-2'];
         expect(ask({ sessionName: 'hwip-runs-2', runId: '1785547000' })).toMatchObject({ resumed: true, sessionName: 'hwip-runs-3' });
+    });
+
+    it('next free name: a conversation a live session is on already is not started twice', () => {
+        // The run went up beside its name before, and the sweep recorded it there.
+        rememberSessions([{ name: 'hwip-runs-2', cwd: PROJECT_DIR, agentKind: 'claude', runId: '1785547000', agentSessionId: OLD }]);
+        liveSessions = ['hwip-runs', 'hwip-runs-2'];
+        expect(ask({ runId: '1785542400' })).toMatchObject({ error: 'already_running', sessionName: 'hwip-runs' });
+        expect(tmuxCalls.some((c) => c[0] === 'new-session')).toBe(false);
     });
 
     it('next free name: without a run id a live name is still refused', () => {

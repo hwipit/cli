@@ -62,9 +62,62 @@ describe('parseBlockedDialog — pi extension select (captured, pi 1.2.0 permiss
         expect(parseBlockedDialog(GATE.slice(0, end) + editor, 'pi')).toBeUndefined();
     });
 
-    it('does not read another extension picker (ask_user_question) or a working pane', () => {
-        expect(parseBlockedDialog(pane('pi-blocked.txt'), 'pi')).toBeUndefined();
+    it('does not read a working or idle pane', () => {
         expect(parseBlockedDialog(pane('pi-working.txt'), 'pi')).toBeUndefined();
         expect(parseBlockedDialog(pane('pi-idle.txt'), 'pi')).toBeUndefined();
+    });
+});
+
+const ASK = pane('pi-blocked.txt');
+/** ASK with the `>` highlight on "Beta". */
+const askOnBeta = ASK.replace('> 1. Alpha', '  1. Alpha').replace('  2. Beta', '> 2. Beta');
+
+describe('parseBlockedDialog — pi ask_user_question picker (captured, pi 0.85.1)', () => {
+    it('reads the question and the numbered answers, without "Other"', () => {
+        expect(parseBlockedDialog(ASK, 'pi')).toMatchObject({
+            title: 'Pick one',
+            detail: [],
+            question: 'Pick one',
+            options: [
+                { n: 1, label: 'Alpha', keys: ['enter'] },
+                { n: 2, label: 'Beta', keys: ['down', 'enter'] },
+            ],
+        });
+    });
+
+    it('counts keys from the highlight the screen shows, and a new highlight is a new prompt', () => {
+        expect(parseBlockedDialog(askOnBeta, 'pi')?.options.map((o) => o.keys)).toEqual([['up', 'enter'], ['enter']]);
+        const id = parseBlockedDialog(ASK, 'pi')!.id;
+        expect(promptStillShown(id, ASK)).toBe(true);
+        expect(promptStillShown(id, askOnBeta)).toBe(false);
+    });
+
+    it('still reads the answers when "Other" holds the highlight', () => {
+        const onOther = ASK.replace('> 1. Alpha', '  1. Alpha').replace('  Other', '> Other');
+        expect(parseBlockedDialog(onOther, 'pi')?.options.map((o) => o.keys)).toEqual([['up', 'up', 'enter'], ['up', 'enter']]);
+    });
+
+    it('reads the context and the answers\' notes as detail', () => {
+        const withNotes = ASK.replace(' Pick one\n\n>', ' Pick one\n\n Which build to ship\n\n>')
+            .replace('> 1. Alpha\n', '> 1. Alpha\n     the old one\n');
+        expect(parseBlockedDialog(withNotes, 'pi')).toMatchObject({
+            question: 'Pick one',
+            detail: ['Which build to ship', 'Alpha: the old one'],
+            options: [{ label: 'Alpha' }, { label: 'Beta' }],
+        });
+    });
+
+    it('reads nothing from the multi-select picker or the custom-answer editor', () => {
+        const multi = ASK.replace(' ↑↓ navigate • Enter select • Esc cancel', ' ↑↓ navigate • Space toggle • Enter edit/submit • Esc cancel');
+        expect(parseBlockedDialog(multi, 'pi')).toBeUndefined();
+        const editor = ASK.replace(' ↑↓ navigate • Enter select • Esc cancel', ' Enter to submit • Esc to go back');
+        expect(parseBlockedDialog(editor, 'pi')).toBeUndefined();
+    });
+
+    it('reads nothing when the editor is drawn below: the same picker in the agent\'s own text', () => {
+        const footer = ASK.indexOf(' ↑↓ navigate');
+        const end = ASK.indexOf('\n', footer) + 1;
+        const editor = '─'.repeat(85) + '\n\n' + '─'.repeat(85) + '\n~/pibench\n';
+        expect(parseBlockedDialog(ASK.slice(0, end) + editor, 'pi')).toBeUndefined();
     });
 });

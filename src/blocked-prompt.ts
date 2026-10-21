@@ -39,10 +39,13 @@
  * numbered answers. No footer.
  *
  * pi has no approval dialog of its own; extensions that gate tools ask through
- * `ctx.ui.select` (`parsePiSelect`, `blocked-prompt-pi.test.ts`).
+ * `ctx.ui.select` (`parsePiSelect`, `blocked-prompt-pi.test.ts`). The `ask_user_question` extension draws its own
+ * picker (`parsePiQuestion`).
  *
  * OpenCode (v2.0.29, `blocked-prompt-opencode.test.ts`): a `┃` panel, `△ Permission required`, the request, and a
- * row of buttons whose chosen one is told apart by background colour only (`parseOpencodePermission`).
+ * row of buttons whose chosen one is told apart by background colour only (`parseOpencodePermission`). Its question
+ * tool (v2.1.2) draws a `Questions` panel whose highlighted answer differs by the colour of its number
+ * (`parseOpencodeQuestion`).
  */
 import { createHash } from 'node:crypto';
 import type { AgentKind } from './remote-agents.js';
@@ -330,15 +333,86 @@ const parsePiSelect = (pane: string): ParsedPrompt | undefined => {
     });
 };
 
+/** An answer as a question reader collects it: the note is the indented line(s) drawn under it. */
+type QuestionOption = { n: number; label: string; selected: boolean; note?: string };
+/** A line indented under an answer, as both question pickers draw a note. */
+const QUESTION_NOTE = /^ {5}(\S.*)$/;
+const appendNote = (option: QuestionOption, text: string): void => {
+    option.note = option.note === undefined ? text.trim() : `${option.note} ${text.trim()}`;
+};
+
+const PI_QUESTION_FOOTER = /^ ↑↓ navigate • Enter select • Esc cancel$/;
+const PI_QUESTION_OPTION = /^(> | {2})(?:(\d{1,2})\. )?(\S.*)$/;
+
+/**
+ * The `ask_user_question` extension's single-answer picker (pi 0.85.1, `pi-blocked.txt`): a full-width rule, the
+ * question, an optional context, numbered answers with `> ` on the highlighted one and an indented note under any,
+ * an unnumbered last answer that opens a text field (left out: keys cannot fill it), then the
+ * `↑↓ navigate • Enter select • Esc cancel` footer and a closing rule.
+ */
+const parsePiQuestion = (pane: string): ParsedPrompt | undefined => {
+    const lines = pane.split('\n').map((l) => l.trimEnd());
+    let footer = -1;
+    for (let i = lines.length - 1; i >= 0 && footer < 0; i--) if (PI_QUESTION_FOOTER.test(lines[i]!)) footer = i;
+    if (footer < 0 || !FULL_RULE.test(lines[footer + 1] ?? '')) return undefined;
+    let top = -1;
+    for (let i = footer - 1; i >= 0 && top < 0; i--) if (FULL_RULE.test(lines[i]!)) top = i;
+    if (top < 0) return undefined;
+    // The picker takes the editor's place, so one rule follows it; the same text in the agent's output sits above
+    // the editor and its two rules.
+    if (lines.slice(footer + 1).filter((l) => FULL_RULE.test(l)).length > 1) return undefined;
+
+    // Answers run up to the footer's gap; the question and context sit above the first one's gap.
+    let first = top + 1;
+    while (first < footer && !/^(> | {2})1\. /.test(lines[first]!)) first++;
+    if (first >= footer || lines[first - 1] !== '') return undefined;
+    const options: QuestionOption[] = [];
+    let own: number | undefined;
+    for (const line of lines.slice(first, footer)) {
+        if (line === '') continue;
+        const note = QUESTION_NOTE.exec(line);
+        if (note && options.length > 0) {
+            appendNote(options[options.length - 1]!, note[1]!);
+            continue;
+        }
+        const m = PI_QUESTION_OPTION.exec(line);
+        if (!m || own !== undefined) return undefined;
+        const n = m[2] === undefined ? options.length + 1 : Number(m[2]);
+        if (m[2] === undefined) own = n;
+        options.push({ n, label: m[3]!.trim(), selected: m[1] === '> ' });
+    }
+    if (own === undefined) return undefined;
+
+    const text = lines.slice(top + 1, first).map((l) => l.replace(/^ /, ''));
+    const gap = text.indexOf('');
+    const asked = (gap < 0 ? text : text.slice(0, gap)).join(' ').trim();
+    if (asked === '') return undefined;
+    const context = gap < 0 ? [] : trimBlank(text.slice(gap + 1)).map((l) => l.trim()).filter((l) => l !== '');
+
+    const prompt = assemble({
+        region: lines.slice(top, footer + 1),
+        title: asked,
+        detail: [...context, ...options.filter((o) => o.note !== undefined && o.n !== own).map((o) => `${o.label}: ${o.note}`)],
+        question: asked,
+        options,
+    });
+    return prompt && { ...prompt, options: prompt.options.filter((o) => o.n !== own) };
+};
+
 // One SGR sequence and its parameters; any other escape is dropped without changing the background.
 const SGR = /^\u001b\[([0-9;:]*)m/;
 const ANY_ESCAPE = new RegExp(`^(?:${ESCAPES.source})`);
 
-/** `line` without escapes, and the background each of its UTF-16 units is drawn on ('7' = reverse video). */
-const withBackground = (line: string): { text: string; bg: string[] } => {
+/**
+ * `line` without escapes, and the background ('7' = reverse video) and foreground each of its UTF-16 units is drawn
+ * in ('' = the default).
+ */
+const withColours = (line: string): { text: string; bg: string[]; fg: string[] } => {
     let text = '';
     const bg: string[] = [];
+    const fg: string[] = [];
     let current = '';
+    let ink = '';
     let reverse = false;
     for (let i = 0; i < line.length;) {
         const sgr = SGR.exec(line.slice(i));
@@ -346,14 +420,17 @@ const withBackground = (line: string): { text: string; bg: string[] } => {
             const p = sgr[1] === '' ? ['0'] : sgr[1]!.split(/[;:]/);
             for (let j = 0; j < p.length; j++) {
                 const code = Number(p[j]);
-                if (code === 0) { current = ''; reverse = false; }
+                if (code === 0) { current = ''; ink = ''; reverse = false; }
                 else if (code === 7) reverse = true;
                 else if (code === 27) reverse = false;
                 else if (code === 49) current = '';
+                else if (code === 39) ink = '';
                 else if ((code >= 40 && code <= 47) || (code >= 100 && code <= 107)) current = String(code);
+                else if ((code >= 30 && code <= 37) || (code >= 90 && code <= 97)) ink = String(code);
                 else if (code === 38 || code === 48 || code === 58) {
                     const span = p[j + 1] === '2' ? 3 : p[j + 1] === '5' ? 1 : 0;
                     if (code === 48) current = p.slice(j, j + 2 + span).join(';');
+                    if (code === 38) ink = p.slice(j, j + 2 + span).join(';');
                     j += 1 + span;
                 }
             }
@@ -364,9 +441,10 @@ const withBackground = (line: string): { text: string; bg: string[] } => {
         if (other) { i += other[0].length; continue; }
         text += line[i];
         bg.push(reverse ? '7' : current);
+        fg.push(ink);
         i++;
     }
-    return { text, bg };
+    return { text, bg, fg };
 };
 
 const OPENCODE_BAR = '┃';
@@ -374,19 +452,20 @@ const OPENCODE_HEADER = /^\s*△ Permission required$/;
 const OPENCODE_HINTS = /ctrl\+|⇆|enter confirm/;
 const OPENCODE_SUBTITLE = /^→ (\S.*)$/;
 
+type ColouredRow = ReturnType<typeof withColours>;
+/** The column after the panel bar on a row drawn in the panel; -1 for any other row. */
+const inPanel = (row: { text: string }): number => {
+    const at = row.text.indexOf(OPENCODE_BAR);
+    return at >= 0 && row.text.slice(0, at).trim() === '' ? at + 1 : -1;
+};
+
 /**
  * OpenCode's permission request: `△ Permission required` in a `┃` panel, the request (a `$ command`, or `→ Edit file`
  * over its diff), then a row of buttons `Allow once   Always allow   Reject` beside `… enter confirm`. The chosen
  * button differs from the others only by its background, so this reads the pane with its escapes: a plain capture
  * yields nothing. Left/right move the choice; the dialog draws no question, so the question is a fixed one.
  */
-const parseOpencodePermission = (pane: string): ParsedPrompt | undefined => {
-    const rows = pane.split('\n').map(withBackground);
-    // Text after the panel bar, with the bar's column, for every row drawn in the panel.
-    const inPanel = (row: { text: string }): number => {
-        const at = row.text.indexOf(OPENCODE_BAR);
-        return at >= 0 && row.text.slice(0, at).trim() === '' ? at + 1 : -1;
-    };
+const parseOpencodePermission = (rows: readonly ColouredRow[]): ParsedPrompt | undefined => {
     let head = -1;
     for (let i = rows.length - 1; i >= 0 && head < 0; i--) {
         const at = inPanel(rows[i]!);
@@ -437,6 +516,67 @@ const parseOpencodePermission = (pane: string): ParsedPrompt | undefined => {
     });
 };
 
+const OPENCODE_QUESTION_HEADER = /^\s*Questions$/;
+/** The one footer captured: a single question, single answer. Several questions add `tab`, several answers a toggle. */
+const OPENCODE_QUESTION_FOOTER = /^\s*↑↓ select {2}enter submit {2}esc dismiss$/;
+const OPENCODE_QUESTION_OPTION = /^ {2}(\d{1,2})\. (\S.*)$/;
+/** The answer OpenCode adds to every question: it opens a text field, which keys cannot fill. */
+const OPENCODE_OWN_ANSWER = 'Type your own answer';
+
+/**
+ * OpenCode's question tool (v2.1.2): `Questions` in a `┃` panel, the question, numbered answers each over an
+ * optional indented note, and a `↑↓ select  enter submit  esc dismiss` footer. The highlighted answer differs only by
+ * the colour of its number, so this too reads the pane with its escapes. Up/down move the highlight.
+ */
+const parseOpencodeQuestion = (rows: readonly ColouredRow[]): ParsedPrompt | undefined => {
+    const textOf = (i: number): string => rows[i]!.text.slice(inPanel(rows[i]!)).trimEnd();
+    let footer = -1;
+    for (let i = rows.length - 1; i >= 0 && footer < 0; i--) {
+        if (inPanel(rows[i]!) >= 0 && OPENCODE_QUESTION_FOOTER.test(textOf(i))) footer = i;
+    }
+    if (footer < 0) return undefined;
+    let head = footer - 1;
+    while (head >= 0 && inPanel(rows[head]!) >= 0 && !OPENCODE_QUESTION_HEADER.test(textOf(head))) head--;
+    if (head < 0 || inPanel(rows[head]!) < 0) return undefined;
+
+    const question: string[] = [];
+    const options: QuestionOption[] = [];
+    const numberInk: string[] = [];
+    for (let i = head + 1; i < footer; i++) {
+        const text = textOf(i);
+        const option = OPENCODE_QUESTION_OPTION.exec(text);
+        if (option) {
+            options.push({ n: Number(option[1]), label: option[2]!.trim(), selected: false });
+            numberInk.push(rows[i]!.fg[inPanel(rows[i]!) + 2]!);
+            continue;
+        }
+        const note = QUESTION_NOTE.exec(text);
+        if (options.length > 0 && note) {
+            appendNote(options[options.length - 1]!, note[1]!);
+        } else if (options.length > 0 && text.trim() !== '') {
+            return undefined;
+        } else if (options.length === 0) {
+            question.push(text.trim());
+        }
+    }
+    // The highlighted answer: the one number ink no other answer shares, the rest all alike.
+    const odd = numberInk.filter((ink) => numberInk.filter((other) => other === ink).length === 1);
+    if (odd.length !== 1 || new Set(numberInk).size !== 2) return undefined;
+    options[numberInk.indexOf(odd[0]!)]!.selected = true;
+
+    const asked = trimBlank(question).join(' ').trim();
+    if (asked === '') return undefined;
+    const prompt = assemble({
+        region: rows.slice(head, footer + 1).map((r) => r.text.trimEnd()),
+        title: 'Question',
+        detail: options.filter((o) => o.note !== undefined && o.label !== OPENCODE_OWN_ANSWER).map((o) => `${o.label}: ${o.note}`),
+        question: asked,
+        options,
+        idSalt: `opencode-question:selected=${options.findIndex((o) => o.selected)}`,
+    });
+    return prompt && { ...prompt, options: prompt.options.filter((o) => o.label !== OPENCODE_OWN_ANSWER) };
+};
+
 /** The checks and caps every reader shares: numbering 1..n, one highlight, label and detail limits. */
 const assemble = (d: {
     region: readonly string[];
@@ -481,8 +621,14 @@ const assemble = (d: {
 const READERS: Partial<Record<AgentKind, (pane: string) => ParsedPrompt | undefined>> = {
     claude: (pane) => parseClaudeDialog(stripEscapes(pane)),
     gemini: (pane) => parseGeminiDialog(stripEscapes(pane)),
-    pi: (pane) => parsePiSelect(stripEscapes(pane)),
-    opencode: parseOpencodePermission,
+    pi: (pane) => {
+        const plain = stripEscapes(pane);
+        return parsePiSelect(plain) ?? parsePiQuestion(plain);
+    },
+    opencode: (pane) => {
+        const rows = pane.split('\n').map(withColours);
+        return parseOpencodePermission(rows) ?? parseOpencodeQuestion(rows);
+    },
 };
 
 /** The approval dialog at the bottom of `pane`, read the way `kind` draws it; undefined when it is not one of those. */

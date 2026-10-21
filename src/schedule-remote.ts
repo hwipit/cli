@@ -12,10 +12,13 @@ import {
     nextOccurrence,
     readScheduleState,
     removeSchedule,
+    scheduleAnchor,
+    updateSchedule,
     validateSchedule,
     type Schedule,
     type ScheduleOutcome,
     type ScheduleWhen,
+    type UncheckedScheduleChange,
 } from './schedule.js';
 import { canPromptKind } from './schedule-ready.js';
 import { recallRun, recallSession, sessionDirectoryExists, type KnownSession } from './session-registry.js';
@@ -31,6 +34,11 @@ export interface PhoneScheduleItem {
     session: string;
     when: ScheduleWhen;
     prompt?: string;
+    /**
+     * The phone cannot change the prompt: what is here is not all of it (cut, or left out for room), or the schedule has
+     * agent arguments the computer gave. The app shows it and leaves it to `hwip schedule edit`.
+     */
+    promptLocked?: true;
     maxRuntimeMin: number;
     /** ISO time of the next run; null when there is none. */
     nextAt: string | null;
@@ -52,6 +60,13 @@ const clip = (text: string, max: number): string => {
     const cut = text.slice(0, max - 1);
     const last = cut.charCodeAt(cut.length - 1);
     return `${last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut}…`;
+};
+
+const listedPrompt = (schedule: Schedule, max: number): Pick<PhoneScheduleItem, 'prompt' | 'promptLocked'> => {
+    const { prompt } = schedule;
+    const listed = prompt !== undefined && max > 0 ? clip(prompt, max) : undefined;
+    const locked = listed !== prompt || schedule.agentArgs !== undefined;
+    return { ...(listed === undefined ? {} : { prompt: listed }), ...(locked ? { promptLocked: true } : {}) };
 };
 
 const isoOrNull = (ms: number | null): string | null => {
@@ -82,9 +97,9 @@ export const phoneScheduleList = (now: number, promptChars: number = LIST_PROMPT
             project: basename(schedule.cwd),
             session: schedule.session,
             when: schedule.when,
-            ...(schedule.prompt !== undefined && promptChars > 0 ? { prompt: clip(schedule.prompt, promptChars) } : {}),
+            ...listedPrompt(schedule, promptChars),
             maxRuntimeMin: schedule.maxRuntimeMin,
-            nextAt: isoOrNull(nextOccurrence(schedule.when, now, Date.parse(schedule.createdAt))),
+            nextAt: isoOrNull(nextOccurrence(schedule.when, now, scheduleAnchor(schedule))),
             ...(last && lastAt ? { last: { outcome: last.outcome, at: lastAt } } : {}),
         };
     });
@@ -198,19 +213,50 @@ const remove = (request: Record<string, unknown>, session: string): PhoneSchedul
     return removed === 'invalid' ? refuse('schedule_invalid', 'not a schedule id') : { ok: true };
 };
 
+const UPDATE_KEYS = new Set(['op', 'id', 'when', 'prompt', 'maxRuntimeMin']);
+
+const update = (request: Record<string, unknown>, session: string, deps: PhoneScheduleDeps): PhoneScheduleResult => {
+    const extra = Object.keys(request).find((k) => !UPDATE_KEYS.has(k));
+    if (extra !== undefined) return refuse('schedule_invalid', `an update carries ${extra}`);
+    const { id, when, prompt, maxRuntimeMin } = request;
+    if (typeof id !== 'string') return refuse('schedule_invalid', 'an update needs an id');
+    const read = listSchedules();
+    if (read.incomplete) return refuse('schedule_failed', 'the schedules could not be listed');
+    // As for a remove: the push names the schedule's own session, so it cannot change another one.
+    const target = read.schedules.find((schedule) => schedule.id === id);
+    if (!target || target.session !== session) return refuse('schedule_invalid', 'no such schedule for that session');
+    // A prompt the list cut is left out by the app, so a missing one keeps the file's whole text.
+    // Arguments the computer gave (a permissions bypass, say) were chosen for its own prompt: the phone cannot put another under them.
+    if (prompt !== undefined && target.agentArgs !== undefined) return refuse('schedule_invalid', 'a schedule with agent arguments takes its prompt from hwip schedule edit');
+    // As `hwip schedule edit`: a prompt of spaces would be typed as nothing.
+    if (typeof prompt === 'string' && prompt.trim() === '') return refuse('schedule_invalid', 'the prompt is empty');
+    if (prompt !== undefined && !deps.canPrompt(target.agentKind)) return refuse('schedule_invalid', 'that agent cannot take a scheduled prompt');
+    // Unchecked here: `updateSchedule` validates the whole schedule they make before it writes.
+    const change: UncheckedScheduleChange = {};
+    if (when !== undefined) change.when = when;
+    if (prompt !== undefined) change.prompt = prompt;
+    if (maxRuntimeMin !== undefined) change.maxRuntimeMin = maxRuntimeMin;
+    const updated = updateSchedule(id, change, deps.now());
+    if (updated.ok) return { ok: true };
+    // Gone between the list and the write is the same as never there for this session.
+    return refuse(updated.failure === 'io' ? 'schedule_failed' : 'schedule_invalid', updated.error);
+};
+
 /**
  * Carry out one change the phone asked for: `{ op: 'create', when, prompt, agentKind?, maxRuntimeMin? }` for the
- * recorded session `session`, or `{ op: 'remove', id }` for the schedule whose session that is. Nothing here
+ * recorded session `session`, `{ op: 'update', id, when?, prompt?, maxRuntimeMin? }` or `{ op: 'remove', id }` for the
+ * schedule whose session that is. Nothing here
  * types into a session. `request` is whatever the phone sealed, so every field is checked as it is used.
  */
 export const applyPhoneSchedule = (request: unknown, session: string, deps: PhoneScheduleDeps = livePhoneScheduleDeps): PhoneScheduleResult => {
     if (!isRecord(request)) return refuse('schedule_invalid', 'the request is not an object');
     try {
         if (request.op === 'create') return create(request, session, deps);
+        if (request.op === 'update') return update(request, session, deps);
         if (request.op === 'remove') return remove(request, session);
     } catch (err) {
         // A file that would not read or write is this machine's trouble, not a mistake in the request.
         return refuse('schedule_failed', err instanceof Error ? err.message : String(err));
     }
-    return refuse('schedule_invalid', 'op is neither create nor remove');
+    return refuse('schedule_invalid', 'op is not create, update or remove');
 };

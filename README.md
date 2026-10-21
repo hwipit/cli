@@ -557,11 +557,17 @@ offers it during setup and `hwip uninstall` takes it away again.
 What you get back after a reboot is your **past sessions**, ready to
 resume from the phone — not live agents. tmux does not survive a reboot
 either, and this doesn't try to bring those sessions back to life.
-A resume starts the agent in the directory it last ran in; for Claude Code
-and OpenCode it also picks up the conversation that session last had
-(`--resume <id>` / `--session <id>`, the id this machine read off the live
-pane's own process — an id two panes both answered to is not kept). Claude Code starts fresh when that conversation is no longer on disk,
-and the other agents always start a new one.
+A resume starts the agent in the directory it last ran in; for Claude Code,
+OpenCode, Codex, Pi and Hermes it also picks up the conversation that session
+last had (`claude --resume <id>`, `opencode --session <id>`,
+`codex resume <thread>`, `pi --session <file>`, `hermes --resume <id>` — the
+id this machine read off the live pane's own process; an id two panes both
+answered to is not kept). Claude Code, Codex and Pi start fresh when that
+conversation is no longer on disk, and the other agents always start a new one.
+Each ended run of a name is its own row on the phone, and starting one
+again picks up that run's conversation, not the newest one. If the name
+is live again by then, that run starts beside it under the next free name
+of the family (`<name>-2`, `<name>-3`, …) instead of being refused.
 
 Two details worth knowing:
 

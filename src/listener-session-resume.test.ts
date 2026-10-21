@@ -35,6 +35,8 @@ const fakeTmux = (args: readonly string[]) => {
     }
     if (a[0] === 'new-session') {
         if (newSessionFails) return { status: 1, stdout: '', stderr: 'no server' };
+        // A started session is live from then on, as it is in tmux.
+        liveSessions.push(a[a.indexOf('-s') + 1]);
         return { status: 0, stdout: '', stderr: '' };
     }
     if (a[0] === 'display-message') {
@@ -64,7 +66,7 @@ process.env.XDG_STATE_HOME = join(TMP, 'state');
 const PROJECT_DIR = join(TMP, 'work', 'api');
 mkdirSync(PROJECT_DIR, { recursive: true });
 
-const { handleSessionResumeRequest, computeListenerDeviceId } = await import('./listener.js');
+const { handleSessionResumeRequest, computeListenerDeviceId, knownSessionsToReport } = await import('./listener.js');
 const { rememberSessions } = await import('./session-registry.js');
 const { claudeProjectDirName, REMOTE_AGENTS } = await import('./remote-agents.js');
 
@@ -359,6 +361,7 @@ describe('agent.session.resume.request — the conversation it last had', () => 
         // read by the agent as an option, not as the id its flag expects.
         for (const bad of ['-x', '--dangerously-skip-permissions', 'a b', 'x'.repeat(129)]) {
             tmuxCalls = [];
+            liveSessions = [];
             rmSync(join(TMP, 'state'), { recursive: true, force: true });
             remember('opencode', bad);
 
@@ -384,5 +387,228 @@ describe('agent.session.resume.request — the conversation it last had', () => 
 
         expect(ask()).toMatchObject({ resumed: true });
         expect(launched()).toEqual(['claude']);
+    });
+});
+
+/**
+ * A run, not just a name: the earlier-runs fold lists each run of a name, and
+ * starting one of them again means that run's conversation (docs/session-runs.md
+ * Q41–Q46). The run id only selects among runs this machine recorded.
+ */
+describe('agent.session.resume.request — the run it names', () => {
+    const device = computeListenerDeviceId();
+    const OLD = '1b5f3c8e-1d2a-4c6b-9e7f-123456789abc';
+    const NEW = '2c6f3c8e-1d2a-4c6b-9e7f-123456789abc';
+    const THIRD = '3d6f3c8e-1d2a-4c6b-9e7f-123456789abc';
+    let sent: Array<Record<string, unknown>>;
+    const send = (data: Record<string, unknown>) => { sent.push(data); };
+    const ask = (fields: Record<string, unknown>) => {
+        handleSessionResumeRequest(
+            { subtype: 'agent.session.resume.request', targetDeviceId: device,
+              sessionName: 'hwip-runs', agentKind: 'claude', requestId: 'r1', ...fields },
+            send,
+        );
+        return sent.at(-1);
+    };
+    const launched = () => {
+        const call = tmuxCalls.find((c) => c[0] === 'new-session') ?? [];
+        return call.slice(call.indexOf('-c') + 2);
+    };
+    const claudeTranscript = (id: string) => {
+        const dir = join(TMP, '.claude', 'projects', claudeProjectDirName(PROJECT_DIR));
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, `${id}.jsonl`), '{}\n');
+    };
+
+    beforeEach(() => {
+        vi.spyOn(console, 'log').mockImplementation(() => {});
+        tmuxCalls = [];
+        sent = [];
+        liveSessions = [];
+        newSessionFails = false;
+        rmSync(join(TMP, 'state'), { recursive: true, force: true });
+        rmSync(join(TMP, '.claude'), { recursive: true, force: true });
+        claudeTranscript(OLD);
+        claudeTranscript(NEW);
+        claudeTranscript(THIRD);
+        const t0 = Date.now() - 60_000;
+        rememberSessions([{ name: 'hwip-runs', cwd: PROJECT_DIR, agentKind: 'claude', runId: '1785542400', agentSessionId: OLD }], t0);
+        rememberSessions([{ name: 'hwip-runs', cwd: PROJECT_DIR, agentKind: 'claude', runId: '1785546000', agentSessionId: NEW }], t0 + 1000);
+    });
+    afterEach(() => vi.restoreAllMocks());
+
+    it('the run it names: starts that run\'s conversation, not the newest', () => {
+        expect(ask({ runId: '1785542400' })).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['claude', '--resume', OLD]);
+    });
+
+    it('the run it names: no run id still means the newest run', () => {
+        expect(ask({})).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['claude', '--resume', NEW]);
+    });
+
+    it('the run it names: a run id the name never had is refused, not swapped for the newest', () => {
+        expect(ask({ runId: '1785549999' })).toMatchObject({ error: 'unknown_session' });
+        expect(tmuxCalls.some((c) => c[0] === 'new-session')).toBe(false);
+    });
+
+    it('the run it names: a run id without an agent still names that run', () => {
+        expect(ask({ agentKind: undefined, runId: '1785542400' })).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['claude', '--resume', OLD]);
+    });
+
+    it('the run it names: a run id without an agent the name never had is refused', () => {
+        expect(ask({ agentKind: undefined, runId: '1785549999' })).toMatchObject({ error: 'unknown_session' });
+        expect(tmuxCalls.some((c) => c[0] === 'new-session')).toBe(false);
+    });
+
+    const startedAs = () => {
+        const call = tmuxCalls.find((c) => c[0] === 'new-session') ?? [];
+        return call[call.indexOf('-s') + 1];
+    };
+
+    it('next free name: a live name with a run id starts that conversation beside it', () => {
+        liveSessions = ['hwip-runs'];
+        expect(ask({ runId: '1785542400' })).toMatchObject({ resumed: true, sessionName: 'hwip-runs-2' });
+        expect(startedAs()).toBe('hwip-runs-2');
+        expect(launched()).toEqual(['claude', '--resume', OLD]);
+    });
+
+    it('next free name: skips every name of the family that is live', () => {
+        liveSessions = ['hwip-runs', 'hwip-runs-2'];
+        expect(ask({ runId: '1785542400' })).toMatchObject({ resumed: true, sessionName: 'hwip-runs-3' });
+        expect(startedAs()).toBe('hwip-runs-3');
+    });
+
+    it('next free name: two resumes in a row do not take the same name', () => {
+        rememberSessions([{ name: 'hwip-runs', cwd: PROJECT_DIR, agentKind: 'claude', runId: '1785544000', agentSessionId: THIRD }], Date.now() - 59_500);
+        liveSessions = ['hwip-runs'];
+        expect(ask({ runId: '1785542400' })).toMatchObject({ resumed: true, sessionName: 'hwip-runs-2' });
+        expect(ask({ runId: '1785544000' })).toMatchObject({ resumed: true, sessionName: 'hwip-runs-3' });
+    });
+
+    it('next free name: counts from the family base, not from a suffixed name', () => {
+        rememberSessions([{ name: 'hwip-runs-2', cwd: PROJECT_DIR, agentKind: 'claude', runId: '1785547000', agentSessionId: OLD }], Date.now() - 30_000);
+        rememberSessions([{ name: 'hwip-runs-2', cwd: PROJECT_DIR, agentKind: 'claude', runId: '1785548000', agentSessionId: THIRD }]);
+        liveSessions = ['hwip-runs', 'hwip-runs-2'];
+        expect(ask({ sessionName: 'hwip-runs-2', runId: '1785547000' })).toMatchObject({ resumed: true, sessionName: 'hwip-runs-3' });
+    });
+
+    it('next free name: a conversation a live session is on already is not started twice', () => {
+        // The run went up beside its name before, and the sweep recorded it there.
+        rememberSessions([{ name: 'hwip-runs-2', cwd: PROJECT_DIR, agentKind: 'claude', runId: '1785547000', agentSessionId: OLD }]);
+        liveSessions = ['hwip-runs', 'hwip-runs-2'];
+        expect(ask({ runId: '1785542400' })).toMatchObject({ error: 'already_running', sessionName: 'hwip-runs' });
+        expect(tmuxCalls.some((c) => c[0] === 'new-session')).toBe(false);
+    });
+
+    it('next free name: without a run id a live name is still refused', () => {
+        liveSessions = ['hwip-runs'];
+        expect(ask({})).toMatchObject({ error: 'already_running', sessionName: 'hwip-runs' });
+        expect(tmuxCalls.some((c) => c[0] === 'new-session')).toBe(false);
+    });
+
+    it('the run it names: a run id that is not one is read as none', () => {
+        expect(ask({ runId: '--resume=x' })).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['claude', '--resume', NEW]);
+    });
+});
+
+/**
+ * Agents past claude and opencode, each measured against its real binary
+ * (docs/session-runs.md Q42): the id the sweep recorded starts that
+ * conversation. codex and pi exit at once on an id they cannot find, so the
+ * flag goes on only when the conversation is still on disk; hermes starts a
+ * new one instead, the way opencode does.
+ */
+describe('agent.session.resume.request — an agent that resumes by its id', () => {
+    const device = computeListenerDeviceId();
+    const UUID = '01a15d37-ca9e-7b12-8ed6-5b974d70f586';
+    const CODEX_ID = `rollout-2026-10-21T15-48-19-${UUID}`;
+    const PI_ID = `2026-10-21T06-48-52-641Z_${UUID}`;
+    const piFile = join(TMP, '.pi', 'agent', 'sessions', `--${PROJECT_DIR.replace(/^\//, '').replace(/[/\\:]/g, '-')}--`, `${PI_ID}.jsonl`);
+    let sent: Array<Record<string, unknown>>;
+    const ask = (agentKind: string, agentSessionId: string) => {
+        rememberSessions([{ name: 'hwip-ids', cwd: PROJECT_DIR, agentKind, agentSessionId }]);
+        handleSessionResumeRequest(
+            { subtype: 'agent.session.resume.request', targetDeviceId: device,
+              sessionName: 'hwip-ids', agentKind, requestId: 'r1' },
+            (data) => { sent.push(data); },
+        );
+        return sent.at(-1);
+    };
+    const launched = () => {
+        const call = tmuxCalls.find((c) => c[0] === 'new-session') ?? [];
+        return call.slice(call.indexOf('-c') + 2);
+    };
+    const write = (path: string) => {
+        mkdirSync(join(path, '..'), { recursive: true });
+        writeFileSync(path, '{}\n');
+    };
+
+    beforeEach(() => {
+        vi.spyOn(console, 'log').mockImplementation(() => {});
+        tmuxCalls = [];
+        sent = [];
+        liveSessions = [];
+        newSessionFails = false;
+        rmSync(join(TMP, 'state'), { recursive: true, force: true });
+        rmSync(join(TMP, '.codex'), { recursive: true, force: true });
+        rmSync(join(TMP, '.pi'), { recursive: true, force: true });
+        // Both stores follow an env override; a machine that sets one would
+        // otherwise answer these from its real store.
+        vi.stubEnv('CODEX_HOME', '');
+        vi.stubEnv('PI_CODING_AGENT_DIR', '');
+    });
+    afterEach(() => {
+        vi.restoreAllMocks();
+        vi.unstubAllEnvs();
+    });
+
+    it('resumes by its id: codex takes the rollout\'s thread id, not its file name', () => {
+        write(join(TMP, '.codex', 'sessions', '2026', '10', '21', `${CODEX_ID}.jsonl`));
+        expect(ask('codex', CODEX_ID)).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['codex', 'resume', UUID]);
+    });
+
+    it('resumes by its id: codex starts fresh when the rollout is gone', () => {
+        expect(ask('codex', CODEX_ID)).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['codex']);
+    });
+
+    it('resumes by its id: pi opens the session file the run wrote', () => {
+        write(piFile);
+        expect(ask('pi', PI_ID)).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['pi', '--session', piFile]);
+    });
+
+    it('resumes by its id: pi starts fresh when the session file is gone', () => {
+        expect(ask('pi', PI_ID)).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['pi']);
+    });
+
+    it('resumes by its id: hermes takes the session id', () => {
+        expect(ask('hermes', '20261021_155015_2b41a7')).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['hermes', '--resume', '20261021_155015_2b41a7']);
+    });
+
+    it('resumes by its id: the report says resumable exactly when the launch carries the id', () => {
+        const rollout = join(TMP, '.codex', 'sessions', '2026', '10', '21', `${CODEX_ID}.jsonl`);
+        write(rollout);
+        expect(ask('codex', CODEX_ID)).toMatchObject({ resumed: true });
+        expect(knownSessionsToReport([])[0]).toMatchObject({ name: 'hwip-ids', resumable: true });
+        expect(launched()).toEqual(['codex', 'resume', UUID]);
+
+        rmSync(rollout);
+        tmuxCalls = [];
+        liveSessions = [];
+        expect(knownSessionsToReport([])[0]).toMatchObject({ name: 'hwip-ids', resumable: false });
+        expect(ask('codex', CODEX_ID)).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['codex']);
+    });
+
+    it('resumes by its id: gemini, which takes no id, starts fresh', () => {
+        expect(ask('gemini', UUID)).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['gemini']);
     });
 });

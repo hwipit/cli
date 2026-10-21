@@ -184,7 +184,7 @@ export const firstFreeSession = (base: string): string => {
 };
 
 /** `<base>`, `<base>-2`, `<base>-3`, … — the session family for one project. */
-const familyNames = (base: string): string[] =>
+export const familyNames = (base: string): string[] =>
     Array.from({ length: MAX_SUFFIX_ATTEMPTS }, (_, i) => (i === 0 ? base : `${base}-${i + 1}`));
 
 /**

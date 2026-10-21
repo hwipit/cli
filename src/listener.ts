@@ -134,6 +134,7 @@ import {
     subagentTranscriptFor, tmuxTargetFor, type PaneInfo,
 } from './tmux-pane.js';
 import { liveRunIdOf, liveSessionNames, sessionExists, sessionLiveness } from './tmux-liveness.js';
+import { familyNames } from './wrapper.js';
 import { noteRunSeqs, runSeqsByRun, runSeqsKey, type RunSeqs } from './run-seqs.js';
 import { FlagValueError, flagOn } from './args.js';
 import { listSchedules, readScheduleState, writeScheduleState } from './schedule.js';
@@ -444,6 +445,8 @@ export interface ReportedKnownSession {
     /** The last name the agent gave the run, and who gave it (hwip docs/session-runs.md Q39): what the phone calls it once ended. */
     providerSessionName?: string;
     providerSessionNameSource?: ProviderNameSource;
+    /** Whether starting the run again picks its conversation back up (Q43) — never the conversation id itself. */
+    resumable: boolean;
     lastSeenAt: string;
 }
 
@@ -479,12 +482,13 @@ export const knownSessionsToReport = (
             ...(e.tmuxRunIds?.length ? { tmuxRunIds: e.tmuxRunIds } : {}),
             ...(e.providerSessionName ? { providerSessionName: e.providerSessionName } : {}),
             ...(e.providerSessionName && e.providerSessionNameSource ? { providerSessionNameSource: e.providerSessionNameSource } : {}),
+            resumable: isResumable(e),
             lastSeenAt: e.lastSeenAt,
         }));
 };
 
 export const knownSessionsFingerprint = (known: ReportedKnownSession[]): string =>
-    known.map((k) => `${k.name} ${k.agentKind} ${k.runId ?? ''} ${k.lastSeenAt} ${k.firstSeq ?? ''} ${k.lastSeq ?? ''} ${k.tmuxRunIds?.join(',') ?? ''} ${k.providerSessionNameSource ?? ''} ${k.providerSessionName ?? ''}`).sort().join('|');
+    known.map((k) => `${k.name} ${k.agentKind} ${k.runId ?? ''} ${k.lastSeenAt} ${k.firstSeq ?? ''} ${k.lastSeq ?? ''} ${k.tmuxRunIds?.join(',') ?? ''} ${k.providerSessionNameSource ?? ''} ${k.providerSessionName ?? ''} ${k.resumable}`).sort().join('|');
 
 export const sessionsFingerprint = (sessions: AgentSession[]): string =>
     sessions
@@ -1734,8 +1738,24 @@ export interface SessionResumeRequest {
      * the same answer a phone too old to send it gets.
      */
     agentKind?: string;
+    /**
+     * Which run of that name and agent (docs/session-runs.md Q41–Q46): the
+     * earlier-runs fold starts one conversation, not the newest. Selects among
+     * runs this machine recorded; one it never had is refused. Read only when
+     * it reads as a run id.
+     */
+    runId?: string;
     requestId?: string;
 }
+
+/** A run id as the registry writes it: tmux `session_created`, epoch seconds. */
+const RUN_ID = /^\d{1,12}$/;
+
+/** The name a wrapper family counts from: `hwip-x-3` → `hwip-x`. */
+const familyBase = (name: string): string => {
+    const base = /^(.+)-\d+$/.exec(name)?.[1];
+    return base !== undefined && familyNames(base).includes(name) ? base : name;
+};
 
 export interface SessionResumeResult {
     subtype: 'agent.session.resume.result';
@@ -1763,6 +1783,27 @@ const resumableConversation = (
     if (typeof id !== 'string' || !CONVERSATION_ID.test(id)) return null;
     const args = agent.resumeArgs?.(id, known.cwd);
     return args ? { id, args } : null;
+};
+
+/**
+ * A live session is on this run's conversation already: the run started beside
+ * its name before, or the live run under it picked the conversation up. The
+ * ended entry stays in the registry, so without this every tap on it would
+ * start one more agent on one transcript.
+ */
+const conversationRunning = (known: KnownSession, live: ReadonlySet<string>): boolean => {
+    const id = known.agentSessionId;
+    if (!id) return false;
+    return [...live].some((name) => {
+        const current = recallSession(name);
+        return current?.agentKind === known.agentKind && current.agentSessionId === id;
+    });
+};
+
+/** What the report says about a run: the same answer a resume of it would act on. */
+const isResumable = (known: KnownSession): boolean => {
+    const agent = REMOTE_AGENTS.find((a) => a.kind === known.agentKind);
+    return agent !== undefined && resumableConversation(agent, known) !== null;
 };
 
 /**
@@ -1810,15 +1851,28 @@ export const handleSessionResumeRequest = (
     // newest run would start claude for a phone that asked for pi — silently,
     // which is the exact failure this path exists to remove. A phone that names
     // nothing still means the newest run.
+    const runId = typeof req.runId === 'string' && RUN_ID.test(req.runId) ? req.runId : undefined;
     const known =
         typeof req.agentKind === 'string'
-            ? recallRun(sessionName, req.agentKind)
-            : recallSession(sessionName);
+            ? recallRun(sessionName, req.agentKind, Date.now(), runId)
+            : recallSession(sessionName, Date.now(), runId);
     if (!known) {
         log(`✗ resume ${sessionName}: never seen on this machine`);
         return reply({ error: 'unknown_session' });
     }
-    if (sessionExists(sessionName)) return reply({ error: 'already_running' });
+    // A live name is refused unless the request names a run: then the phone
+    // asked for one earlier conversation, and the session holding the name is
+    // a different one — so it starts beside it, under the next free name of
+    // the family `hwip cc` would pick (Q41), counted from the family base so a
+    // busy `<base>-2` leads to `<base>-3`. A request without a run id is an
+    // older app that only knows the name, and still gets the refusal it renders.
+    const live = new Set(liveSessionNames() ?? []);
+    const target = !live.has(sessionName)
+        ? sessionName
+        : runId !== undefined
+            ? familyNames(familyBase(sessionName)).find((name) => !live.has(name))
+            : undefined;
+    if (!target || conversationRunning(known, live)) return reply({ error: 'already_running' });
     if (!sessionDirectoryExists(known)) {
         log(`✗ resume ${sessionName}: ${known.cwd} is gone`);
         return reply({ error: 'missing_directory' });
@@ -1841,7 +1895,7 @@ export const handleSessionResumeRequest = (
     const conversation = resumableConversation(agent, known);
     const started = spawnSync(
         'tmux',
-        tmuxArgs(['new-session', '-d', '-s', sessionName, '-c', known.cwd, agent.binary, ...(conversation?.args ?? []), ...sidecar]),
+        tmuxArgs(['new-session', '-d', '-s', target, '-c', known.cwd, agent.binary, ...(conversation?.args ?? []), ...sidecar]),
         { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] },
     );
     if (started.status !== 0) {
@@ -1849,8 +1903,9 @@ export const handleSessionResumeRequest = (
         return reply({ error: 'start_failed' });
     }
     const resumedFrom = conversation ? ` (conversation ${conversation.id.slice(0, 8)})` : '';
-    log(`⟲ resume ${sessionName}: ${agent.binary}${resumedFrom} in ${known.cwd}`);
-    return reply({ resumed: true });
+    const beside = target === sessionName ? '' : ` as ${target}`;
+    log(`⟲ resume ${sessionName}${beside}: ${agent.binary}${resumedFrom} in ${known.cwd}`);
+    return reply({ resumed: true, sessionName: target });
 };
 
 export interface SessionExitRequest {
@@ -2059,7 +2114,7 @@ export const handleSessionForgetRequest = (
     // alternative is an irreversible delete (registry AND scrollback) justified
     // by a question that failed to be asked. It says so in the log, because
     // from the phone the two refusals are the same sentence.
-    const runId = typeof req.runId === 'string' && /^\d{1,12}$/.test(req.runId) ? req.runId : undefined;
+    const runId = typeof req.runId === 'string' && RUN_ID.test(req.runId) ? req.runId : undefined;
     const liveness = sessionLiveness(sessionName);
     if (liveness === 'unknown') {
         log(`✗ forget ${sessionName}: no tmux answered, so nothing was deleted`);

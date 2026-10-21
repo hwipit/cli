@@ -153,10 +153,14 @@ export const knownSessions = (now: number = Date.now()): KnownSession[] =>
         .filter((e) => now - Date.parse(e.lastSeenAt) < KNOWN_SESSION_TTL_MS)
         .sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt));
 
+/** No run asked for, or that run. */
+const ofRun = (e: KnownSession, runId: string | undefined): boolean => runId === undefined || e.runId === runId;
+
 /** One remembered session, or null when this machine never saw that name.
- *  The newest run under that name — which is the one a bare resume means. */
-export const recallSession = (name: string, now: number = Date.now()): KnownSession | null =>
-    knownSessions(now).find((e) => e.name === name) ?? null;
+ *  The newest run under that name — which is the one a bare resume means.
+ *  With `runId`, that run of the name and nothing else (Q46). */
+export const recallSession = (name: string, now: number = Date.now(), runId?: string): KnownSession | null =>
+    knownSessions(now).find((e) => e.name === name && ofRun(e, runId)) ?? null;
 
 /**
  * One specific run: the newest under this name that ran THIS agent.
@@ -166,13 +170,18 @@ export const recallSession = (name: string, now: number = Date.now()): KnownSess
  * which row was tapped and says so; this is how that answer is honoured.
  * Null when this machine never saw that agent under that name — the caller
  * decides whether to fall back to the newest run or refuse.
+ *
+ * With `runId`, that run of the name and nothing else (docs/session-runs.md
+ * Q46): the earlier-runs fold asks for one conversation, and the newest run is
+ * a different one.
  */
 export const recallRun = (
     name: string,
     agentKind: string,
     now: number = Date.now(),
+    runId?: string,
 ): KnownSession | null =>
-    knownSessions(now).find((e) => e.name === name && e.agentKind === agentKind) ?? null;
+    knownSessions(now).find((e) => e.name === name && e.agentKind === agentKind && ofRun(e, runId)) ?? null;
 
 /** tmux sessions remembered per run: an `exit` and `-c` every few minutes all day stays a short list. */
 export const MAX_TMUX_RUNS_PER_RUN = 10;

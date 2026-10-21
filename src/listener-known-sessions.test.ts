@@ -7,7 +7,7 @@
  * so the report carries it and the list stops disagreeing with the button.
  */
 
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { describe, expect, it, beforeEach, vi } from 'vitest';
@@ -109,6 +109,7 @@ describe('known sessions in the inventory report', () => {
             'lastSeenAt',
             'name',
             'project',
+            'resumable',
         ]);
     });
 
@@ -172,7 +173,7 @@ describe('separate runs in the report (hwip docs/session-runs.md)', () => {
 
         const known = knownSessionsToReport([{ ...live('hwip-api'), runId: String(R2) }], (R2 + 60) * 1000);
 
-        expect(known).toEqual([{ name: 'hwip-api', agentKind: 'claude', project: 'api', runId: String(R1), startedAt: at(R1), lastSeenAt: at(R1 + 60) }]);
+        expect(known).toEqual([{ name: 'hwip-api', agentKind: 'claude', project: 'api', runId: String(R1), startedAt: at(R1), resumable: false, lastSeenAt: at(R1 + 60) }]);
     });
 
     it('reports up to fifty', () => {
@@ -265,5 +266,54 @@ describe('the run title an ended run keeps (hwip docs/session-runs.md Q39)', () 
             .not.toBe(knownSessionsFingerprint([{ ...base, providerSessionName: 'B' }]));
         expect(knownSessionsFingerprint([{ ...base, providerSessionName: 'A', providerSessionNameSource: 'auto' }]))
             .not.toBe(knownSessionsFingerprint([{ ...base, providerSessionName: 'A', providerSessionNameSource: 'user' }]));
+    });
+});
+
+/**
+ * Whether starting an ended run again picks its conversation back up
+ * (docs/session-runs.md Q43): the phone offers resume only where it does.
+ * The same check that builds the resume flags, so the two cannot disagree.
+ */
+describe('the resumable flag an ended run carries', () => {
+    beforeEach(() => {
+        rmSync(join(TMP, 'state'), { recursive: true, force: true });
+        rmSync(join(TMP, '.claude'), { recursive: true, force: true });
+    });
+    const CWD = '/work/api';
+    const ID = '1b5f3c8e-1d2a-4c6b-9e7f-123456789abc';
+    const report = (agentKind: string, agentSessionId?: string) => {
+        rememberSessions([{ name: 'hwip-api', cwd: CWD, agentKind, runId: '1790000000', agentSessionId }]);
+        return knownSessionsToReport([])[0];
+    };
+
+    it('resumable: a claude run whose conversation is on disk', async () => {
+        const { claudeProjectDirName } = await import('./remote-agents.js');
+        const dir = join(TMP, '.claude', 'projects', claudeProjectDirName(CWD));
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, `${ID}.jsonl`), '{}\n');
+
+        expect(report('claude', ID)).toMatchObject({ resumable: true });
+    });
+
+    it('resumable: not a claude run whose conversation is gone', () => {
+        expect(report('claude', ID)).toMatchObject({ resumable: false });
+    });
+
+    it('resumable: not a run with no conversation id', () => {
+        expect(report('opencode')).toMatchObject({ resumable: false });
+    });
+
+    it('resumable: an opencode run with an id', () => {
+        expect(report('opencode', 'ses_abc123')).toMatchObject({ resumable: true });
+    });
+
+    it('resumable: not an agent that takes no id', () => {
+        expect(report('gemini', ID)).toMatchObject({ resumable: false });
+    });
+
+    it('resumable: a change re-sends the report', () => {
+        const base = { name: 'hwip-api', agentKind: 'claude', lastSeenAt: '2026-10-21T00:00:00.000Z' };
+        expect(knownSessionsFingerprint([{ ...base, resumable: true }]))
+            .not.toBe(knownSessionsFingerprint([{ ...base, resumable: false }]));
     });
 });

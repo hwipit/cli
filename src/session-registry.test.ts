@@ -318,6 +318,21 @@ describe('one row per run, not per name', () => {
         expect(recallRun('hwip-api', 'codex', T0 + 1000)).toBeNull();
     });
 
+    it('recallRun with a runId recalls that run of the name, not the newest', () => {
+        rememberSessions([live({ agentKind: 'claude', runId: '1785542400', agentSessionId: 'conv-old' })], T0);
+        rememberSessions([live({ agentKind: 'claude', runId: '1785546000', agentSessionId: 'conv-new' })], T0 + 1000);
+
+        expect(recallRun('hwip-api', 'claude', T0 + 1000)?.agentSessionId).toBe('conv-new');
+        expect(recallRun('hwip-api', 'claude', T0 + 1000, '1785542400')?.agentSessionId).toBe('conv-old');
+    });
+
+    it('recallRun with a runId the name never had recalls nothing', () => {
+        rememberSessions([live({ agentKind: 'claude', runId: '1785542400' })], T0);
+
+        expect(recallRun('hwip-api', 'claude', T0 + 1000, '1785549999')).toBeNull();
+        expect(recallRun('hwip-api', 'pi', T0 + 1000, '1785542400')).toBeNull();
+    });
+
     it('deletes only the run named, and keeps the chat scrollback the other one shares', () => {
         rememberSessions([live({ agentKind: 'pi' })], T0);
         rememberSessions([live({ agentKind: 'claude' })], T0 + 1000);

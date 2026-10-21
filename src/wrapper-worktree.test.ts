@@ -11,7 +11,7 @@ import { handleAgentSession, type SpawnTarget } from './wrapper.js';
 withTmpStateDir('hwip-wt-launch-state-');
 
 // `hwip cc --wt x --detach` as far as the launch: the real worktree and the real argv, with the listener
-// and tmux themselves replaced (a fake `tmux` on PATH only gets the check for "is tmux installed" past).
+// and tmux themselves replaced (a fake `tmux` and a fake agent on PATH only get the checks for "is it installed" past).
 describe('handleAgentSession --wt', () => {
     const cc = findAgentBySubcommand('cc')!;
     let tmp: string;
@@ -27,8 +27,10 @@ describe('handleAgentSession --wt', () => {
         execFileSync('git', ['-C', main, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'init']);
         const bin = join(tmp, 'bin');
         execFileSync('mkdir', [bin]);
-        writeFileSync(join(bin, 'tmux'), '#!/bin/sh\nexit 0\n');
-        chmodSync(join(bin, 'tmux'), 0o755);
+        for (const name of ['tmux', cc.binary]) {
+            writeFileSync(join(bin, name), '#!/bin/sh\nexit 0\n');
+            chmodSync(join(bin, name), 0o755);
+        }
         process.env.PATH = `${bin}:${env.PATH}`;
         process.env.HWIP_NO_UPDATE_CHECK = '1';
         delete process.env.TMUX;

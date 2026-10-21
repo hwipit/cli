@@ -562,6 +562,10 @@ and OpenCode it also picks up the conversation that session last had
 (`--resume <id>` / `--session <id>`, the id this machine read off the live
 pane's own process — an id two panes both answered to is not kept). Claude Code starts fresh when that conversation is no longer on disk,
 and the other agents always start a new one.
+Each ended run of a name is its own row on the phone, and starting one
+again picks up that run's conversation, not the newest one. If the name
+is live again by then, that run starts beside it under the next free name
+of the family (`<name>-2`, `<name>-3`, …) instead of being refused.
 
 Two details worth knowing:
 

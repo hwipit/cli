@@ -134,6 +134,7 @@ import {
     subagentTranscriptFor, tmuxTargetFor, type PaneInfo,
 } from './tmux-pane.js';
 import { liveRunIdOf, liveSessionNames, sessionExists, sessionLiveness } from './tmux-liveness.js';
+import { familyNames } from './wrapper.js';
 import { noteRunSeqs, runSeqsByRun, runSeqsKey, type RunSeqs } from './run-seqs.js';
 import { FlagValueError, flagOn } from './args.js';
 import { listSchedules, readScheduleState, writeScheduleState } from './schedule.js';
@@ -1747,6 +1748,12 @@ export interface SessionResumeRequest {
 /** A run id as the registry writes it: tmux `session_created`, epoch seconds. */
 const RUN_ID = /^\d{1,12}$/;
 
+/** The name a wrapper family counts from: `hwip-x-3` → `hwip-x`. */
+const familyBase = (name: string): string => {
+    const base = /^(.+)-\d+$/.exec(name)?.[1];
+    return base !== undefined && familyNames(base).includes(name) ? base : name;
+};
+
 export interface SessionResumeResult {
     subtype: 'agent.session.resume.result';
     requestId: string;
@@ -1829,7 +1836,19 @@ export const handleSessionResumeRequest = (
         log(`✗ resume ${sessionName}: never seen on this machine`);
         return reply({ error: 'unknown_session' });
     }
-    if (sessionExists(sessionName)) return reply({ error: 'already_running' });
+    // A live name is refused unless the request names a run: then the phone
+    // asked for one earlier conversation, and the session holding the name is
+    // a different one — so it starts beside it, under the next free name of
+    // the family `hwip cc` would pick (Q41), counted from the family base so a
+    // busy `<base>-2` leads to `<base>-3`. A request without a run id is an
+    // older app that only knows the name, and still gets the refusal it renders.
+    const live = new Set(liveSessionNames() ?? []);
+    const target = !live.has(sessionName)
+        ? sessionName
+        : runId !== undefined
+            ? familyNames(familyBase(sessionName)).find((name) => !live.has(name))
+            : undefined;
+    if (!target) return reply({ error: 'already_running' });
     if (!sessionDirectoryExists(known)) {
         log(`✗ resume ${sessionName}: ${known.cwd} is gone`);
         return reply({ error: 'missing_directory' });
@@ -1852,7 +1871,7 @@ export const handleSessionResumeRequest = (
     const conversation = resumableConversation(agent, known);
     const started = spawnSync(
         'tmux',
-        tmuxArgs(['new-session', '-d', '-s', sessionName, '-c', known.cwd, agent.binary, ...(conversation?.args ?? []), ...sidecar]),
+        tmuxArgs(['new-session', '-d', '-s', target, '-c', known.cwd, agent.binary, ...(conversation?.args ?? []), ...sidecar]),
         { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] },
     );
     if (started.status !== 0) {
@@ -1860,8 +1879,9 @@ export const handleSessionResumeRequest = (
         return reply({ error: 'start_failed' });
     }
     const resumedFrom = conversation ? ` (conversation ${conversation.id.slice(0, 8)})` : '';
-    log(`⟲ resume ${sessionName}: ${agent.binary}${resumedFrom} in ${known.cwd}`);
-    return reply({ resumed: true });
+    const beside = target === sessionName ? '' : ` as ${target}`;
+    log(`⟲ resume ${sessionName}${beside}: ${agent.binary}${resumedFrom} in ${known.cwd}`);
+    return reply({ resumed: true, sessionName: target });
 };
 
 export interface SessionExitRequest {

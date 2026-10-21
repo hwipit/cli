@@ -35,6 +35,8 @@ const fakeTmux = (args: readonly string[]) => {
     }
     if (a[0] === 'new-session') {
         if (newSessionFails) return { status: 1, stdout: '', stderr: 'no server' };
+        // A started session is live from then on, as it is in tmux.
+        liveSessions.push(a[a.indexOf('-s') + 1]);
         return { status: 0, stdout: '', stderr: '' };
     }
     if (a[0] === 'display-message') {
@@ -359,6 +361,7 @@ describe('agent.session.resume.request — the conversation it last had', () => 
         // read by the agent as an option, not as the id its flag expects.
         for (const bad of ['-x', '--dangerously-skip-permissions', 'a b', 'x'.repeat(129)]) {
             tmuxCalls = [];
+            liveSessions = [];
             rmSync(join(TMP, 'state'), { recursive: true, force: true });
             remember('opencode', bad);
 
@@ -454,6 +457,42 @@ describe('agent.session.resume.request — the run it names', () => {
 
     it('the run it names: a run id without an agent the name never had is refused', () => {
         expect(ask({ agentKind: undefined, runId: '1785549999' })).toMatchObject({ error: 'unknown_session' });
+        expect(tmuxCalls.some((c) => c[0] === 'new-session')).toBe(false);
+    });
+
+    const startedAs = () => {
+        const call = tmuxCalls.find((c) => c[0] === 'new-session') ?? [];
+        return call[call.indexOf('-s') + 1];
+    };
+
+    it('next free name: a live name with a run id starts that conversation beside it', () => {
+        liveSessions = ['hwip-runs'];
+        expect(ask({ runId: '1785542400' })).toMatchObject({ resumed: true, sessionName: 'hwip-runs-2' });
+        expect(startedAs()).toBe('hwip-runs-2');
+        expect(launched()).toEqual(['claude', '--resume', OLD]);
+    });
+
+    it('next free name: skips every name of the family that is live', () => {
+        liveSessions = ['hwip-runs', 'hwip-runs-2'];
+        expect(ask({ runId: '1785542400' })).toMatchObject({ resumed: true, sessionName: 'hwip-runs-3' });
+        expect(startedAs()).toBe('hwip-runs-3');
+    });
+
+    it('next free name: two resumes in a row do not take the same name', () => {
+        liveSessions = ['hwip-runs'];
+        expect(ask({ runId: '1785542400' })).toMatchObject({ resumed: true, sessionName: 'hwip-runs-2' });
+        expect(ask({ runId: '1785546000' })).toMatchObject({ resumed: true, sessionName: 'hwip-runs-3' });
+    });
+
+    it('next free name: counts from the family base, not from a suffixed name', () => {
+        rememberSessions([{ name: 'hwip-runs-2', cwd: PROJECT_DIR, agentKind: 'claude', runId: '1785547000', agentSessionId: OLD }]);
+        liveSessions = ['hwip-runs', 'hwip-runs-2'];
+        expect(ask({ sessionName: 'hwip-runs-2', runId: '1785547000' })).toMatchObject({ resumed: true, sessionName: 'hwip-runs-3' });
+    });
+
+    it('next free name: without a run id a live name is still refused', () => {
+        liveSessions = ['hwip-runs'];
+        expect(ask({})).toMatchObject({ error: 'already_running', sessionName: 'hwip-runs' });
         expect(tmuxCalls.some((c) => c[0] === 'new-session')).toBe(false);
     });
 

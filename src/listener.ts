@@ -445,6 +445,8 @@ export interface ReportedKnownSession {
     /** The last name the agent gave the run, and who gave it (hwip docs/session-runs.md Q39): what the phone calls it once ended. */
     providerSessionName?: string;
     providerSessionNameSource?: ProviderNameSource;
+    /** Whether starting the run again picks its conversation back up (Q43) — never the conversation id itself. */
+    resumable: boolean;
     lastSeenAt: string;
 }
 
@@ -480,12 +482,13 @@ export const knownSessionsToReport = (
             ...(e.tmuxRunIds?.length ? { tmuxRunIds: e.tmuxRunIds } : {}),
             ...(e.providerSessionName ? { providerSessionName: e.providerSessionName } : {}),
             ...(e.providerSessionName && e.providerSessionNameSource ? { providerSessionNameSource: e.providerSessionNameSource } : {}),
+            resumable: isResumable(e),
             lastSeenAt: e.lastSeenAt,
         }));
 };
 
 export const knownSessionsFingerprint = (known: ReportedKnownSession[]): string =>
-    known.map((k) => `${k.name} ${k.agentKind} ${k.runId ?? ''} ${k.lastSeenAt} ${k.firstSeq ?? ''} ${k.lastSeq ?? ''} ${k.tmuxRunIds?.join(',') ?? ''} ${k.providerSessionNameSource ?? ''} ${k.providerSessionName ?? ''}`).sort().join('|');
+    known.map((k) => `${k.name} ${k.agentKind} ${k.runId ?? ''} ${k.lastSeenAt} ${k.firstSeq ?? ''} ${k.lastSeq ?? ''} ${k.tmuxRunIds?.join(',') ?? ''} ${k.providerSessionNameSource ?? ''} ${k.providerSessionName ?? ''} ${k.resumable}`).sort().join('|');
 
 export const sessionsFingerprint = (sessions: AgentSession[]): string =>
     sessions
@@ -1780,6 +1783,12 @@ const resumableConversation = (
     if (typeof id !== 'string' || !CONVERSATION_ID.test(id)) return null;
     const args = agent.resumeArgs?.(id, known.cwd);
     return args ? { id, args } : null;
+};
+
+/** What the report says about a run: the same answer a resume of it would act on. */
+const isResumable = (known: KnownSession): boolean => {
+    const agent = REMOTE_AGENTS.find((a) => a.kind === known.agentKind);
+    return agent !== undefined && resumableConversation(agent, known) !== null;
 };
 
 /**

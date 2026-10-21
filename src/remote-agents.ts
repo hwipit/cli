@@ -668,6 +668,16 @@ const piSessionDirName = (cwd: string): string => {
     return `--${resolved.replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`;
 };
 
+/** `--session <file>` for a pi session still on disk, or null. */
+const piSessionFile = (cwd: string, id: string): string[] | null => {
+    const path = join(piSessionsDir(), piSessionDirName(cwd), `${id}.jsonl`);
+    try {
+        return statSync(path).isFile() ? ['--session', path] : null;
+    } catch {
+        return null;
+    }
+};
+
 /**
  * Newest session file pi wrote for this directory.
  *
@@ -1069,6 +1079,20 @@ const codexSessionsDir = (): string => {
     return join(home, 'sessions');
 };
 
+/** `rollout-YYYY-MM-DDThh-mm-ss-<uuid>`: the day it shards under, and the thread it carries. */
+const CODEX_ROLLOUT = /^rollout-(\d{4})-(\d{2})-(\d{2})T[\d-]+-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+
+/** The thread id of a rollout that is still on disk, or null. */
+const codexRolloutThread = (rolloutId: string): string | null => {
+    const m = CODEX_ROLLOUT.exec(rolloutId);
+    if (!m) return null;
+    try {
+        return statSync(join(codexSessionsDir(), m[1], m[2], m[3], `${rolloutId}.jsonl`)).isFile() ? m[4] : null;
+    } catch {
+        return null;
+    }
+};
+
 /**
  * The two newest `sessions/<YYYY>/<MM>/<DD>` shards.
  *
@@ -1443,8 +1467,15 @@ const REMOTE_AGENT_TABLE = [
         resolveSessionName: detectCodexSessionName,
         resolveTranscript: (paneCwd, panePid) => codexTranscriptPath(paneCwd, panePid),
         projectTranscript: projectCodexEntries,
-        // Read only to tell a resumed conversation's run (no `resumeArgs`): the rollout a resume appends to.
+        // The rollout a resume appends to, by file name.
         resolveResumeId: (paneCwd, panePid) => paneTranscriptId(codexTranscriptPath(paneCwd, panePid), panePid),
+        // `codex resume` takes the thread's UUID; the rollout's file name reads as
+        // a thread NAME and starts a new conversation (measured on 0.163.0). An
+        // unknown UUID exits at once, so only a rollout still on disk.
+        resumeArgs: (id) => {
+            const thread = codexRolloutThread(id);
+            return thread ? ['resume', thread] : null;
+        },
     },
     {
         // The pane binary is `cursor-agent`, Cursor's terminal TUI — NOT the
@@ -1482,6 +1513,10 @@ const REMOTE_AGENT_TABLE = [
         // `<timestamp>_<hash>` string, and nothing on the wire consumes it yet.
         resolveSessionName: detectHermesSessionName,
         resolveResumeId: detectHermesResumeId,
+        // Measured: `--resume <id>` carries the conversation on, and an id the
+        // store lost starts a new session rather than exit — so, like opencode,
+        // not checked against the store.
+        resumeArgs: (id) => ['--resume', id],
     },
     {
         kind: 'pi',
@@ -1492,6 +1527,10 @@ const REMOTE_AGENT_TABLE = [
         projectTranscript: projectPiEntries,
         resolveResumeId: (paneCwd, panePid) => paneTranscriptId(piTranscriptPath(paneCwd, panePid), panePid),
         resolveSessionName: (paneCwd, panePid) => detectPiSessionName(paneCwd, panePid),
+        // The session file itself: `--session` takes a path or a UUID, and the
+        // recorded id is the file name, which it does not match. A session pi
+        // cannot find exits at once (measured), so only a file still on disk.
+        resumeArgs: (id, cwd) => piSessionFile(cwd, id),
     },
     {
         kind: 'opencode',

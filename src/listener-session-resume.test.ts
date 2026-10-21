@@ -66,7 +66,7 @@ process.env.XDG_STATE_HOME = join(TMP, 'state');
 const PROJECT_DIR = join(TMP, 'work', 'api');
 mkdirSync(PROJECT_DIR, { recursive: true });
 
-const { handleSessionResumeRequest, computeListenerDeviceId } = await import('./listener.js');
+const { handleSessionResumeRequest, computeListenerDeviceId, knownSessionsToReport } = await import('./listener.js');
 const { rememberSessions } = await import('./session-registry.js');
 const { claudeProjectDirName, REMOTE_AGENTS } = await import('./remote-agents.js');
 
@@ -499,5 +499,104 @@ describe('agent.session.resume.request — the run it names', () => {
     it('the run it names: a run id that is not one is read as none', () => {
         expect(ask({ runId: '--resume=x' })).toMatchObject({ resumed: true });
         expect(launched()).toEqual(['claude', '--resume', NEW]);
+    });
+});
+
+/**
+ * Agents past claude and opencode, each measured against its real binary
+ * (docs/session-runs.md Q42): the id the sweep recorded starts that
+ * conversation. codex and pi exit at once on an id they cannot find, so the
+ * flag goes on only when the conversation is still on disk; hermes starts a
+ * new one instead, the way opencode does.
+ */
+describe('agent.session.resume.request — an agent that resumes by its id', () => {
+    const device = computeListenerDeviceId();
+    const UUID = '01a15d37-ca9e-7b12-8ed6-5b974d70f586';
+    const CODEX_ID = `rollout-2026-10-21T15-48-19-${UUID}`;
+    const PI_ID = `2026-10-21T06-48-52-641Z_${UUID}`;
+    const piFile = join(TMP, '.pi', 'agent', 'sessions', `--${PROJECT_DIR.replace(/^\//, '').replace(/[/\\:]/g, '-')}--`, `${PI_ID}.jsonl`);
+    let sent: Array<Record<string, unknown>>;
+    const ask = (agentKind: string, agentSessionId: string) => {
+        rememberSessions([{ name: 'hwip-ids', cwd: PROJECT_DIR, agentKind, agentSessionId }]);
+        handleSessionResumeRequest(
+            { subtype: 'agent.session.resume.request', targetDeviceId: device,
+              sessionName: 'hwip-ids', agentKind, requestId: 'r1' },
+            (data) => { sent.push(data); },
+        );
+        return sent.at(-1);
+    };
+    const launched = () => {
+        const call = tmuxCalls.find((c) => c[0] === 'new-session') ?? [];
+        return call.slice(call.indexOf('-c') + 2);
+    };
+    const write = (path: string) => {
+        mkdirSync(join(path, '..'), { recursive: true });
+        writeFileSync(path, '{}\n');
+    };
+
+    beforeEach(() => {
+        vi.spyOn(console, 'log').mockImplementation(() => {});
+        tmuxCalls = [];
+        sent = [];
+        liveSessions = [];
+        newSessionFails = false;
+        rmSync(join(TMP, 'state'), { recursive: true, force: true });
+        rmSync(join(TMP, '.codex'), { recursive: true, force: true });
+        rmSync(join(TMP, '.pi'), { recursive: true, force: true });
+        // Both stores follow an env override; a machine that sets one would
+        // otherwise answer these from its real store.
+        vi.stubEnv('CODEX_HOME', '');
+        vi.stubEnv('PI_CODING_AGENT_DIR', '');
+    });
+    afterEach(() => {
+        vi.restoreAllMocks();
+        vi.unstubAllEnvs();
+    });
+
+    it('resumes by its id: codex takes the rollout\'s thread id, not its file name', () => {
+        write(join(TMP, '.codex', 'sessions', '2026', '10', '21', `${CODEX_ID}.jsonl`));
+        expect(ask('codex', CODEX_ID)).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['codex', 'resume', UUID]);
+    });
+
+    it('resumes by its id: codex starts fresh when the rollout is gone', () => {
+        expect(ask('codex', CODEX_ID)).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['codex']);
+    });
+
+    it('resumes by its id: pi opens the session file the run wrote', () => {
+        write(piFile);
+        expect(ask('pi', PI_ID)).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['pi', '--session', piFile]);
+    });
+
+    it('resumes by its id: pi starts fresh when the session file is gone', () => {
+        expect(ask('pi', PI_ID)).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['pi']);
+    });
+
+    it('resumes by its id: hermes takes the session id', () => {
+        expect(ask('hermes', '20261021_155015_2b41a7')).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['hermes', '--resume', '20261021_155015_2b41a7']);
+    });
+
+    it('resumes by its id: the report says resumable exactly when the launch carries the id', () => {
+        const rollout = join(TMP, '.codex', 'sessions', '2026', '10', '21', `${CODEX_ID}.jsonl`);
+        write(rollout);
+        expect(ask('codex', CODEX_ID)).toMatchObject({ resumed: true });
+        expect(knownSessionsToReport([])[0]).toMatchObject({ name: 'hwip-ids', resumable: true });
+        expect(launched()).toEqual(['codex', 'resume', UUID]);
+
+        rmSync(rollout);
+        tmuxCalls = [];
+        liveSessions = [];
+        expect(knownSessionsToReport([])[0]).toMatchObject({ name: 'hwip-ids', resumable: false });
+        expect(ask('codex', CODEX_ID)).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['codex']);
+    });
+
+    it('resumes by its id: gemini, which takes no id, starts fresh', () => {
+        expect(ask('gemini', UUID)).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['gemini']);
     });
 });

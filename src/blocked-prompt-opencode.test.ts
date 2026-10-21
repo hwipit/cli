@@ -104,3 +104,68 @@ describe('parseBlockedDialog — OpenCode permission (captured, v2.0.29, default
         expect(parseBlockedDialog(BASH, 'pi')).toBeUndefined();
     });
 });
+
+// Captured from a live OpenCode v2.1.2 session (`tmux capture-pane -e`): the question tool's panel, highlight on 2.
+const QUESTION = pane('opencode-blocked-question.ansi.txt');
+const LIT = '\u001b[38;2;250;178;131m';
+const DIM = '\u001b[38;2;128;128;128m';
+/** QUESTION with the highlight moved from option 2 to option `to`. */
+const highlightOn = (to: number): string =>
+    QUESTION.replace(`${LIT}2.`, `${DIM}2.`).replace(`${LIT}PR까지`, '\u001b[38;2;238;238;238mPR까지')
+        .replace(`${DIM}${to}.`, `${LIT}${to}.`);
+
+describe('parseBlockedDialog — OpenCode question tool (captured, v2.1.2, default theme)', () => {
+    it('reads the question, the answers with their notes, and up/down keys from the highlight', () => {
+        expect(parseBlockedDialog(QUESTION, 'opencode')).toMatchObject({
+            title: 'Question',
+            question: '`docs/agents-instructions` 브랜치를 origin에 push해도 될까요? (커밋 `3d19917`)',
+            detail: [
+                'Push만 (Recommended): 브랜치를 origin에 올리고 PR은 만들지 않는다',
+                'PR까지: push 후 main 대상 PR을 만든다',
+                '아직 안 함: 커밋만 두고 push하지 않는다',
+            ],
+            options: [
+                { n: 1, label: 'Push만 (Recommended)', keys: ['up', 'enter'] },
+                { n: 2, label: 'PR까지', keys: ['enter'] },
+                { n: 3, label: '아직 안 함', keys: ['down', 'enter'] },
+            ],
+        });
+    });
+
+    it('leaves out "Type your own answer": choosing it opens a text field the keys cannot fill', () => {
+        const labels = parseBlockedDialog(QUESTION, 'opencode')!.options.map((o) => o.label);
+        expect(labels).not.toContain('Type your own answer');
+        expect(parseBlockedDialog(highlightOn(4), 'opencode')!.options.map((o) => o.keys)).toEqual([
+            ['up', 'up', 'up', 'enter'],
+            ['up', 'up', 'enter'],
+            ['up', 'enter'],
+        ]);
+    });
+
+    it('gives a new id when the highlight moves, and the bound check sees it', () => {
+        const id = parseBlockedDialog(QUESTION, 'opencode')!.id;
+        const moved = highlightOn(1);
+        expect(parseBlockedDialog(moved, 'opencode')!.id).not.toBe(id);
+        expect(promptStillShown(id, QUESTION)).toBe(true);
+        expect(promptStillShown(id, moved)).toBe(false);
+    });
+
+    it('reads nothing from a capture without escapes: the highlight cannot be seen', () => {
+        expect(parseBlockedDialog(stripEscapes(QUESTION), 'opencode')).toBeUndefined();
+    });
+
+    it('reads nothing unless exactly one answer stands out', () => {
+        expect(parseBlockedDialog(highlightOn(1).replace(`${DIM}3.`, `${LIT}3.`), 'opencode')).toBeUndefined();
+    });
+
+    it('reads nothing from a footer it has not seen (several questions, a multi-select)', () => {
+        const footer = (from: string, to: string) => QUESTION.replace(from, to);
+        expect(parseBlockedDialog(footer('select\u001b[38;2;255;255;255m  ', 'select  tab next  '), 'opencode')).toBeUndefined();
+        expect(parseBlockedDialog(footer('submit', 'toggle'), 'opencode')).toBeUndefined();
+    });
+
+    it('is not read as another agent', () => {
+        expect(parseBlockedDialog(QUESTION, 'claude')).toBeUndefined();
+        expect(parseBlockedDialog(QUESTION, 'pi')).toBeUndefined();
+    });
+});

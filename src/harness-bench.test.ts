@@ -193,7 +193,7 @@ describe('harness bench — bundled rules vs real panes', () => {
  * the cli. A floor that lags the merged version is harmless — it only ever
  * blocks a bundle bump, never a fetch.
  */
-const PUBLISHED_FLOOR = '2026.10.18.1';
+const PUBLISHED_FLOOR = '2026.10.21.1';
 
 describe('bundled manifest vs published manifest', () => {
     it('does not outrank what the endpoint serves', () => {

@@ -18,7 +18,7 @@
  *   still be working underneath, so it must not change the state.
  *
  * Every agent here carries the same rules the server manifest publishes
- * (hwip server/src/agent-rules/manifest.json, version 2026.10.18.1 — hwip#532, merged and deployed before this cli ships),
+ * (hwip server/src/agent-rules/manifest.json, version 2026.10.21.1 — hwip#616, merged and deployed before this cli ships),
  * so a listener that never reaches the endpoint classifies them too. A fetched
  * manifest replaces this bundle whole for state reports; schedules read only
  * this bundle. An agent without rules here
@@ -29,7 +29,7 @@ import { ENGINE_VERSION, type DetectionManifest } from './agent-state.js';
 
 export const DEFAULT_MANIFEST: DetectionManifest = {
     engineVersion: ENGINE_VERSION,
-    version: '2026.10.18.1',
+    version: '2026.10.21.1',
     agents: {
         claude: [
             {
@@ -235,8 +235,8 @@ export const DEFAULT_MANIFEST: DetectionManifest = {
             // guarded by any button or footer string so the phrase in tool
             // output or agent text alone is not a dialog. tailLines 30
             // because an edit request draws its diff between that line and
-            // the buttons. Other prompts (the agent asking a question) are
-            // not captured and report `unknown`.
+            // the buttons. Other prompts (anything but a permission request or
+            // the question tool, below) are not read and report `unknown`.
             // No idle rule: at rest the footer is only `ctrl+p commands`,
             // which says nothing the absence of `esc interrupt` does not.
             {
@@ -250,6 +250,17 @@ export const DEFAULT_MANIFEST: DetectionManifest = {
                     { contains: ['reject'] },
                     { contains: ['enter confirm'] },
                 ],
+            },
+            {
+                // The question tool's panel (captured on opencode 2.1.2).
+                // tailLines 40: answers carry notes. `esc interrupt` means a
+                // turn still running, so these words in agent text do not count.
+                id: 'opencode-blocked-question',
+                state: 'blocked',
+                priority: 900,
+                tailLines: 40,
+                contains: ['questions', 'enter submit', 'esc dismiss'],
+                not: [{ contains: ['esc interrupt'] }],
             },
             {
                 id: 'opencode-working-interrupt-hint',

@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
     advanceState, clearRegexCache, evaluateState,
@@ -5,6 +6,7 @@ import {
     type DetectionManifest, type DetectionRule, type StateTracker,
 } from './agent-state.js';
 import { DEFAULT_MANIFEST } from './agent-rules.default.js';
+import { stripEscapes } from './blocked-prompt.js';
 
 // ── Synthetic pane fixtures ──────────────────────────────────────
 // Hand-written approximations of Claude Code screens; the point is to
@@ -313,6 +315,15 @@ describe('opencode rules — screens rebuilt from recorded strings', () => {
 
     it('the esc interrupt footer → working', () => {
         expect(opencode(['  Reading src/listener.ts…', '', '  esc interrupt   ctrl+p commands'])).toBe('working');
+    });
+
+    it('reads the question tool\'s panel as blocked (captured, v2.1.2)', () => {
+        const pane = readFileSync(new URL('./fixtures/panes/opencode-blocked-question.ansi.txt', import.meta.url), 'utf-8');
+        expect(evaluateState(stripEscapes(pane), 'opencode', DEFAULT_MANIFEST).state).toBe('blocked');
+    });
+
+    it('does not read the panel\'s words in agent text as a question', () => {
+        expect(opencode(['  ┃  Questions', '  ┃  ↑↓ select  enter submit  esc dismiss', '', '  esc interrupt   ctrl+p commands'])).toBe('working');
     });
 
     it.each([

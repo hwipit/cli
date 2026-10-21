@@ -973,7 +973,12 @@ handing the listener a key:
   session name, its `seq`/`epoch` and that nonce, so a relay that cannot
   swap in a key of its own (below) can't move one to another stream,
   replay one from an earlier subscription, or hand one back as input —
-  or as anything else this listener sealed for the phone. Your
+  or as anything else this listener sealed for the phone. A history page
+  (scrolling up past the live window) holds the same nonce and `epoch`,
+  the request id it answers and where it sits in the scrollback, so a
+  relay can't hand an earlier page back under a new request or move
+  where the next one is asked for; only the request id rides beside it
+  in the clear. Your
   keystrokes are sealed for this listener as `stream.input` with their
   `seq`/`epoch` stamps, the stream's start epoch and the phone's device
   id inside, so a forged restart can't replay them. The start answer (`agent.stream.start.ok`)

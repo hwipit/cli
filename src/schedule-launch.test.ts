@@ -47,6 +47,12 @@ describe('launchHwip', () => {
         expect(env[LISTENER_LAUNCH_ENV]).toBe('1');
     });
 
+    it('puts the directories the person\'s shell found agents in on the child\'s PATH', async () => {
+        const { calls, execFile } = fakeExec({ err: null, stderr: '' });
+        await launchHwip(['cc'], '/w', LAUNCH_TIMEOUT_MS, { execFile, cliPath: () => '/cli.js', env: { PATH: '/usr/bin' }, agentPath: (path) => `${path}:/home/me/.local/bin` });
+        expect((calls[0]!.options.env as NodeJS.ProcessEnv).PATH).toBe('/usr/bin:/home/me/.local/bin');
+    });
+
     it('is a failure with the child\'s stderr when it exits non-zero, else with the error message', async () => {
         const withStderr = fakeExec({ err: new Error('Command failed'), stderr: 'claude: command not found' });
         expect(await launchHwip(['cc'], '/w', LAUNCH_TIMEOUT_MS, { execFile: withStderr.execFile, cliPath: () => '/cli.js' })).toEqual({ ok: false, error: 'claude: command not found' });

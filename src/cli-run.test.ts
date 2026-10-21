@@ -383,8 +383,8 @@ describe('the base URL in config.json', () => {
     });
 });
 
-// F7: `--wt` is refused before anything is made or started. A tmux that only exits 0 is enough to get past the
-// "tmux not found" check; the listener and the agent are never reached, which is the point of these cases.
+// F7: `--wt` is refused before anything is made or started. A tmux and a claude that only exit 0 are enough to get past
+// the "not found" checks; the listener and the agent are never reached, which is the point of these cases.
 describe('--wt refusals', () => {
     let bin: string;
     let repos: string;
@@ -392,6 +392,7 @@ describe('--wt refusals', () => {
         bin = join(dir, 'bin');
         mkdirSync(bin);
         writeFileSync(join(bin, 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+        writeFileSync(join(bin, 'claude'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
         repos = mkdtempSync(join(dir, 'repos-'));
     });
     // git is the one real tool the refusals need.

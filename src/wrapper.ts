@@ -11,7 +11,8 @@
  */
 import { execFileSync, spawn, spawnSync } from 'child_process';
 import { basename } from 'path';
-import { resolveCommand } from './agents.js';
+import { rememberAgentDir } from './agent-dirs.js';
+import { findOnPath, resolveCommand } from './agents.js';
 import { planTmuxInstall, type TmuxInstallPlan } from './tmux-install.js';
 import { cachedUpdateNotice, isNewer } from './check-update.js';
 import { checkoutOf, groupOf, HERDR_ENV_VARS, HERDR_SELF_REPORTING_KINDS, HERDR_SESSION_OPTIONS, PROJECT_DIR_ENV_VARS, resolvedEnv, SESSION_LABEL_OPTION, SESSION_PROJECT_OPTION, SESSION_SHELL_OPTION, tmuxName, VERSION } from './config.js';
@@ -600,6 +601,14 @@ export const handleAgentSession = async (
     const missing = tmuxMissing(agent.subcommands[0]);
     if (missing) {
         console.error(missing);
+        return 127;
+    }
+    // Where this shell finds the agent: a schedule launch, which has only the listener's PATH, looks there too (agent-dirs.ts).
+    const agentFile = findOnPath(agent.binary);
+    if (agentFile && !launchedByListener) rememberAgentDir(agentFile);
+    // tmux would create the session anyway and its pane would die at once, leaving the caller a session that is just gone.
+    if (opts.detach && !agentFile) {
+        console.error(`hwip: '${agent.binary}' not found on PATH`);
         return 127;
     }
     // Before the listener starts: a refused `--wt` should cost nothing.

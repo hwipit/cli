@@ -386,3 +386,79 @@ describe('agent.session.resume.request — the conversation it last had', () => 
         expect(launched()).toEqual(['claude']);
     });
 });
+
+/**
+ * A run, not just a name: the earlier-runs fold lists each run of a name, and
+ * starting one of them again means that run's conversation (docs/session-runs.md
+ * Q41–Q46). The run id only selects among runs this machine recorded.
+ */
+describe('agent.session.resume.request — the run it names', () => {
+    const device = computeListenerDeviceId();
+    const OLD = '1b5f3c8e-1d2a-4c6b-9e7f-123456789abc';
+    const NEW = '2c6f3c8e-1d2a-4c6b-9e7f-123456789abc';
+    let sent: Array<Record<string, unknown>>;
+    const send = (data: Record<string, unknown>) => { sent.push(data); };
+    const ask = (fields: Record<string, unknown>) => {
+        handleSessionResumeRequest(
+            { subtype: 'agent.session.resume.request', targetDeviceId: device,
+              sessionName: 'hwip-runs', agentKind: 'claude', requestId: 'r1', ...fields },
+            send,
+        );
+        return sent.at(-1);
+    };
+    const launched = () => {
+        const call = tmuxCalls.find((c) => c[0] === 'new-session') ?? [];
+        return call.slice(call.indexOf('-c') + 2);
+    };
+    const claudeTranscript = (id: string) => {
+        const dir = join(TMP, '.claude', 'projects', claudeProjectDirName(PROJECT_DIR));
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, `${id}.jsonl`), '{}\n');
+    };
+
+    beforeEach(() => {
+        vi.spyOn(console, 'log').mockImplementation(() => {});
+        tmuxCalls = [];
+        sent = [];
+        liveSessions = [];
+        newSessionFails = false;
+        rmSync(join(TMP, 'state'), { recursive: true, force: true });
+        rmSync(join(TMP, '.claude'), { recursive: true, force: true });
+        claudeTranscript(OLD);
+        claudeTranscript(NEW);
+        const t0 = Date.now() - 60_000;
+        rememberSessions([{ name: 'hwip-runs', cwd: PROJECT_DIR, agentKind: 'claude', runId: '1785542400', agentSessionId: OLD }], t0);
+        rememberSessions([{ name: 'hwip-runs', cwd: PROJECT_DIR, agentKind: 'claude', runId: '1785546000', agentSessionId: NEW }], t0 + 1000);
+    });
+    afterEach(() => vi.restoreAllMocks());
+
+    it('the run it names: starts that run\'s conversation, not the newest', () => {
+        expect(ask({ runId: '1785542400' })).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['claude', '--resume', OLD]);
+    });
+
+    it('the run it names: no run id still means the newest run', () => {
+        expect(ask({})).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['claude', '--resume', NEW]);
+    });
+
+    it('the run it names: a run id the name never had is refused, not swapped for the newest', () => {
+        expect(ask({ runId: '1785549999' })).toMatchObject({ error: 'unknown_session' });
+        expect(tmuxCalls.some((c) => c[0] === 'new-session')).toBe(false);
+    });
+
+    it('the run it names: a run id without an agent still names that run', () => {
+        expect(ask({ agentKind: undefined, runId: '1785542400' })).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['claude', '--resume', OLD]);
+    });
+
+    it('the run it names: a run id without an agent the name never had is refused', () => {
+        expect(ask({ agentKind: undefined, runId: '1785549999' })).toMatchObject({ error: 'unknown_session' });
+        expect(tmuxCalls.some((c) => c[0] === 'new-session')).toBe(false);
+    });
+
+    it('the run it names: a run id that is not one is read as none', () => {
+        expect(ask({ runId: '--resume=x' })).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['claude', '--resume', NEW]);
+    });
+});

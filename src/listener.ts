@@ -1734,8 +1734,18 @@ export interface SessionResumeRequest {
      * the same answer a phone too old to send it gets.
      */
     agentKind?: string;
+    /**
+     * Which run of that name and agent (docs/session-runs.md Q41–Q46): the
+     * earlier-runs fold starts one conversation, not the newest. Selects among
+     * runs this machine recorded; one it never had is refused. Read only when
+     * it reads as a run id.
+     */
+    runId?: string;
     requestId?: string;
 }
+
+/** A run id as the registry writes it: tmux `session_created`, epoch seconds. */
+const RUN_ID = /^\d{1,12}$/;
 
 export interface SessionResumeResult {
     subtype: 'agent.session.resume.result';
@@ -1810,10 +1820,11 @@ export const handleSessionResumeRequest = (
     // newest run would start claude for a phone that asked for pi — silently,
     // which is the exact failure this path exists to remove. A phone that names
     // nothing still means the newest run.
+    const runId = typeof req.runId === 'string' && RUN_ID.test(req.runId) ? req.runId : undefined;
     const known =
         typeof req.agentKind === 'string'
-            ? recallRun(sessionName, req.agentKind)
-            : recallSession(sessionName);
+            ? recallRun(sessionName, req.agentKind, Date.now(), runId)
+            : recallSession(sessionName, Date.now(), runId);
     if (!known) {
         log(`✗ resume ${sessionName}: never seen on this machine`);
         return reply({ error: 'unknown_session' });
@@ -2059,7 +2070,7 @@ export const handleSessionForgetRequest = (
     // alternative is an irreversible delete (registry AND scrollback) justified
     // by a question that failed to be asked. It says so in the log, because
     // from the phone the two refusals are the same sentence.
-    const runId = typeof req.runId === 'string' && /^\d{1,12}$/.test(req.runId) ? req.runId : undefined;
+    const runId = typeof req.runId === 'string' && RUN_ID.test(req.runId) ? req.runId : undefined;
     const liveness = sessionLiveness(sessionName);
     if (liveness === 'unknown') {
         log(`✗ forget ${sessionName}: no tmux answered, so nothing was deleted`);

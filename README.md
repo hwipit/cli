@@ -645,8 +645,9 @@ went.
 - **The prompt** (`--prompt`) is typed once, and only when the agent is the foreground program of the pane and its detection rules read the screen as `idle` — not working, not a dialog. If that does not happen within 90 seconds the prompt is not typed, the session stays, and the phone is told. **Only agents that have an `idle` rule can take a prompt** (today Claude Code, Codex, Gemini CLI and pi): for any other agent nothing separates "ready" from a trust or permission dialog, and the Enter that submits a prompt would answer the dialog's default with nobody there to read it. `hwip schedule add … --prompt` refuses those agents and says which ones work; a schedule without `--prompt` starts any agent. The rules that decide this are the ones shipped in the `hwip` package, not the detection rules the listener updates over the air: a phone's input is typed by someone who has seen the screen, a schedule by nobody, and a rule set that arrives over the air is not signed — it must not be able to call a dialog `idle` and have your prompt and Enter typed into it.
 - **The cap**: a session that runs longer than `--max-runtime` is asked to end the way the phone's *end session* does — the agent's own quit command, then signals. It is never killed; one that stays keeps the schedule from starting its next run (`overlap`).
 - **The phone is told** with one push per listener tick, listing each schedule with how many times and why (`<label> · 놓침 31회` — the push is in Korean). A run skipped because the last one is still going counts once until the result changes; a push that does not go out is tried again after 30 seconds, then 1, 2, 4 … minutes up to 30 (only a refusal by the server, such as the daily limit, is not tried again; a timeout, a proxy or a captive portal in the way is), and is dropped after 24 hours. The push has one title per kind of news — skipped or missed, over its runtime, or a prompt not typed — and a general one when a push holds several kinds. The prompt is never in it. A free account sends at most 100 pushes a day (`pushPerDay`), which is why these are batched.
+- **Editing**: `hwip schedule edit <id>` changes the time (`--at`, `--days`, `--every`), `--prompt` and `--max-runtime` of a schedule in place; the id, the session, the directory and the agent stay. What a flag does not name is kept — `--at` keeps the days, `--days` the time. A changed time counts from the edit: the times before it are neither started nor counted as missed, and an `--every` schedule runs one period after the edit; changing only the prompt or the run time keeps the schedule on its times. A session already running keeps going. A listener of an older build is restarted first, because it would skip the edited file as unreadable; when it cannot be replaced, a new time is not written (exit 1) and the schedule keeps running as it was.
 - **State** is files under `~/.local/state/hwip`: one `schedules/<id>.json` per schedule (limit 20) and `schedule-state.json`, written only by the listener, with where each schedule has got to.
-- **From the phone**: the app lists the schedules of a computer, makes one for a session this computer has run, and removes one. It names the session, a time and what to do; the directory, the agent's command and its arguments are never the phone's (see *Defense*). A schedule made there needs an agent that can take a prompt, and shows in `hwip schedule` like any other.
+- **From the phone**: the app lists the schedules of a computer, makes one for a session this computer has run, edits one, and removes one. It names the session, a time and what to do; the directory, the agent's command and its arguments are never the phone's (see *Defense*). A schedule made there needs an agent that can take a prompt, and shows in `hwip schedule` like any other.
 
 ### Session history
 
@@ -832,7 +833,7 @@ The phone also reads this machine's schedules (see [Scheduled sessions](#schedul
 { subtype: 'agent.schedule.list.result',  requestId, at, schedules | encrypted | error }
 ```
 
-`schedules` is the list as a JSON string; `encrypted` is the list sealed for the asking device (purpose `schedule.list`, bound to this machine's device id) as `{ v: 1, requestId, at, schedules: [...], unreadable? }` — the app checks that the `requestId` inside is the one it asked, so an older sealed list is not taken for a newer answer. `unreadable` is how many schedule files could not be read; a directory that cannot be listed at all, or that holds more than 20 files, is the error `read_failed`, never an empty list (and a remove then fails as `schedule_failed`; `hwip schedule rm` still works on the computer). A list too long for one frame has its prompts shortened, step by step (`too_large` only when it does not fit even without them). Each entry holds `id`, `source`, `agentKind`, `project` (the directory's name, not its path), `session`, `when`, `prompt` (cut to 500 characters, shorter when the list would not fit), `maxRuntimeMin`, `nextAt` and the `last` result — never a directory path or the agent's arguments.
+`schedules` is the list as a JSON string; `encrypted` is the list sealed for the asking device (purpose `schedule.list`, bound to this machine's device id) as `{ v: 1, requestId, at, schedules: [...], unreadable? }` — the app checks that the `requestId` inside is the one it asked, so an older sealed list is not taken for a newer answer. `unreadable` is how many schedule files could not be read; a directory that cannot be listed at all, or that holds more than 20 files, is the error `read_failed`, never an empty list (and a remove then fails as `schedule_failed`; `hwip schedule rm` still works on the computer). A list too long for one frame has its prompts shortened, step by step (`too_large` only when it does not fit even without them). Each entry holds `id`, `source`, `agentKind`, `project` (the directory's name, not its path), `session`, `when`, `prompt` (cut to 500 characters, shorter when the list would not fit; `promptLocked: true` says the phone cannot change it — it is not the whole text, or the schedule has agent arguments — so the app leaves it to `hwip schedule edit`), `maxRuntimeMin`, `nextAt` and the `last` result — never a directory path or the agent's arguments.
 
 ### Your API key and redirects
 
@@ -1188,7 +1189,7 @@ device, takes plain commands as before; an unreadable
 forgets the pins, and with them goes back to taking plain commands until a
 device is pinned again.
 
-**A schedule request** — the phone making or removing a scheduled session — rides
+**A schedule request** — the phone making, changing or removing a scheduled session — rides
 the same `agent.command` push, with a `schedule` field and no `body`. It carries
 a time, a prompt and, if the phone says so, an agent and a run time — and nothing
 else. The directory and the agent come from what this machine recorded for the
@@ -1197,8 +1198,11 @@ schedule at another directory; it cannot send agent arguments, a worktree or a
 label either, and a request that carries one is refused rather than ignored
 (`schedule_invalid`; `schedule_limit` at 20 schedules; `unknown_session` for a
 session this machine never recorded; `schedule_failed` when this machine's own
-files would not read or write). A remove names the schedule's own
-session, so it cannot reach another. Applying a request never types into a
+files would not read or write). A change (`op: 'update'`) carries the schedule's id
+and any of the time, the prompt and the run time; what it leaves out stays as it was,
+and a change with none of them is refused. A schedule made on the computer with agent arguments keeps its prompt: the phone may change its time and run time, not what is typed under those arguments. A change and a remove name the schedule's own
+session, so they cannot reach another. A listener of an older build refuses a change as
+`schedule_invalid`. Applying a request never types into a
 session. The request is sealed like any
 command — the whole of it inside the body, only `op` beside it, and the sender,
 label and counter checks above apply, so a replay or a swapped `op` changes

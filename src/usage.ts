@@ -175,6 +175,10 @@ ${usageAgentLines()}
                                     (cc, codex, …) and the project is this one
                   schedule [list]   show them, with the next run and the last
                                     result (--json for scripts)
+                  schedule edit <id> [--at HH:MM] [--days …] [--every <N>m|<N>h]
+                                    [--prompt <text>] [--max-runtime <N>m|<N>h]
+                                    change one in place; a new time counts
+                                    from the edit, a running session keeps going
                   schedule rm <id>  remove one; a session it already started
                                     keeps running
   sh              Open (or reattach) 'hwip-<project>-sh', a login shell the

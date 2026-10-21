@@ -58,6 +58,122 @@ describe('phoneScheduleList', () => {
     });
 });
 
+describe('phoneScheduleList after an edit [F8-edit]', () => {
+    it('gives the next run counted from the edit', () => {
+        put('aaaaaa', { updatedAt: '2026-10-03T00:20:00.000Z' });
+        expect(phoneScheduleList(Date.parse('2026-10-03T00:30:00.000Z'))!.schedules[0]!.nextAt).toBe('2026-10-03T01:20:00.000Z');
+    });
+});
+
+describe('phoneScheduleList promptLocked [F8-edit]', () => {
+    it('marks a prompt the list cut or left out, and one under agent arguments, and only those', () => {
+        put('aaaaaa', { prompt: 'x'.repeat(LIST_PROMPT_CHARS + 1) });
+        put('bbbbbb', { prompt: 'short' });
+        put('cccccc');
+        const [cut, kept, none] = phoneScheduleList(Date.now())!.schedules;
+        expect(cut.promptLocked).toBe(true);
+        expect(kept).not.toHaveProperty('promptLocked');
+        expect(none).not.toHaveProperty('promptLocked');
+        expect(phoneScheduleList(Date.now(), 0)!.schedules[1]).toMatchObject({ promptLocked: true });
+        expect(phoneScheduleList(Date.now(), 0)!.schedules[1]).not.toHaveProperty('prompt');
+        put('dddddd', { prompt: 'short', agentArgs: ['--x'] });
+        expect(phoneScheduleList(Date.now())!.schedules[3]).toMatchObject({ prompt: 'short', promptLocked: true });
+        put('eeeeee', { agentArgs: ['--x'] });
+        expect(phoneScheduleList(Date.now())!.schedules[4]).toMatchObject({ promptLocked: true });
+        expect(phoneScheduleList(Date.now())!.schedules[4]).not.toHaveProperty('prompt');
+    });
+});
+
+describe('applyPhoneSchedule update [F8-edit]', () => {
+    const now = Date.parse('2026-10-05T00:00:00.000Z');
+    const deps = (over: Partial<PhoneScheduleDeps> = {}): PhoneScheduleDeps => ({
+        now: () => now,
+        recall: () => null,
+        directoryExists: () => true,
+        canPrompt: (kind) => kind === 'claude',
+        ...over,
+    });
+    const refused = (result: PhoneScheduleResult, reason: string) => expect(result).toMatchObject({ ok: false, reason });
+    const saved = () => listSchedules().schedules[0]!;
+
+    it('changes the time, prompt and run time of the schedule whose session sent it', () => {
+        put('aaaaaa', { prompt: 'old' });
+        const result = applyPhoneSchedule(
+            { op: 'update', id: 'aaaaaa', when: { kind: 'daily', at: '09:00', days: [1, 3] }, prompt: 'new', maxRuntimeMin: 45 },
+            'hwip-api-sched-aaaaaa', deps(),
+        );
+        expect(result).toEqual({ ok: true });
+        expect(saved()).toMatchObject({
+            id: 'aaaaaa', createdAt: '2026-10-01T00:00:00.000Z', cwd: '/work/api', session: 'hwip-api-sched-aaaaaa',
+            when: { kind: 'daily', at: '09:00', days: [1, 3] }, prompt: 'new', maxRuntimeMin: 45, updatedAt: '2026-10-05T00:00:00.000Z',
+        });
+    });
+
+    it('keeps the prompt when the request leaves it out', () => {
+        put('aaaaaa', { prompt: 'x'.repeat(LIST_PROMPT_CHARS + 10) });
+        expect(applyPhoneSchedule({ op: 'update', id: 'aaaaaa', maxRuntimeMin: 20 }, 'hwip-api-sched-aaaaaa', deps())).toEqual({ ok: true });
+        expect(saved().prompt).toHaveLength(LIST_PROMPT_CHARS + 10);
+        expect(saved().maxRuntimeMin).toBe(20);
+    });
+
+    it('refuses another session\'s schedule, an unknown id and an id that is a path, and changes nothing', () => {
+        put('aaaaaa');
+        refused(applyPhoneSchedule({ op: 'update', id: 'aaaaaa', maxRuntimeMin: 20 }, 'hwip-other', deps()), 'schedule_invalid');
+        refused(applyPhoneSchedule({ op: 'update', id: 'zzzzzz', maxRuntimeMin: 20 }, 'hwip-api-sched-aaaaaa', deps()), 'schedule_invalid');
+        refused(applyPhoneSchedule({ op: 'update', id: '../x', maxRuntimeMin: 20 }, 'hwip-api-sched-aaaaaa', deps()), 'schedule_invalid');
+        expect(saved().maxRuntimeMin).toBe(30);
+    });
+
+    it.each([
+        ['cwd', { cwd: '/etc' }],
+        ['agentArgs', { agentArgs: ['--x'] }],
+        ['label', { label: 'mine' }],
+        ['agentKind', { agentKind: 'codex' }],
+        ['session', { session: 'hwip-x' }],
+    ])('refuses an update that carries %s', (_name, extra) => {
+        put('aaaaaa');
+        refused(applyPhoneSchedule({ op: 'update', id: 'aaaaaa', maxRuntimeMin: 20, ...extra }, 'hwip-api-sched-aaaaaa', deps()), 'schedule_invalid');
+        expect(saved().maxRuntimeMin).toBe(30);
+    });
+
+    it.each([
+        ['nothing to change', {}],
+        ['an empty prompt', { prompt: '' }],
+        ['a prompt of spaces', { prompt: '  ' }],
+        ['a prompt that is not text', { prompt: 5 }],
+        ['a run time past the new every period', { when: { kind: 'every', minutes: 15 } }],
+        ['a time that is not a time', { when: { kind: 'daily', at: '25:00', days: [1] } }],
+    ])('refuses an update with %s', (_name, over) => {
+        put('aaaaaa');
+        refused(applyPhoneSchedule({ op: 'update', id: 'aaaaaa', ...over }, 'hwip-api-sched-aaaaaa', deps()), 'schedule_invalid');
+        expect(saved()).toMatchObject({ when: { kind: 'every', minutes: 60 }, maxRuntimeMin: 30 });
+        expect(saved().updatedAt).toBeUndefined();
+    });
+
+    it('refuses a new prompt for a schedule the computer gave agent arguments, but still changes its time', () => {
+        // The arguments (say, a permissions bypass) were the computer's choice for its own prompt, not for the phone's.
+        put('aaaaaa', { prompt: 'triage', agentArgs: ['--dangerously-skip-permissions'] });
+        refused(applyPhoneSchedule({ op: 'update', id: 'aaaaaa', prompt: 'something else' }, 'hwip-api-sched-aaaaaa', deps()), 'schedule_invalid');
+        expect(saved().prompt).toBe('triage');
+        put('bbbbbb', { agentArgs: ['--x'] });
+        refused(applyPhoneSchedule({ op: 'update', id: 'bbbbbb', prompt: 'a first one' }, 'hwip-api-sched-bbbbbb', deps()), 'schedule_invalid');
+        expect(applyPhoneSchedule({ op: 'update', id: 'aaaaaa', maxRuntimeMin: 20 }, 'hwip-api-sched-aaaaaa', deps())).toEqual({ ok: true });
+    });
+
+    it('refuses a prompt for an agent that cannot take one', () => {
+        put('aaaaaa', { agentKind: 'codex' });
+        refused(applyPhoneSchedule({ op: 'update', id: 'aaaaaa', prompt: 'go' }, 'hwip-api-sched-aaaaaa', deps()), 'schedule_invalid');
+    });
+
+    it('tells a schedules directory that cannot be listed as schedule_failed', () => {
+        put('aaaaaa');
+        const dir = schedulesDir();
+        rmSync(dir, { recursive: true });
+        writeFileSync(dir, 'in the way');
+        refused(applyPhoneSchedule({ op: 'update', id: 'aaaaaa', maxRuntimeMin: 20 }, 'hwip-api-sched-aaaaaa', deps()), 'schedule_failed');
+    });
+});
+
 describe('applyPhoneSchedule', () => {
     const entry = { name: 'hwip-api', cwd: '/work/api', agentKind: 'claude', lastSeenAt: '2026-10-01T00:00:00.000Z' };
     const deps = (over: Partial<PhoneScheduleDeps> = {}): PhoneScheduleDeps => ({
@@ -188,7 +304,7 @@ describe('applyPhoneSchedule', () => {
         expect(listSchedules().schedules).toHaveLength(1);
     });
 
-    it.each([[undefined], [null], ['create'], [[]], [{}], [{ op: 'pause', id: 'abcdef' }]])('refuses %j as a request', (request) => {
+    it.each([[undefined], [null], ['create'], [[]], [{}], [{ op: 'pause', id: 'abcdef' }], [{ op: 'Update', id: 'abcdef', maxRuntimeMin: 20 }]])('refuses %j as a request', (request) => {
         refused(applyPhoneSchedule(request, 'hwip-api', deps()), 'schedule_invalid');
     });
 });

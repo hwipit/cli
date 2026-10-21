@@ -5620,7 +5620,7 @@ const openSealedCommand = async (
 };
 
 /**
- * A phone's request to make or remove a schedule (F8). The decisions are `applyPhoneSchedule`'s; this spends
+ * A phone's request to make, change or remove a schedule (F8). The decisions are `applyPhoneSchedule`'s; this spends
  * the session's rate budget the way a typed command does and reports a refusal the way every command does.
  * Never types anything. A push no one addressed to this machine is not acted on: it changes files, and a
  * push.new reaches every listener of the account.

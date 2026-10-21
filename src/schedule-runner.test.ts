@@ -1010,3 +1010,43 @@ describe('notifyFailureOutcome', () => {
         expect(notifyFailureOutcome(null)).toBe('retry');
     });
 });
+
+describe('an edited schedule [F8-edit]', () => {
+    it('counts from the edit: the times before it are neither run nor missed, and an every runs a period after it', async () => {
+        const edited = new Date(T0 + 5 * HOUR + 7 * MIN).toISOString();
+        const w = world([schedule('aaaaaa', { updatedAt: edited })], { state: { v: 1, schedules: { aaaaaa: { cursor: T0 } } } });
+        await w.runner.tick(T0 + 5 * HOUR + 7 * MIN + 30_000);
+        expect(w.launched).toEqual([]);
+        expect(w.logs.join('\n')).not.toContain('missed');
+        await w.runner.tick(T0 + 5 * HOUR + 22 * MIN + 10_000);
+        expect(w.launched).toHaveLength(1);
+        expect(w.logs.join('\n')).not.toContain('missed');
+    });
+
+    it('does not count the daily times between the old cursor and the edit as missed', async () => {
+        const edited = new Date(T0 + 3 * 24 * HOUR).toISOString();
+        const daily = schedule('aaaaaa', { updatedAt: edited, when: { kind: 'daily', at: '00:30', days: [0, 1, 2, 3, 4, 5, 6] }, maxRuntimeMin: 30 });
+        const w = world([daily], { state: { v: 1, schedules: { aaaaaa: { cursor: T0 } } } });
+        await w.runner.tick(T0 + 3 * 24 * HOUR + 10 * MIN);
+        expect(w.logs.join('\n')).not.toContain('missed');
+        expect(last(w, 'aaaaaa')).toBeUndefined();
+    });
+});
+
+describe('a running session when its schedule is edited [F8-edit]', () => {
+    it('keeps running, is not started again, and is held to a shorter cap at the next poll', async () => {
+        const START = T0 + 15 * MIN + 10_000;
+        const w = world([schedule('aaaaaa', { maxRuntimeMin: 15 })]);
+        await w.runner.tick(START);
+        w.sessions.add('hwip-app-sched-aaaaaa');
+        expect(w.launched).toHaveLength(1);
+        w.schedules = [schedule('aaaaaa', { maxRuntimeMin: 5, updatedAt: new Date(START + 2 * MIN).toISOString() })];
+        w.deps.listSchedules = () => ({ schedules: w.schedules, unreadable: 0 });
+        await w.runner.tick(START + 3 * MIN);
+        expect(w.ended).toEqual([]);
+        expect(w.state.schedules.aaaaaa!.running).toBeDefined();
+        await w.runner.tick(START + 5 * MIN + 1);
+        expect(w.ended).toEqual(['hwip-app-sched-aaaaaa']);
+        expect(w.launched).toHaveLength(1);
+    });
+});

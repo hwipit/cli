@@ -2435,7 +2435,7 @@ const capturePane = (
  * is. `display-message ; capture-pane` runs the two as consecutive commands in
  * one client: the first output line is the geometry, the rest is the capture.
  */
-export const STREAM_GEOMETRY_FORMAT = '#{cursor_x},#{cursor_y},#{pane_height},#{history_size}';
+export const STREAM_GEOMETRY_FORMAT = '#{cursor_x},#{cursor_y},#{pane_height},#{history_size},#{alternate_on}';
 
 type StreamRead = { captured: { content: string; truncated: boolean }; geometry: PaneGeometry | null };
 
@@ -2488,7 +2488,16 @@ export interface PaneGeometry {
      *  it record the lines that scroll past without matching text. Absent when
      *  tmux did not answer with a usable number. */
     historySize?: number;
+    /** The pane is on the alternate screen: a full-screen program (Claude Code's
+     *  fullscreen renderer, an editor) draws there, and tmux keeps no scrollback
+     *  of it — older output exists only inside the program, which scrolls it
+     *  itself. Absent when tmux did not say. */
+    alternateScreen?: boolean;
 }
+
+/** A tmux flag field: `1`/`0`, or undefined for an empty or unknown answer. */
+const tmuxFlag = (field: string | undefined): boolean | undefined =>
+    field === '1' ? true : field === '0' ? false : undefined;
 
 /**
  * Read the one tmux answer the frame path already asks for per tick.
@@ -2508,8 +2517,14 @@ export const parsePaneGeometry = (raw: string): PaneGeometry | null => {
     // clear; letting an empty answer arrive as one would fake the clear and
     // make the viewer re-record output it already holds.
     const depth = fields.length > 3 && fields[3] !== '' ? Number(fields[3]) : NaN;
-    if (!Number.isSafeInteger(depth) || depth < 0) return { x, y, height };
-    return { x, y, height, historySize: depth };
+    const alternateScreen = tmuxFlag(fields[4]);
+    return {
+        x,
+        y,
+        height,
+        ...(Number.isSafeInteger(depth) && depth >= 0 ? { historySize: depth } : {}),
+        ...(alternateScreen === undefined ? {} : { alternateScreen }),
+    };
 };
 
 /**
@@ -3190,6 +3205,11 @@ export type StreamFramePayload = {
      *  it see the buffer being cleared as the depth dropping. Absent when tmux
      *  would not say. In the clear as the cursor is, and sealed the same way. */
     historySize?: number;
+    /** The pane is on the alternate screen, where tmux keeps no scrollback: a
+     *  viewer scrolls the program (wheel keys) instead of asking for history.
+     *  Absent when tmux would not say. In the clear as the cursor is, and
+     *  sealed the same way. */
+    alternateScreen?: boolean;
     /** Plaintext pane content — only on unencrypted streams. */
     content?: string;
     /** Envelope v2 (`stream.frame`, context = session) of a SealedStreamFrame —
@@ -3215,6 +3235,7 @@ export type SealedStreamFrame = {
     cursorCol?: number;
     historyLines?: number;
     historySize?: number;
+    alternateScreen?: boolean;
 };
 
 /** Longest subscriber nonce taken; a viewer's is 16 random bytes in Base64 (24). */
@@ -3398,6 +3419,7 @@ export const buildStreamFrame = async (
         cursor?: { line: number; col: number } | null;
         historyLines?: number;
         historySize?: number;
+        alternateScreen?: boolean;
     },
     /** Capture stamp and subscription nonce, sealed with the pane. A sealed
      *  frame without it is dropped: the viewer could not check it. */
@@ -3409,6 +3431,7 @@ export const buildStreamFrame = async (
         ...(cursor ? { cursorLine: cursor.line, cursorCol: cursor.col } : {}),
         ...(meta?.historyLines === undefined ? {} : { historyLines: meta.historyLines }),
         ...(meta?.historySize === undefined ? {} : { historySize: meta.historySize }),
+        ...(meta?.alternateScreen === undefined ? {} : { alternateScreen: meta.alternateScreen }),
     };
     const head = { subtype: 'agent.stream.frame' as const, sessionName, capturedAt: new Date().toISOString() };
     if (!subscriberPublicKey) return { ...head, ...view, content: captured.content };
@@ -3550,12 +3573,14 @@ export const handleStreamControl = (
     paneFitter.open(sessionName);
     if (fitTarget !== null) paneFitter.fit(sessionName, fitTarget, req.cols);
     let lastContent: string | null = null;
-    // The cursor's last reported place, as `line,col`. Part of the diff-gate
-    // because moving the cursor is a change the CAPTURE cannot show: an arrow
-    // key inside a prompt leaves every character where it was, so gating on the
-    // text alone means the mirror's cursor never moves — which is precisely the
-    // feedback the cursor exists to give.
-    let lastCursor: string | null = null;
+    // The cursor's last reported place and the screen the pane was on, as
+    // `line,col|alternate`. Part of the diff-gate because both change without
+    // the CAPTURE showing it: an arrow key inside a prompt leaves every
+    // character where it was, so gating on the text alone means the mirror's
+    // cursor never moves — which is precisely the feedback the cursor exists to
+    // give; and a program opening its alternate screen over an identical paint
+    // would leave the viewer paging a scrollback that is gone.
+    let lastView: string | null = null;
     const stats: StreamStats = {
         startedAt: Date.now(),
         frames: 0,
@@ -3679,8 +3704,9 @@ export const handleStreamControl = (
             ? historyLinesIn(captured.content, cursorAt.height)
             : undefined;
         const historySize = cursorAt?.historySize;
-        const cursorKey = cursor ? `${cursor.line},${cursor.col}` : '';
-        if (captured.content === lastContent && cursorKey === lastCursor) {
+        const alternateScreen = cursorAt?.alternateScreen;
+        const viewKey = `${cursor ? `${cursor.line},${cursor.col}` : ''}|${alternateScreen ?? ''}`;
+        if (captured.content === lastContent && viewKey === lastView) {
             stats.skipped++;
             return true; // diff-gate
         }
@@ -3699,14 +3725,14 @@ export const handleStreamControl = (
         // fps by one frame per episode in the R2 numbers.
         const inBurst = armedDelay === BURST_INTERVAL_MS;
         lastContent = captured.content;
-        lastCursor = cursorKey;
+        lastView = viewKey;
         // Stamp the sequence in CAPTURE order, synchronously — frame assembly
         // is async (encryption) and fire-and-forget, so resolve order is not
         // guaranteed under load; the receiver drops any seq it has already
         // painted past.
         const seq = ++wireSeq;
         const stamp = { seq, epoch: stats.startedAt, nonce };
-        void buildStreamFrame(captured, sessionName, subscriberPublicKey, { cursor, historyLines, historySize }, stamp).then((frame) => {
+        void buildStreamFrame(captured, sessionName, subscriberPublicKey, { cursor, historyLines, historySize, alternateScreen }, stamp).then((frame) => {
             // Stream stopped or restarted while this frame was in flight —
             // `stats` is unique per start, so it doubles as the identity
             // token. Don't send into a dead/replaced stream or skew its stats.
@@ -3717,7 +3743,7 @@ export const handleStreamControl = (
                 // subscriber key) never recovers: fail closed after a few
                 // strikes instead of retrying every tick for 5 minutes.
                 lastContent = null;
-                lastCursor = null;
+                lastView = null;
                 // Init still in flight (or failed — its own path fail-closes):
                 // a not-yet-ready key is not a malformed key, don't strike.
                 if (getDevicePublicKey() === null) return;

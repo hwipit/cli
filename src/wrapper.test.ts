@@ -4,7 +4,7 @@ import { mkdtempSync, realpathSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { checkoutOf } from './config.js';
-import { agentLaunchEnv, detectProjectDir, detectProjectName, handOffExec, herdrEnvArgs, herdrSessionArgs, installedTmuxVersion, inPaneNote, planShellSession, tmuxMissingMessage, readShellSessionState, sanitizeLabel, shellTargets, sessionSidecarArgs, splitAgentOptions, targetForAgent, tmuxSessionName } from './wrapper.js';
+import { agentLaunchArgs, agentLaunchEnv, detectProjectDir, detectProjectName, handOffExec, herdrEnvArgs, herdrSessionArgs, installedTmuxVersion, inPaneNote, planShellSession, tmuxMissingMessage, readShellSessionState, sanitizeLabel, shellTargets, sessionSidecarArgs, splitAgentOptions, targetForAgent, tmuxSessionName } from './wrapper.js';
 import type { ProcessHandOff } from './wrapper.js';
 
 // TMUX is in here for two reasons: targetForAgent branches on it, and a
@@ -124,6 +124,15 @@ describe('targetForAgent', () => {
         expect(targetForAgent('pi', [], 'pi', { detach: true }).args.join(' ')).not.toContain('CLAUDE_CODE');
     });
 
+    // pi's fullscreen mode is the default and a flag turns it off.
+    it('starts pi in regular mode unless the caller picked a mode', () => {
+        process.env.TMUX = '/private/tmp/tmux-501/default,43544,87';
+        expect(targetForAgent('pi', ['-n', 'x'], 'pi')).toEqual({ kind: 'direct', cmd: 'pi', args: ['--tui-mode', 'regular', '-n', 'x'] });
+        expect(agentLaunchArgs('pi', ['--tui-mode', 'fullscreen'])).toEqual(['--tui-mode', 'fullscreen']);
+        expect(agentLaunchArgs('pi', ['--tui-mode=fullscreen'])).toEqual(['--tui-mode=fullscreen']);
+        expect(agentLaunchArgs('claude', ['--resume'])).toEqual(['--resume']);
+    });
+
     it('keeps a renderer choice the launching shell made', () => {
         expect(agentLaunchEnv('claude', { CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: '0' })).toEqual({ CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: '0' });
         expect(agentLaunchEnv('opencode', {})).toEqual({});
@@ -146,7 +155,7 @@ describe('targetForAgent', () => {
         expect(kind).toBe('tmux-detached');
         expect(cmd).toBe('tmux');
         expect(args).toEqual(['new', '-d', '-s', 'hwip-pi-config-impl', '-c', '/work/pi-config',
-            ...herdrEnvArgs('pi', {}, installedTmuxVersion()), "pi '/skill:02-implement a.md'",
+            ...herdrEnvArgs('pi', {}, installedTmuxVersion()), "pi --tui-mode regular '/skill:02-implement a.md'",
             ';', 'set-option', '-t', '=hwip-pi-config-impl:', '@hwip_project', 'pi-config', ';', 'set-option', '-t', '=hwip-pi-config-impl:', '@hwip_session_label', 'impl']);
     });
 

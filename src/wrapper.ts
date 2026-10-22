@@ -128,6 +128,22 @@ const AGENT_LAUNCH_ENV: Record<string, Record<string, string>> = {
 export const agentLaunchEnv = (agentKind: string | undefined, env: NodeJS.ProcessEnv): Record<string, string> =>
     Object.fromEntries(Object.entries(AGENT_LAUNCH_ENV[agentKind ?? ''] ?? {}).map(([name, value]) => [name, env[name] ?? value]));
 
+/**
+ * Leading flags with the same aim, by kind, for an agent whose renderer is a
+ * flag: pi defaults to `--tui-mode fullscreen`. Left off when the caller
+ * passes the flag itself.
+ */
+const AGENT_LAUNCH_ARGS: Record<string, string[]> = {
+    pi: ['--tui-mode', 'regular'],
+};
+
+export const agentLaunchArgs = (agentKind: string | undefined, extra: string[]): string[] => {
+    const lead = AGENT_LAUNCH_ARGS[agentKind ?? ''] ?? [];
+    const flag = lead[0];
+    if (flag === undefined || extra.some((a) => a === flag || a.startsWith(`${flag}=`))) return extra;
+    return [...lead, ...extra];
+};
+
 /** `new-session -e` flags for `agentLaunchEnv`; none before tmux 3.2, as for herdr. */
 const launchEnvArgs = (launchEnv: Record<string, string>, tmuxVersion: string): string[] =>
     sessionEnvSupported(tmuxVersion) ? Object.entries(launchEnv).flatMap(([name, value]) => ['-e', `${name}=${value}`]) : [];
@@ -377,6 +393,7 @@ export const targetForAgent = (
     // A label asks for a tmux session by name; running in the current pane
     // would drop that silently, so a label is the other exception.
     const launchEnv = agentLaunchEnv(agentKind, process.env);
+    extra = agentLaunchArgs(agentKind, extra);
     if (process.env.TMUX && !opts.detach && !opts.label) {
         return { kind: 'direct', cmd: agent, args: extra, ...(Object.keys(launchEnv).length ? { env: launchEnv } : {}) };
     }

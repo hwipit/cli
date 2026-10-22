@@ -4,13 +4,13 @@ import { mkdtempSync, realpathSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { checkoutOf } from './config.js';
-import { detectProjectDir, detectProjectName, handOffExec, herdrEnvArgs, herdrSessionArgs, installedTmuxVersion, inPaneNote, planShellSession, tmuxMissingMessage, readShellSessionState, sanitizeLabel, shellTargets, sessionSidecarArgs, splitAgentOptions, targetForAgent, tmuxSessionName } from './wrapper.js';
+import { agentLaunchEnv, detectProjectDir, detectProjectName, handOffExec, herdrEnvArgs, herdrSessionArgs, installedTmuxVersion, inPaneNote, planShellSession, tmuxMissingMessage, readShellSessionState, sanitizeLabel, shellTargets, sessionSidecarArgs, splitAgentOptions, targetForAgent, tmuxSessionName } from './wrapper.js';
 import type { ProcessHandOff } from './wrapper.js';
 
 // TMUX is in here for two reasons: targetForAgent branches on it, and a
 // developer running the suite from inside tmux would otherwise have it set
 // ambiently and fail every "outside tmux" case.
-const ENV_KEYS = ['CLAUDE_PROJECT_DIR', 'CURSOR_PROJECT_DIR', 'WINDSURF_PROJECT_DIR', 'TMUX'] as const;
+const ENV_KEYS = ['CLAUDE_PROJECT_DIR', 'CURSOR_PROJECT_DIR', 'WINDSURF_PROJECT_DIR', 'TMUX', 'CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN'] as const;
 const originalEnv: Record<string, string | undefined> = {};
 let originalCwd: string;
 
@@ -106,6 +106,27 @@ describe('targetForAgent', () => {
         process.env.CLAUDE_PROJECT_DIR = '/work/hwip-plain-probe';
         const shellCmd = targetForAgent('claude', ['--resume']).args.find((a) => a.startsWith('claude'));
         expect(shellCmd).toBe('claude --resume');
+    });
+
+    // Claude Code's fullscreen renderer keeps its transcript off tmux's scrollback, where the phone pages history.
+    it('starts Claude Code on the classic renderer, in a pane or a new session', () => {
+        delete process.env.CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN;
+        process.env.TMUX = '/private/tmp/tmux-501/default,43544,87';
+        expect(targetForAgent('claude', [], 'claude')).toEqual({
+            kind: 'direct', cmd: 'claude', args: [], env: { CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: '1' },
+        });
+        delete process.env.TMUX;
+        process.env.CLAUDE_PROJECT_DIR = '/work/hwip-classic-probe';
+        const { args } = targetForAgent('claude', [], 'claude');
+        const at = args.indexOf('CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1');
+        expect(args[at - 1]).toBe('-e');
+        expect(at).toBeLessThan(args.indexOf('claude'));
+        expect(targetForAgent('pi', [], 'pi', { detach: true }).args.join(' ')).not.toContain('CLAUDE_CODE');
+    });
+
+    it('keeps a renderer choice the launching shell made', () => {
+        expect(agentLaunchEnv('claude', { CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: '0' })).toEqual({ CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: '0' });
+        expect(agentLaunchEnv('opencode', {})).toEqual({});
     });
 
     // `--label` pins the name: the caller wants this exact session next to

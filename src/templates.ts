@@ -832,6 +832,17 @@ const LOOKUP_TIMEOUT_MS = 5000;
 const RESUBSCRIBE_MIN_MS = 1000;
 const RESUBSCRIBE_MAX_MS = 30000;
 
+// The newest instance per directory. 2.x evicts a directory's instance after an
+// idle hour (\`experimental.location_idle_timeout\`) and runs \`setup\` again on the
+// next request, but hands \`setup\` no way to learn of the eviction — and the
+// evicted instance's stream keeps delivering. Each eviction would leave one more
+// loop pushing every turn. The module is evaluated afresh per instance (2.1.2,
+// 2026-10-22), so only \`globalThis\` outlives one; an outdated loop stops at its
+// next event.
+const CURRENT_KEY = Symbol.for("hwip.opencode.current");
+const currentByDirectory = (): Map<string, object> =>
+  ((globalThis as Record<symbol, Map<string, object> | undefined>)[CURRENT_KEY] ??= new Map());
+
 const setup = (ctx: V2Context): void => {
   // 1.18 calls \`setup\` as well as \`server\`, with a context that has no event
   // stream. Its hooks are \`server\`'s, so there is nothing to do here.
@@ -840,6 +851,10 @@ const setup = (ctx: V2Context): void => {
   const subscribe = stream.subscribe.bind(stream);
   const here = ctx.location?.directory;
   const turns = createTurns();
+  const instance = {};
+  const key = here ?? "";
+  currentByDirectory().set(key, instance);
+  const outdated = (): boolean => currentByDirectory().get(key) !== instance;
 
   // One server runs an instance of this plugin per directory and hands every
   // instance every session's events, so the session's own directory decides
@@ -897,9 +912,10 @@ const setup = (ctx: V2Context): void => {
   // \`notify\` drops them — there is no channel the user would read.
   const consume = async (): Promise<void> => {
     let wait = RESUBSCRIBE_MIN_MS;
-    for (;;) {
+    while (!outdated()) {
       try {
         for await (const event of subscribe()) {
+          if (outdated()) return;
           wait = RESUBSCRIBE_MIN_MS;
           try {
             await handle(event);

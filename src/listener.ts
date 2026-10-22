@@ -29,6 +29,7 @@ import { homedir, hostname } from 'os';
 import { join, basename, dirname, isAbsolute, resolve, sep } from 'path';
 import WebSocket from 'ws';
 import { checkoutOf, configIgnoredBecause, groupOf, keyIsFromFile, loadConfig, resolveBaseUrl, resolvedEnv, type HwipConfig, SESSION_LABEL_OPTION, SESSION_PROJECT_OPTION, SESSION_SHELL_OPTION, TRUST_FILE, VERSION, type Checkout } from './config.js';
+import { withAgentDirs } from './agent-dirs.js';
 import { apiFetch, apiUrl } from './api.js';
 import { appendShellAudit, type ShellAuditEntry } from './shell-audit.js';
 import { downloadUrlProblem, warnInsecureUrl } from './insecure-url.js';
@@ -1893,10 +1894,13 @@ export const handleSessionResumeRequest = (
         ? [';', 'set-option', SESSION_PROJECT_OPTION, known.project, ';', 'set-option', SESSION_LABEL_OPTION, known.label]
         : [];
     const conversation = resumableConversation(agent, known);
+    // tmux gives the new pane this client's PATH. A login service's PATH has none
+    // of the agent directories, so they go on as schedule launches add them —
+    // otherwise the agent is not found and the session ends as it starts.
     const started = spawnSync(
         'tmux',
         tmuxArgs(['new-session', '-d', '-s', target, '-c', known.cwd, agent.binary, ...(conversation?.args ?? []), ...sidecar]),
-        { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] },
+        { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PATH: withAgentDirs(process.env.PATH) } },
     );
     if (started.status !== 0) {
         log(`✗ resume ${sessionName}: tmux refused (${(started.stderr ?? '').trim() || 'no detail'})`);

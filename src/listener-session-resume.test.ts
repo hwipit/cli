@@ -17,6 +17,8 @@ const FIELD_SEP = '␟';
 /** tmux sessions that exist right now. */
 let liveSessions: string[] = [];
 let tmuxCalls: string[][] = [];
+/** The PATH each new-session call handed tmux: the started agent inherits it. */
+let newSessionPaths: Array<string | undefined> = [];
 let newSessionFails = false;
 
 const fakeTmux = (args: readonly string[]) => {
@@ -54,8 +56,11 @@ vi.mock('child_process', async (importOriginal) => {
     const actual = await importOriginal<typeof import('child_process')>();
     return {
         ...actual,
-        spawnSync: (cmd: string, args?: readonly string[]) =>
-            cmd === 'tmux' ? fakeTmux(args ?? []) : { status: 1, stdout: '', stderr: '' },
+        spawnSync: (cmd: string, args?: readonly string[], opts?: { env?: NodeJS.ProcessEnv }) => {
+            if (cmd !== 'tmux') return { status: 1, stdout: '', stderr: '' };
+            if ((args ?? []).includes('new-session')) newSessionPaths.push(opts?.env?.PATH);
+            return fakeTmux(args ?? []);
+        },
     };
 });
 
@@ -69,6 +74,7 @@ mkdirSync(PROJECT_DIR, { recursive: true });
 const { handleSessionResumeRequest, computeListenerDeviceId, knownSessionsToReport } = await import('./listener.js');
 const { rememberSessions } = await import('./session-registry.js');
 const { claudeProjectDirName, REMOTE_AGENTS } = await import('./remote-agents.js');
+const { rememberAgentDir } = await import('./agent-dirs.js');
 
 describe('agent.session.resume.request — starting a session that ended', () => {
     const device = computeListenerDeviceId();
@@ -140,6 +146,21 @@ describe('agent.session.resume.request — starting a session that ended', () =>
                 sessionName: 'hwip-api',
                 resumed: true,
             });
+        });
+
+        // The listener runs as a login service whose PATH has none of the agent
+        // directories, and tmux hands the new pane the PATH of the client that
+        // asked for it: without the directories the shell found agents in, the
+        // agent is not found and the session ends as soon as it starts.
+        it('starts the agent with the directories the shell found agents in', () => {
+            newSessionPaths = [];
+            rememberAgentDir('/opt/agents/bin/claude');
+            remember();
+
+            ask();
+
+            expect(newSessionPaths).toHaveLength(1);
+            expect(newSessionPaths[0]?.split(':')).toContain('/opt/agents/bin');
         });
 
         // A labelled or worktree session lived with sidecar options; a fresh

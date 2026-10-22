@@ -114,6 +114,40 @@ export const herdrEnvArgs = (agentKind: string | undefined, env: NodeJS.ProcessE
     return HERDR_ENV_VARS.flatMap((name) => ['-e', `${name}=${native ? env[name] ?? '' : ''}`]);
 };
 
+/**
+ * Env that keeps an agent's transcript in tmux scrollback, by kind. A
+ * full-screen renderer draws on the alternate screen, where tmux keeps no
+ * history, so the phone cannot page back. Claude Code's fullscreen renderer
+ * is a user setting (`/tui fullscreen`); this forces the classic one. A value
+ * the launching shell already sets wins.
+ */
+const AGENT_LAUNCH_ENV: Record<string, Record<string, string>> = {
+    claude: { CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: '1' },
+};
+
+export const agentLaunchEnv = (agentKind: string | undefined, env: NodeJS.ProcessEnv): Record<string, string> =>
+    Object.fromEntries(Object.entries(AGENT_LAUNCH_ENV[agentKind ?? ''] ?? {}).map(([name, value]) => [name, env[name] ?? value]));
+
+/**
+ * Leading flags with the same aim, by kind, for an agent whose renderer is a
+ * flag: pi defaults to `--tui-mode fullscreen`. Left off when the caller
+ * passes the flag itself.
+ */
+const AGENT_LAUNCH_ARGS: Record<string, string[]> = {
+    pi: ['--tui-mode', 'regular'],
+};
+
+export const agentLaunchArgs = (agentKind: string | undefined, extra: string[]): string[] => {
+    const lead = AGENT_LAUNCH_ARGS[agentKind ?? ''] ?? [];
+    const flag = lead[0];
+    if (flag === undefined || extra.some((a) => a === flag || a.startsWith(`${flag}=`))) return extra;
+    return [...lead, ...extra];
+};
+
+/** `new-session -e` flags for `agentLaunchEnv`; none before tmux 3.2, as for herdr. */
+const launchEnvArgs = (launchEnv: Record<string, string>, tmuxVersion: string): string[] =>
+    sessionEnvSupported(tmuxVersion) ? Object.entries(launchEnv).flatMap(([name, value]) => ['-e', `${name}=${value}`]) : [];
+
 /** `tmux -V` says 3.2 or later (`new-session -e`); a development build (`next-3.7`, `master`) is newer. */
 const sessionEnvSupported = (version: string): boolean => {
     if (/\b(master|next-)/.test(version)) return true;
@@ -272,6 +306,8 @@ export interface SpawnTarget {
     args: string[];
     /** The tmux session name for the two tmux kinds — carried, not re-read off argv. */
     session?: string;
+    /** Variables the agent runs with on top of this process's env (`direct`); the tmux kinds carry them as `-e`. */
+    env?: Record<string, string>;
 }
 
 /**
@@ -356,8 +392,10 @@ export const targetForAgent = (
     // is exactly where it runs from.
     // A label asks for a tmux session by name; running in the current pane
     // would drop that silently, so a label is the other exception.
+    const launchEnv = agentLaunchEnv(agentKind, process.env);
+    extra = agentLaunchArgs(agentKind, extra);
     if (process.env.TMUX && !opts.detach && !opts.label) {
-        return { kind: 'direct', cmd: agent, args: extra };
+        return { kind: 'direct', cmd: agent, args: extra, ...(Object.keys(launchEnv).length ? { env: launchEnv } : {}) };
     }
     const projectDir = opts.projectDir ?? detectProjectDir();
     const base = tmuxSessionName(safeBasename(projectDir));
@@ -388,11 +426,13 @@ export const targetForAgent = (
     if (opts.detach) {
         // Attached to no herdr pane: blank, whatever pane this command was typed in.
         const herdrEnv = herdrEnvArgs(agentKind, {}, installedTmuxVersion());
-        return { kind: 'tmux-detached', cmd: 'tmux', args: ['new', '-d', '-s', session, '-c', projectDir, ...herdrEnv, shellCmd, ...sidecar], session };
+        const agentEnv = launchEnvArgs(launchEnv, installedTmuxVersion());
+        return { kind: 'tmux-detached', cmd: 'tmux', args: ['new', '-d', '-s', session, '-c', projectDir, ...herdrEnv, ...agentEnv, shellCmd, ...sidecar], session };
     }
     // `tmux new -A`: attach if the named session exists, else create it. `-e` applies only when it creates.
     const herdrEnv = herdrEnvArgs(agentKind, process.env, installedTmuxVersion());
-    return { kind: 'tmux-new', cmd: 'tmux', args: ['new', '-A', '-s', session, ...herdrEnv, shellCmd, ...sidecar, ...herdrSessionArgs(session)], session };
+    const agentEnv = launchEnvArgs(launchEnv, installedTmuxVersion());
+    return { kind: 'tmux-new', cmd: 'tmux', args: ['new', '-A', '-s', session, ...herdrEnv, ...agentEnv, shellCmd, ...sidecar, ...herdrSessionArgs(session)], session };
 };
 
 // ── Background listener auto-start ────────────────────────────────────
@@ -629,7 +669,7 @@ export const handleAgentSession = async (
     // The cwd is what a new tmux session (or the in-pane agent) starts in. After the listener start: a daemon
     // spawned from here would inherit the worktree as its cwd, and it is the one that later removes the directory.
     if (opts.worktree && opts.projectDir) process.chdir(opts.projectDir);
-    const { kind, cmd, args, session } = targetForAgent(agent.binary, extra, agent.kind, opts);
+    const { kind, cmd, args, session, env } = targetForAgent(agent.binary, extra, agent.kind, opts);
     const note = kind === 'direct' ? inPaneNote(agent.subcommands[0], currentTmuxSession()) : undefined;
     if (note) console.error(note);
 
@@ -644,7 +684,7 @@ export const handleAgentSession = async (
         }
     }
 
-    return (deps.launch ?? launchTarget)({ kind, cmd, args, session }, agent.binary);
+    return (deps.launch ?? launchTarget)({ kind, cmd, args, session, env }, agent.binary);
 };
 
 /**
@@ -652,7 +692,8 @@ export const handleAgentSession = async (
  * hands the terminal over (execve where it can, a waited child where not) and
  * forwards the exit code. `what` names the program in the detached message.
  */
-const launchTarget = async ({ kind, cmd, args, session }: SpawnTarget, what: string): Promise<number> => {
+const launchTarget = async ({ kind, cmd, args, session, env: agentEnv }: SpawnTarget, what: string): Promise<number> => {
+    const env = agentEnv ? { ...process.env, ...agentEnv } : process.env;
     if (kind === 'tmux-detached' && session) {
         const r = spawnSync(cmd, args, { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
         if (r.error || r.status !== 0) {
@@ -671,7 +712,7 @@ const launchTarget = async ({ kind, cmd, args, session }: SpawnTarget, what: str
     // exit code that execve gives us for free by being the same process.
     const handOff = handOffExec({
         execve: process.execve,
-        env: process.env,
+        env,
         kind,
         stdinTTY: process.stdin.isTTY,
         stdoutTTY: process.stdout.isTTY,
@@ -692,7 +733,7 @@ const launchTarget = async ({ kind, cmd, args, session }: SpawnTarget, what: str
 
     return new Promise<number>((resolve) => {
         const start = Date.now();
-        const child = spawn(cmd, args, { stdio: 'inherit' });
+        const child = spawn(cmd, args, { stdio: 'inherit', env });
         child.on('exit', (code) => {
             const dur = Date.now() - start;
             // Short-lived non-zero exits are the symptom of "ran from a

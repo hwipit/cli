@@ -4,13 +4,13 @@ import { mkdtempSync, realpathSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { checkoutOf } from './config.js';
-import { detectProjectDir, detectProjectName, handOffExec, herdrEnvArgs, herdrSessionArgs, installedTmuxVersion, inPaneNote, planShellSession, tmuxMissingMessage, readShellSessionState, sanitizeLabel, shellTargets, sessionSidecarArgs, splitAgentOptions, targetForAgent, tmuxSessionName } from './wrapper.js';
+import { agentLaunchArgs, agentLaunchEnv, detectProjectDir, detectProjectName, handOffExec, herdrEnvArgs, herdrSessionArgs, installedTmuxVersion, inPaneNote, planShellSession, tmuxMissingMessage, readShellSessionState, sanitizeLabel, shellTargets, sessionSidecarArgs, splitAgentOptions, targetForAgent, tmuxSessionName } from './wrapper.js';
 import type { ProcessHandOff } from './wrapper.js';
 
 // TMUX is in here for two reasons: targetForAgent branches on it, and a
 // developer running the suite from inside tmux would otherwise have it set
 // ambiently and fail every "outside tmux" case.
-const ENV_KEYS = ['CLAUDE_PROJECT_DIR', 'CURSOR_PROJECT_DIR', 'WINDSURF_PROJECT_DIR', 'TMUX'] as const;
+const ENV_KEYS = ['CLAUDE_PROJECT_DIR', 'CURSOR_PROJECT_DIR', 'WINDSURF_PROJECT_DIR', 'TMUX', 'CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN'] as const;
 const originalEnv: Record<string, string | undefined> = {};
 let originalCwd: string;
 
@@ -108,6 +108,36 @@ describe('targetForAgent', () => {
         expect(shellCmd).toBe('claude --resume');
     });
 
+    // Claude Code's fullscreen renderer keeps its transcript off tmux's scrollback, where the phone pages history.
+    it('starts Claude Code on the classic renderer, in a pane or a new session', () => {
+        delete process.env.CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN;
+        process.env.TMUX = '/private/tmp/tmux-501/default,43544,87';
+        expect(targetForAgent('claude', [], 'claude')).toEqual({
+            kind: 'direct', cmd: 'claude', args: [], env: { CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: '1' },
+        });
+        delete process.env.TMUX;
+        process.env.CLAUDE_PROJECT_DIR = '/work/hwip-classic-probe';
+        const { args } = targetForAgent('claude', [], 'claude');
+        const at = args.indexOf('CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1');
+        expect(args[at - 1]).toBe('-e');
+        expect(at).toBeLessThan(args.indexOf('claude'));
+        expect(targetForAgent('pi', [], 'pi', { detach: true }).args.join(' ')).not.toContain('CLAUDE_CODE');
+    });
+
+    // pi's fullscreen mode is the default and a flag turns it off.
+    it('starts pi in regular mode unless the caller picked a mode', () => {
+        process.env.TMUX = '/private/tmp/tmux-501/default,43544,87';
+        expect(targetForAgent('pi', ['-n', 'x'], 'pi')).toEqual({ kind: 'direct', cmd: 'pi', args: ['--tui-mode', 'regular', '-n', 'x'] });
+        expect(agentLaunchArgs('pi', ['--tui-mode', 'fullscreen'])).toEqual(['--tui-mode', 'fullscreen']);
+        expect(agentLaunchArgs('pi', ['--tui-mode=fullscreen'])).toEqual(['--tui-mode=fullscreen']);
+        expect(agentLaunchArgs('claude', ['--resume'])).toEqual(['--resume']);
+    });
+
+    it('keeps a renderer choice the launching shell made', () => {
+        expect(agentLaunchEnv('claude', { CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: '0' })).toEqual({ CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: '0' });
+        expect(agentLaunchEnv('opencode', {})).toEqual({});
+    });
+
     // `--label` pins the name: the caller wants this exact session next to
     // the user's own `hwip pi`, not a slot in the -2/-3 family.
     it('--label names the session hwip-<project>-<label> and skips the family scan', () => {
@@ -125,7 +155,7 @@ describe('targetForAgent', () => {
         expect(kind).toBe('tmux-detached');
         expect(cmd).toBe('tmux');
         expect(args).toEqual(['new', '-d', '-s', 'hwip-pi-config-impl', '-c', '/work/pi-config',
-            ...herdrEnvArgs('pi', {}, installedTmuxVersion()), "pi '/skill:02-implement a.md'",
+            ...herdrEnvArgs('pi', {}, installedTmuxVersion()), "pi --tui-mode regular '/skill:02-implement a.md'",
             ';', 'set-option', '-t', '=hwip-pi-config-impl:', '@hwip_project', 'pi-config', ';', 'set-option', '-t', '=hwip-pi-config-impl:', '@hwip_session_label', 'impl']);
     });
 

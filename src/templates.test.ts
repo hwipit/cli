@@ -378,6 +378,24 @@ describe('templates.ts: the OpenCode plugin on the 2.x plugin API', () => {
         expect(spawned[0].command).toContain(`--${NONREADONLY_COUNT_FLAG} 1`);
     });
 
+    // 2.x evicts a directory's instance after an idle hour and sets the plugin up
+    // again on the next request, re-evaluating this module (measured on 2.1.2,
+    // 2026-10-22). The evicted instance's stream keeps delivering, so a server
+    // up for 15 hours pushed every turn 15 times.
+    it('pushes once per turn after the directory is set up again', async () => {
+        const b = bus();
+        const first = compile();
+        await first.definition.setup(host(b, '/repo/a'));
+        const second = compile();
+        await second.definition.setup(host(b, '/repo/a'));
+
+        await turn(b, 'ses_a', ['write']);
+        await b.emit('session.execution.succeeded', { sessionID: 'ses_a' });
+
+        expect(first.spawned).toEqual([]);
+        expect(second.spawned).toHaveLength(1);
+    });
+
     it('rolls a subagent session up into its parent', async () => {
         const b = bus();
         const { definition, spawned } = compile();

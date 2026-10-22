@@ -761,6 +761,56 @@ export const resolveKeys = (keys: string[]): string[] | null => {
     return out.length ? out : null;
 };
 
+type WheelDirection = 'up' | 'down';
+
+/**
+ * The phone's scroll for a pane on the alternate screen, where a full-screen
+ * TUI draws and tmux keeps no scrollback to page. Not in ALLOWED_KEYS, so only
+ * stream input takes them: the REST path stores a command and shows it as a
+ * bubble, and a wheel tick means nothing without a live view of the pane.
+ */
+const WHEEL_KEYS = new Map<string, WheelDirection>([
+    ['wheelup', 'up'],
+    ['wheeldown', 'down'],
+]);
+
+/** A batch of wheel keys as directions; null unless every key is one. */
+export const resolveWheel = (keys: string[]): WheelDirection[] | null => {
+    const out: WheelDirection[] = [];
+    for (const k of keys) {
+        const direction = WHEEL_KEYS.get(k.toLowerCase().trim());
+        if (!direction) return null;
+        out.push(direction);
+    }
+    return out.length ? out : null;
+};
+
+/** What a wheel tick needs from the pane, read when the tick arrives rather than from the frame the phone saw. */
+export const WHEEL_STATE_FORMAT = '#{alternate_on},#{mouse_any_flag},#{mouse_sgr_flag},#{pane_width},#{pane_height}';
+
+/**
+ * The `send-keys` arguments that scroll the TUI by `ticks`, from the pane's
+ * WHEEL_STATE_FORMAT answer. A TUI that reports the mouse in SGR gets wheel
+ * events at the pane centre (button 64 up, 65 down), written as bytes with
+ * `-H`; one that does not gets PPage/NPage. Every byte is built here from
+ * tmux's numbers, never from the wire.
+ *
+ * Null when the pane is not on the alternate screen: the phone's flag can be a
+ * frame stale, and a PgUp into a shell or a prompt prints junk.
+ */
+export const wheelInput = (ticks: WheelDirection[], state: string): string[] | null => {
+    const [alternate, mouseAny, mouseSgr, width, height] = state.trim().split(',');
+    if (alternate !== '1') return null;
+    const cols = Number(width);
+    const rows = Number(height);
+    if (mouseAny === '1' && mouseSgr === '1' && Number.isSafeInteger(cols) && Number.isSafeInteger(rows) && cols > 0 && rows > 0) {
+        const at = `${Math.floor(cols / 2) + 1};${Math.floor(rows / 2) + 1}M`;
+        const bytes = ticks.map((t) => `\x1b[<${t === 'up' ? 64 : 65};${at}`).join('');
+        return ['-H', ...Array.from(Buffer.from(bytes, 'ascii'), (b) => b.toString(16).padStart(2, '0'))];
+    }
+    return ticks.map((t) => (t === 'up' ? 'PPage' : 'NPage'));
+};
+
 /**
  * Send named keys as keys (NOT `-l`), so tmux interprets Escape/Up/Enter as
  * key presses rather than literal text. One send-keys call carries the
@@ -3919,9 +3969,10 @@ type ValidatedInput = SequencedInput & {
     /** Sender's device, when the relay stamped one — rides along so a refusal
      *  frame can name whose input was refused (inputDeviceId). */
     deviceId?: string;
-    /** Exactly one of these is set. */
+    /** Exactly one of tokens, text and wheel is set. */
     tokens: string[] | null;
     text: string | null;
+    wheel?: WheelDirection[];
     /** Whether `text` carries its own submit. False for `insert` (and, vacuously,
      *  for a key batch — the keys say for themselves what they are). */
     submit: boolean;
@@ -4003,6 +4054,9 @@ export const validateInputMessage = (msg: AgentCommandInput): InputCheck => {
         if (msg.body !== undefined || msg.insert !== undefined) {
             return { ok: false, reason: 'keys are mutually exclusive with body/insert' };
         }
+        // A batch is all wheel or all named keys: a mix fails both lookups and is refused whole.
+        const wheel = resolveWheel(msg.keys);
+        if (wheel) return { ok: true, input: { ...base, tokens: null, text: null, wheel, submit: false } };
         const tokens = resolveKeys(msg.keys);
         if (!tokens) return { ok: false, reason: `unknown key(s) [${msg.keys.join(' ')}]` };
         return { ok: true, input: { ...base, tokens, text: null, submit: false } };
@@ -4035,7 +4089,9 @@ const deliverInput = (input: PendingInput): void => {
     if (!bound) reason = 'prompt_changed';
     const injected = bound && hasStream(input.sessionName)
         // Stream input arrives on this listener's own subscription: addressed.
-        && (input.tokens
+        && (input.wheel
+            ? tryScroll(input.sessionName, input.wheel, deps)
+            : input.tokens
             ? tryInjectKeys(input.sessionName, input.tokens, deps, true)
             : tryInject(input.sessionName, input.text ?? '', deps, { submit: input.submit, addressed: true }));
     // Every refusal reachable from here — dead lease, shell pane, rate limit,
@@ -4044,7 +4100,8 @@ const deliverInput = (input: PendingInput): void => {
     // instead of falling back to the REST push path.
     // Only a reason that does not depend on the text: this input may be sealed.
     if (!injected) input.send(streamErrorFrame(input.sessionName, 'input_rejected', input, reason && isSessionStateRefusal(reason) ? reason : undefined));
-    else takeWidthBack(input.sessionName, input.deviceId);
+    // Scrolling is looking, not typing: it does not size a window a desktop took back.
+    else if (!input.wheel) takeWidthBack(input.sessionName, input.deviceId);
 };
 
 /**
@@ -4859,7 +4916,13 @@ interface HandlePushDeps {
  *
  * Returns what the probe saw when the input is admitted, null when refused.
  */
-const passesInjectGuards = (session: string, deps: HandlePushDeps, addressed: boolean, cost = 1): PaneProbe | null => {
+const passesInjectGuards = (
+    session: string,
+    deps: HandlePushDeps,
+    addressed: boolean,
+    cost = 1,
+    bucket = session,
+): PaneProbe | null => {
     // Subagent panes are view-only: the phone reads them but the agent
     // itself answers at the terminal. This sits above the rate bucket so a
     // flood of refused subagent writes costs nothing and spawns nothing —
@@ -4873,7 +4936,7 @@ const passesInjectGuards = (session: string, deps: HandlePushDeps, addressed: bo
     // Rate bucket first: the pane probe below is a blocking tmux spawnSync,
     // and the sequencer can flush several held messages back-to-back — an
     // empty bucket must refuse before paying that probe N times, not after.
-    if (!(deps.rateLimit ?? checkRateLimit)(session, Date.now(), cost)) {
+    if (!(deps.rateLimit ?? checkRateLimit)(bucket, Date.now(), cost)) {
         log(`! ${session}: rate-limited — drop`);
         deps.noteRefusal?.('rate_limited');
         return null;
@@ -5040,6 +5103,36 @@ const tryInjectKeys = (session: string, tokens: string[], deps: HandlePushDeps, 
         if (probe.shellMarked) auditShellInput({ session, probe, kind: 'keys', text: tokens.join(' ') }, deps);
     }
     log(`${ok ? '⌨' : '✗'} ${session}: [${tokens.join(' ')}]`);
+    if (!ok) deps.noteRefusal?.('inject_failed');
+    return ok;
+};
+
+/**
+ * Wheel sibling of tryInjectKeys, under the same pane/shell guards. Its own
+ * rate bucket: the phone sends a tick batch every few hundred ms while a
+ * finger drags, and a minute of scrolling must not spend the typing budget.
+ * A pane that left the alternate screen takes nothing and is not a refusal —
+ * the scroll simply has nowhere to go.
+ */
+const tryScroll = (session: string, ticks: WheelDirection[], deps: HandlePushDeps): boolean => {
+    const probe = passesInjectGuards(session, deps, true, 1, `wheel:${session}`);
+    if (!probe) return false;
+    const target = tmuxTargetFor(session);
+    if (target === null) return false;
+    const names = ticks.map((t) => `wheel${t}`).join(' ');
+    const state = runTmux(['display-message', '-p', '-t', target, WHEEL_STATE_FORMAT]);
+    const args = state.status === 0 ? wheelInput(ticks, state.stdout) : undefined;
+    if (args === null) {
+        log(`· ${session}: wheel for a pane off the alternate screen — skip`);
+        return true;
+    }
+    const ok = args !== undefined
+        && spawnSync('tmux', tmuxArgs(['send-keys', '-t', target, ...args]), { stdio: ['ignore', 'ignore', 'pipe'] }).status === 0;
+    if (ok) {
+        noteStreamInput(session);
+        if (probe.shellMarked) auditShellInput({ session, probe, kind: 'keys', text: names }, deps);
+    }
+    log(`${ok ? '⌨' : '✗'} ${session}: [${names}]`);
     if (!ok) deps.noteRefusal?.('inject_failed');
     return ok;
 };

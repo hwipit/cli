@@ -15,6 +15,9 @@ const SESSIONS = ['hwip-a'];
 /** The stream tick's geometry answer: cursor_x, cursor_y, pane_height, history_size, alternate_on. */
 let geometry = '';
 let paneText = 'a steady pane\n';
+/** The wheel path's pane answer: alternate_on, mouse_any_flag, mouse_sgr_flag, pane_width, pane_height. */
+let wheelState = '1,1,1,80,24';
+let wheelReadFails = false;
 const sendKeys: string[][] = [];
 
 const fakeTmux = (args: readonly string[]) => {
@@ -30,6 +33,7 @@ const fakeTmux = (args: readonly string[]) => {
         if (a[4]?.includes('#{session_name}')) return { status: 0, stdout: ['node', session, ''].join(FIELD_SEP), stderr: '' };
         if (a[4] === '#{pane_current_command}') return { status: 0, stdout: 'node', stderr: '' };
         if (a[4]?.startsWith('#{cursor_x}')) return { status: 0, stdout: geometry, stderr: '' };
+        if (a[4]?.startsWith('#{alternate_on}')) return { status: wheelReadFails ? 1 : 0, stdout: wheelReadFails ? '' : wheelState, stderr: '' };
         return { status: 0, stdout: ['node', 'claude', '/tmp/proj', '1234', ''].join(FIELD_SEP), stderr: '' };
     }
     if (a[0] === 'capture-pane') return { status: 0, stdout: paneText, stderr: '' };
@@ -73,6 +77,10 @@ const {
     parsePaneGeometry,
     buildStreamFrame,
     handleStreamControl,
+    handleCommandInput,
+    resolveKeys,
+    resolveWheel,
+    wheelInput,
     stopAllStreams,
     computeListenerDeviceId,
     STREAM_GEOMETRY_FORMAT,
@@ -161,6 +169,122 @@ describe('alternate screen frame', () => {
 
             await vi.advanceTimersByTimeAsync(STREAM_INTERVAL_MS * 3);
             expect(frames()).toHaveLength(2);
+        });
+    });
+});
+
+/** The bytes tmux is asked to write, from a `send-keys -t T -H <hex>…` call. */
+const hexBytes = (call: string[]): string => {
+    const at = call.indexOf('-H');
+    return Buffer.from(call.slice(at + 1).join(''), 'hex').toString('ascii');
+};
+
+describe('wheel', () => {
+    it('scrolls a TUI that reports the mouse in SGR with wheel events at the pane centre', () => {
+        const args = wheelInput(['up', 'up'], '1,1,1,81,25\n');
+        expect(args?.[0]).toBe('-H');
+        expect(hexBytes(args ?? [])).toBe('\x1b[<64;41;13M\x1b[<64;41;13M');
+        expect(hexBytes(wheelInput(['down'], '1,1,1,80,24') ?? [])).toBe('\x1b[<65;41;13M');
+    });
+
+    // Wheel reporting needs mouse_any_flag; the SGR encoding needs mouse_sgr_flag.
+    it.each([
+        ['no mouse reporting', '1,0,0,80,24'],
+        ['mouse reporting in the old encoding', '1,1,0,80,24'],
+        ['a pane size tmux did not give', '1,1,1,,'],
+    ])('pages the TUI with PgUp/PgDn when it has %s', (_, state) => {
+        expect(wheelInput(['up', 'down'], state)).toEqual(['PPage', 'NPage']);
+    });
+
+    it.each([
+        ['the normal screen', '0,1,1,80,24'],
+        ['an unknown screen', ',1,1,80,24'],
+    ])('sends nothing to a pane on %s', (_, state) => {
+        expect(wheelInput(['up'], state)).toBeNull();
+    });
+
+    // The two names are the whole vocabulary: a batch that is not all wheel
+    // keys is not wheel input, and the REST key list does not know them.
+    it('takes only the two wheel names, and only as a whole batch', () => {
+        expect(resolveWheel(['wheelup', 'WheelDown '])).toEqual(['up', 'down']);
+        expect(resolveWheel(['wheelup', 'down'])).toBeNull();
+        expect(resolveWheel(['constructor'])).toBeNull();
+        expect(resolveKeys(['wheelup'])).toBeNull();
+    });
+
+    describe('on the stream', () => {
+        const device = computeListenerDeviceId();
+        let sent: Array<Record<string, unknown>>;
+        let seq: number;
+        const send = (data: Record<string, unknown>) => { sent.push(data); };
+        const input = (keys: string[]) => {
+            seq += 1;
+            return handleCommandInput({
+                subtype: 'agent.command.input', targetDeviceId: device, sessionName: 'hwip-a', keys, seq, epoch: 100,
+            }, send);
+        };
+        const rejections = () => sent.filter((f) => f.error === 'input_rejected');
+
+        beforeEach(() => {
+            vi.useFakeTimers();
+            vi.spyOn(console, 'log').mockImplementation(() => {});
+            sent = [];
+            seq = 0;
+            sendKeys.length = 0;
+            wheelState = '1,1,1,80,24';
+            wheelReadFails = false;
+            handleStreamControl({ subtype: 'agent.stream.start', targetDeviceId: device, sessionName: 'hwip-a', renew: true }, send);
+        });
+        afterEach(() => {
+            stopAllStreams();
+            vi.useRealTimers();
+            vi.restoreAllMocks();
+        });
+
+        it('writes the wheel bytes into the pane', () => {
+            input(['wheelup', 'wheelup', 'wheelup']);
+            expect(sendKeys).toHaveLength(1);
+            expect(sendKeys[0].slice(0, 4)).toEqual(['send-keys', '-t', '%0', '-H']);
+            expect(hexBytes(sendKeys[0])).toBe('\x1b[<64;41;13M'.repeat(3));
+            expect(rejections()).toEqual([]);
+        });
+
+        it('pages a pane without SGR mouse reporting', () => {
+            wheelState = '1,0,0,80,24';
+            input(['wheeldown']);
+            expect(sendKeys).toEqual([['send-keys', '-t', '%0', 'NPage']]);
+        });
+
+        // The phone's flag is a frame old; the TUI may have quit to a prompt since.
+        it('drops a wheel batch for a pane that left the alternate screen, without a refusal', () => {
+            wheelState = '0,0,0,80,24';
+            input(['wheelup']);
+            expect(sendKeys).toEqual([]);
+            expect(rejections()).toEqual([]);
+        });
+
+        // Without the pane's state there is no telling which input scrolls it.
+        it('refuses a wheel batch when the pane state cannot be read', () => {
+            wheelReadFails = true;
+            input(['wheelup']);
+            expect(sendKeys).toEqual([]);
+            expect(rejections()).toHaveLength(1);
+        });
+
+        it('refuses a batch that mixes wheel and named keys', () => {
+            input(['wheelup', 'enter']);
+            expect(sendKeys).toEqual([]);
+            expect(rejections()).toHaveLength(1);
+        });
+
+        it('leaves the typing budget alone however long the scroll', () => {
+            // Scroll until the wheel's own bucket is empty (120 a minute, as for keys).
+            for (let i = 0; i < 200 && rejections().length === 0; i++) input(['wheelup']);
+            expect(rejections()).toHaveLength(1);
+            expect(sendKeys.length).toBeGreaterThanOrEqual(100);
+            sendKeys.length = 0;
+            input(['down']);
+            expect(sendKeys).toEqual([['send-keys', '-t', '%0', 'Down']]);
         });
     });
 });

@@ -786,7 +786,43 @@ export const resolveWheel = (keys: string[]): WheelDirection[] | null => {
 };
 
 /** What a wheel tick needs from the pane, read when the tick arrives rather than from the frame the phone saw. */
-export const WHEEL_STATE_FORMAT = '#{alternate_on},#{mouse_any_flag},#{mouse_sgr_flag},#{pane_width},#{pane_height}';
+export const WHEEL_STATE_FORMAT = '#{alternate_on},#{mouse_any_flag},#{mouse_sgr_flag},#{pane_width},#{pane_height},#{pane_current_command}';
+
+/**
+ * Lines a TUI scrolls for one wheel event, by the pane's command, where that is
+ * not one. The phone sends a wheel key per line of drag; measured 2026-10-22
+ * with SGR wheel bytes into live panes, Claude Code and pi (`node`) scroll a
+ * line an event and OpenCode three.
+ */
+const WHEEL_LINES_PER_EVENT = new Map<string, number>([['opencode', 3]]);
+
+/** Wheel keys a pane has taken toward its next event, kept across batches. */
+export type WheelCarry = { direction: WheelDirection; lines: number };
+
+/**
+ * The phone's per-line wheel keys as wheel events for the pane's command:
+ * one event per WHEEL_LINES_PER_EVENT lines, the rest carried into the next
+ * batch. Turning back drops the carry, as the phone drops what it did not send.
+ */
+export const wheelEvents = (
+    keys: WheelDirection[],
+    command: string,
+    carry?: WheelCarry,
+): { events: WheelDirection[]; carry?: WheelCarry } => {
+    const perEvent = WHEEL_LINES_PER_EVENT.get(command) ?? 1;
+    const events: WheelDirection[] = [];
+    let held = carry;
+    for (const direction of keys) {
+        const lines = (held?.direction === direction ? held.lines : 0) + 1;
+        if (lines >= perEvent) {
+            events.push(direction);
+            held = undefined;
+        } else {
+            held = { direction, lines };
+        }
+    }
+    return { events, carry: held };
+};
 
 /**
  * The `send-keys` arguments that scroll the TUI by `ticks`, from the pane's
@@ -5114,6 +5150,8 @@ const tryInjectKeys = (session: string, tokens: string[], deps: HandlePushDeps, 
  * A pane that left the alternate screen takes nothing and is not a refusal —
  * the scroll simply has nowhere to go.
  */
+const wheelCarry = new Map<string, WheelCarry>();
+
 const tryScroll = (session: string, ticks: WheelDirection[], deps: HandlePushDeps): boolean => {
     const probe = passesInjectGuards(session, deps, true, 1, `wheel:${session}`);
     if (!probe) return false;
@@ -5121,9 +5159,18 @@ const tryScroll = (session: string, ticks: WheelDirection[], deps: HandlePushDep
     if (target === null) return false;
     const names = ticks.map((t) => `wheel${t}`).join(' ');
     const state = runTmux(['display-message', '-p', '-t', target, WHEEL_STATE_FORMAT]);
-    const args = state.status === 0 ? wheelInput(ticks, state.stdout) : undefined;
+    const command = state.stdout.trim().split(',').slice(5).join(',');
+    const { events, carry } = wheelEvents(ticks, command, wheelCarry.get(session));
+    const args = state.status === 0 ? wheelInput(events, state.stdout) : undefined;
     if (args === null) {
+        wheelCarry.delete(session);
         log(`· ${session}: wheel for a pane off the alternate screen — skip`);
+        return true;
+    }
+    if (carry) wheelCarry.set(session, carry);
+    else wheelCarry.delete(session);
+    if (args !== undefined && events.length === 0) {
+        log(`· ${session}: [${names}] held toward ${command}'s next wheel event`);
         return true;
     }
     const ok = args !== undefined

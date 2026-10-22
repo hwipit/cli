@@ -15,7 +15,7 @@ const SESSIONS = ['hwip-a'];
 /** The stream tick's geometry answer: cursor_x, cursor_y, pane_height, history_size, alternate_on. */
 let geometry = '';
 let paneText = 'a steady pane\n';
-/** The wheel path's pane answer: alternate_on, mouse_any_flag, mouse_sgr_flag, pane_width, pane_height. */
+/** The wheel path's pane answer: alternate_on, mouse_any_flag, mouse_sgr_flag, pane_width, pane_height, pane_current_command. */
 let wheelState = '1,1,1,80,24';
 let wheelReadFails = false;
 const sendKeys: string[][] = [];
@@ -80,6 +80,7 @@ const {
     handleCommandInput,
     resolveKeys,
     resolveWheel,
+    wheelEvents,
     wheelInput,
     stopAllStreams,
     computeListenerDeviceId,
@@ -203,6 +204,17 @@ describe('wheel', () => {
         expect(wheelInput(['up'], state)).toBeNull();
     });
 
+    // The phone sends a key per line of drag; OpenCode scrolls three lines an event.
+    it('turns per-line keys into one event per line, or per three for OpenCode', () => {
+        expect(wheelEvents(['up', 'up', 'up'], 'node').events).toEqual(['up', 'up', 'up']);
+        expect(wheelEvents(['up', 'up', 'up', 'up'], 'opencode')).toEqual({ events: ['up'], carry: { direction: 'up', lines: 1 } });
+        const first = wheelEvents(['down', 'down'], 'opencode');
+        expect(first.events).toEqual([]);
+        expect(wheelEvents(['down'], 'opencode', first.carry)).toEqual({ events: ['down'], carry: undefined });
+        // Turning back starts the count over.
+        expect(wheelEvents(['up'], 'opencode', first.carry)).toEqual({ events: [], carry: { direction: 'up', lines: 1 } });
+    });
+
     // The two names are the whole vocabulary: a batch that is not all wheel
     // keys is not wheel input, and the REST key list does not know them.
     it('takes only the two wheel names, and only as a whole batch', () => {
@@ -247,6 +259,16 @@ describe('wheel', () => {
             expect(sendKeys[0].slice(0, 4)).toEqual(['send-keys', '-t', '%0', '-H']);
             expect(hexBytes(sendKeys[0])).toBe('\x1b[<64;41;13M'.repeat(3));
             expect(rejections()).toEqual([]);
+        });
+
+        it('sends OpenCode one wheel event per three lines, carrying the rest to the next batch', () => {
+            wheelState = '1,1,1,80,24,opencode';
+            input(['wheelup', 'wheelup']);
+            expect(sendKeys).toEqual([]);
+            expect(rejections()).toEqual([]);
+            input(['wheelup', 'wheelup', 'wheelup', 'wheelup']);
+            expect(sendKeys).toHaveLength(1);
+            expect(hexBytes(sendKeys[0])).toBe('\x1b[<64;41;13M'.repeat(2));
         });
 
         it('pages a pane without SGR mouse reporting', () => {

@@ -761,6 +761,56 @@ export const resolveKeys = (keys: string[]): string[] | null => {
     return out.length ? out : null;
 };
 
+type WheelDirection = 'up' | 'down';
+
+/**
+ * The phone's scroll for a pane on the alternate screen, where a full-screen
+ * TUI draws and tmux keeps no scrollback to page. Not in ALLOWED_KEYS, so only
+ * stream input takes them: the REST path stores a command and shows it as a
+ * bubble, and a wheel tick means nothing without a live view of the pane.
+ */
+const WHEEL_KEYS = new Map<string, WheelDirection>([
+    ['wheelup', 'up'],
+    ['wheeldown', 'down'],
+]);
+
+/** A batch of wheel keys as directions; null unless every key is one. */
+export const resolveWheel = (keys: string[]): WheelDirection[] | null => {
+    const out: WheelDirection[] = [];
+    for (const k of keys) {
+        const direction = WHEEL_KEYS.get(k.toLowerCase().trim());
+        if (!direction) return null;
+        out.push(direction);
+    }
+    return out.length ? out : null;
+};
+
+/** What a wheel tick needs from the pane, read when the tick arrives rather than from the frame the phone saw. */
+export const WHEEL_STATE_FORMAT = '#{alternate_on},#{mouse_any_flag},#{mouse_sgr_flag},#{pane_width},#{pane_height}';
+
+/**
+ * The `send-keys` arguments that scroll the TUI by `ticks`, from the pane's
+ * WHEEL_STATE_FORMAT answer. A TUI that reports the mouse in SGR gets wheel
+ * events at the pane centre (button 64 up, 65 down), written as bytes with
+ * `-H`; one that does not gets PPage/NPage. Every byte is built here from
+ * tmux's numbers, never from the wire.
+ *
+ * Null when the pane is not on the alternate screen: the phone's flag can be a
+ * frame stale, and a PgUp into a shell or a prompt prints junk.
+ */
+export const wheelInput = (ticks: WheelDirection[], state: string): string[] | null => {
+    const [alternate, mouseAny, mouseSgr, width, height] = state.trim().split(',');
+    if (alternate !== '1') return null;
+    const cols = Number(width);
+    const rows = Number(height);
+    if (mouseAny === '1' && mouseSgr === '1' && Number.isSafeInteger(cols) && Number.isSafeInteger(rows) && cols > 0 && rows > 0) {
+        const at = `${Math.floor(cols / 2) + 1};${Math.floor(rows / 2) + 1}M`;
+        const bytes = ticks.map((t) => `\x1b[<${t === 'up' ? 64 : 65};${at}`).join('');
+        return ['-H', ...Array.from(Buffer.from(bytes, 'ascii'), (b) => b.toString(16).padStart(2, '0'))];
+    }
+    return ticks.map((t) => (t === 'up' ? 'PPage' : 'NPage'));
+};
+
 /**
  * Send named keys as keys (NOT `-l`), so tmux interprets Escape/Up/Enter as
  * key presses rather than literal text. One send-keys call carries the
@@ -2435,7 +2485,7 @@ const capturePane = (
  * is. `display-message ; capture-pane` runs the two as consecutive commands in
  * one client: the first output line is the geometry, the rest is the capture.
  */
-export const STREAM_GEOMETRY_FORMAT = '#{cursor_x},#{cursor_y},#{pane_height},#{history_size}';
+export const STREAM_GEOMETRY_FORMAT = '#{cursor_x},#{cursor_y},#{pane_height},#{history_size},#{alternate_on}';
 
 type StreamRead = { captured: { content: string; truncated: boolean }; geometry: PaneGeometry | null };
 
@@ -2488,7 +2538,16 @@ export interface PaneGeometry {
      *  it record the lines that scroll past without matching text. Absent when
      *  tmux did not answer with a usable number. */
     historySize?: number;
+    /** The pane is on the alternate screen: a full-screen program (Claude Code's
+     *  fullscreen renderer, an editor) draws there, and tmux keeps no scrollback
+     *  of it — older output exists only inside the program, which scrolls it
+     *  itself. Absent when tmux did not say. */
+    alternateScreen?: boolean;
 }
+
+/** A tmux flag field: `1`/`0`, or undefined for an empty or unknown answer. */
+const tmuxFlag = (field: string | undefined): boolean | undefined =>
+    field === '1' ? true : field === '0' ? false : undefined;
 
 /**
  * Read the one tmux answer the frame path already asks for per tick.
@@ -2508,8 +2567,14 @@ export const parsePaneGeometry = (raw: string): PaneGeometry | null => {
     // clear; letting an empty answer arrive as one would fake the clear and
     // make the viewer re-record output it already holds.
     const depth = fields.length > 3 && fields[3] !== '' ? Number(fields[3]) : NaN;
-    if (!Number.isSafeInteger(depth) || depth < 0) return { x, y, height };
-    return { x, y, height, historySize: depth };
+    const alternateScreen = tmuxFlag(fields[4]);
+    return {
+        x,
+        y,
+        height,
+        ...(Number.isSafeInteger(depth) && depth >= 0 ? { historySize: depth } : {}),
+        ...(alternateScreen === undefined ? {} : { alternateScreen }),
+    };
 };
 
 /**
@@ -3190,6 +3255,11 @@ export type StreamFramePayload = {
      *  it see the buffer being cleared as the depth dropping. Absent when tmux
      *  would not say. In the clear as the cursor is, and sealed the same way. */
     historySize?: number;
+    /** The pane is on the alternate screen, where tmux keeps no scrollback: a
+     *  viewer scrolls the program (wheel keys) instead of asking for history.
+     *  Absent when tmux would not say. In the clear as the cursor is, and
+     *  sealed the same way. */
+    alternateScreen?: boolean;
     /** Plaintext pane content — only on unencrypted streams. */
     content?: string;
     /** Envelope v2 (`stream.frame`, context = session) of a SealedStreamFrame —
@@ -3215,6 +3285,7 @@ export type SealedStreamFrame = {
     cursorCol?: number;
     historyLines?: number;
     historySize?: number;
+    alternateScreen?: boolean;
 };
 
 /** Longest subscriber nonce taken; a viewer's is 16 random bytes in Base64 (24). */
@@ -3398,6 +3469,7 @@ export const buildStreamFrame = async (
         cursor?: { line: number; col: number } | null;
         historyLines?: number;
         historySize?: number;
+        alternateScreen?: boolean;
     },
     /** Capture stamp and subscription nonce, sealed with the pane. A sealed
      *  frame without it is dropped: the viewer could not check it. */
@@ -3409,6 +3481,7 @@ export const buildStreamFrame = async (
         ...(cursor ? { cursorLine: cursor.line, cursorCol: cursor.col } : {}),
         ...(meta?.historyLines === undefined ? {} : { historyLines: meta.historyLines }),
         ...(meta?.historySize === undefined ? {} : { historySize: meta.historySize }),
+        ...(meta?.alternateScreen === undefined ? {} : { alternateScreen: meta.alternateScreen }),
     };
     const head = { subtype: 'agent.stream.frame' as const, sessionName, capturedAt: new Date().toISOString() };
     if (!subscriberPublicKey) return { ...head, ...view, content: captured.content };
@@ -3550,12 +3623,14 @@ export const handleStreamControl = (
     paneFitter.open(sessionName);
     if (fitTarget !== null) paneFitter.fit(sessionName, fitTarget, req.cols);
     let lastContent: string | null = null;
-    // The cursor's last reported place, as `line,col`. Part of the diff-gate
-    // because moving the cursor is a change the CAPTURE cannot show: an arrow
-    // key inside a prompt leaves every character where it was, so gating on the
-    // text alone means the mirror's cursor never moves — which is precisely the
-    // feedback the cursor exists to give.
-    let lastCursor: string | null = null;
+    // The cursor's last reported place and the screen the pane was on, as
+    // `line,col|alternate`. Part of the diff-gate because both change without
+    // the CAPTURE showing it: an arrow key inside a prompt leaves every
+    // character where it was, so gating on the text alone means the mirror's
+    // cursor never moves — which is precisely the feedback the cursor exists to
+    // give; and a program opening its alternate screen over an identical paint
+    // would leave the viewer paging a scrollback that is gone.
+    let lastView: string | null = null;
     const stats: StreamStats = {
         startedAt: Date.now(),
         frames: 0,
@@ -3679,8 +3754,9 @@ export const handleStreamControl = (
             ? historyLinesIn(captured.content, cursorAt.height)
             : undefined;
         const historySize = cursorAt?.historySize;
-        const cursorKey = cursor ? `${cursor.line},${cursor.col}` : '';
-        if (captured.content === lastContent && cursorKey === lastCursor) {
+        const alternateScreen = cursorAt?.alternateScreen;
+        const viewKey = `${cursor ? `${cursor.line},${cursor.col}` : ''}|${alternateScreen ?? ''}`;
+        if (captured.content === lastContent && viewKey === lastView) {
             stats.skipped++;
             return true; // diff-gate
         }
@@ -3699,14 +3775,14 @@ export const handleStreamControl = (
         // fps by one frame per episode in the R2 numbers.
         const inBurst = armedDelay === BURST_INTERVAL_MS;
         lastContent = captured.content;
-        lastCursor = cursorKey;
+        lastView = viewKey;
         // Stamp the sequence in CAPTURE order, synchronously — frame assembly
         // is async (encryption) and fire-and-forget, so resolve order is not
         // guaranteed under load; the receiver drops any seq it has already
         // painted past.
         const seq = ++wireSeq;
         const stamp = { seq, epoch: stats.startedAt, nonce };
-        void buildStreamFrame(captured, sessionName, subscriberPublicKey, { cursor, historyLines, historySize }, stamp).then((frame) => {
+        void buildStreamFrame(captured, sessionName, subscriberPublicKey, { cursor, historyLines, historySize, alternateScreen }, stamp).then((frame) => {
             // Stream stopped or restarted while this frame was in flight —
             // `stats` is unique per start, so it doubles as the identity
             // token. Don't send into a dead/replaced stream or skew its stats.
@@ -3717,7 +3793,7 @@ export const handleStreamControl = (
                 // subscriber key) never recovers: fail closed after a few
                 // strikes instead of retrying every tick for 5 minutes.
                 lastContent = null;
-                lastCursor = null;
+                lastView = null;
                 // Init still in flight (or failed — its own path fail-closes):
                 // a not-yet-ready key is not a malformed key, don't strike.
                 if (getDevicePublicKey() === null) return;
@@ -3893,9 +3969,10 @@ type ValidatedInput = SequencedInput & {
     /** Sender's device, when the relay stamped one — rides along so a refusal
      *  frame can name whose input was refused (inputDeviceId). */
     deviceId?: string;
-    /** Exactly one of these is set. */
+    /** Exactly one of tokens, text and wheel is set. */
     tokens: string[] | null;
     text: string | null;
+    wheel?: WheelDirection[];
     /** Whether `text` carries its own submit. False for `insert` (and, vacuously,
      *  for a key batch — the keys say for themselves what they are). */
     submit: boolean;
@@ -3977,6 +4054,9 @@ export const validateInputMessage = (msg: AgentCommandInput): InputCheck => {
         if (msg.body !== undefined || msg.insert !== undefined) {
             return { ok: false, reason: 'keys are mutually exclusive with body/insert' };
         }
+        // A batch is all wheel or all named keys: a mix fails both lookups and is refused whole.
+        const wheel = resolveWheel(msg.keys);
+        if (wheel) return { ok: true, input: { ...base, tokens: null, text: null, wheel, submit: false } };
         const tokens = resolveKeys(msg.keys);
         if (!tokens) return { ok: false, reason: `unknown key(s) [${msg.keys.join(' ')}]` };
         return { ok: true, input: { ...base, tokens, text: null, submit: false } };
@@ -4009,7 +4089,9 @@ const deliverInput = (input: PendingInput): void => {
     if (!bound) reason = 'prompt_changed';
     const injected = bound && hasStream(input.sessionName)
         // Stream input arrives on this listener's own subscription: addressed.
-        && (input.tokens
+        && (input.wheel
+            ? tryScroll(input.sessionName, input.wheel, deps)
+            : input.tokens
             ? tryInjectKeys(input.sessionName, input.tokens, deps, true)
             : tryInject(input.sessionName, input.text ?? '', deps, { submit: input.submit, addressed: true }));
     // Every refusal reachable from here — dead lease, shell pane, rate limit,
@@ -4018,7 +4100,8 @@ const deliverInput = (input: PendingInput): void => {
     // instead of falling back to the REST push path.
     // Only a reason that does not depend on the text: this input may be sealed.
     if (!injected) input.send(streamErrorFrame(input.sessionName, 'input_rejected', input, reason && isSessionStateRefusal(reason) ? reason : undefined));
-    else takeWidthBack(input.sessionName, input.deviceId);
+    // Scrolling is looking, not typing: it does not size a window a desktop took back.
+    else if (!input.wheel) takeWidthBack(input.sessionName, input.deviceId);
 };
 
 /**
@@ -4833,7 +4916,13 @@ interface HandlePushDeps {
  *
  * Returns what the probe saw when the input is admitted, null when refused.
  */
-const passesInjectGuards = (session: string, deps: HandlePushDeps, addressed: boolean, cost = 1): PaneProbe | null => {
+const passesInjectGuards = (
+    session: string,
+    deps: HandlePushDeps,
+    addressed: boolean,
+    cost = 1,
+    bucket = session,
+): PaneProbe | null => {
     // Subagent panes are view-only: the phone reads them but the agent
     // itself answers at the terminal. This sits above the rate bucket so a
     // flood of refused subagent writes costs nothing and spawns nothing —
@@ -4847,7 +4936,7 @@ const passesInjectGuards = (session: string, deps: HandlePushDeps, addressed: bo
     // Rate bucket first: the pane probe below is a blocking tmux spawnSync,
     // and the sequencer can flush several held messages back-to-back — an
     // empty bucket must refuse before paying that probe N times, not after.
-    if (!(deps.rateLimit ?? checkRateLimit)(session, Date.now(), cost)) {
+    if (!(deps.rateLimit ?? checkRateLimit)(bucket, Date.now(), cost)) {
         log(`! ${session}: rate-limited — drop`);
         deps.noteRefusal?.('rate_limited');
         return null;
@@ -5014,6 +5103,36 @@ const tryInjectKeys = (session: string, tokens: string[], deps: HandlePushDeps, 
         if (probe.shellMarked) auditShellInput({ session, probe, kind: 'keys', text: tokens.join(' ') }, deps);
     }
     log(`${ok ? '⌨' : '✗'} ${session}: [${tokens.join(' ')}]`);
+    if (!ok) deps.noteRefusal?.('inject_failed');
+    return ok;
+};
+
+/**
+ * Wheel sibling of tryInjectKeys, under the same pane/shell guards. Its own
+ * rate bucket: the phone sends a tick batch every few hundred ms while a
+ * finger drags, and a minute of scrolling must not spend the typing budget.
+ * A pane that left the alternate screen takes nothing and is not a refusal —
+ * the scroll simply has nowhere to go.
+ */
+const tryScroll = (session: string, ticks: WheelDirection[], deps: HandlePushDeps): boolean => {
+    const probe = passesInjectGuards(session, deps, true, 1, `wheel:${session}`);
+    if (!probe) return false;
+    const target = tmuxTargetFor(session);
+    if (target === null) return false;
+    const names = ticks.map((t) => `wheel${t}`).join(' ');
+    const state = runTmux(['display-message', '-p', '-t', target, WHEEL_STATE_FORMAT]);
+    const args = state.status === 0 ? wheelInput(ticks, state.stdout) : undefined;
+    if (args === null) {
+        log(`· ${session}: wheel for a pane off the alternate screen — skip`);
+        return true;
+    }
+    const ok = args !== undefined
+        && spawnSync('tmux', tmuxArgs(['send-keys', '-t', target, ...args]), { stdio: ['ignore', 'ignore', 'pipe'] }).status === 0;
+    if (ok) {
+        noteStreamInput(session);
+        if (probe.shellMarked) auditShellInput({ session, probe, kind: 'keys', text: names }, deps);
+    }
+    log(`${ok ? '⌨' : '✗'} ${session}: [${names}]`);
     if (!ok) deps.noteRefusal?.('inject_failed');
     return ok;
 };

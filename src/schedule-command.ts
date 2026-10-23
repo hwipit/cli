@@ -16,6 +16,7 @@ import {
     nextOccurrence,
     parseDuration,
     parseWhen,
+    pastWhen,
     readScheduleState,
     removeSchedule,
     scheduleAnchor,
@@ -55,8 +56,8 @@ export interface ScheduleCommandDeps {
     err: (line: string) => void;
 }
 
-const USAGE = "usage: hwip schedule add <agent> (--at HH:MM [--days daily|weekdays|mon,wed,…] | --every <N>m|<N>h) [--prompt <text>] [--label <x>] [--wt <branch>] [--max-runtime <N>m|<N>h] [-- <agent args…>]\n"
-    + '       hwip schedule edit <id> [--at HH:MM] [--days …] [--every <N>m|<N>h] [--prompt <text>] [--max-runtime <N>m|<N>h]\n'
+const USAGE = "usage: hwip schedule add <agent> (--at HH:MM [--days daily|weekdays|mon,wed,…] | --on YYYY-MM-DD --at HH:MM | --every <N>m|<N>h) [--prompt <text>] [--label <x>] [--wt <branch>] [--max-runtime <N>m|<N>h] [-- <agent args…>]\n"
+    + '       hwip schedule edit <id> [--at HH:MM] [--days …] [--on YYYY-MM-DD] [--every <N>m|<N>h] [--prompt <text>] [--max-runtime <N>m|<N>h]\n'
     + '       hwip schedule [list] [--json]\n'
     + '       hwip schedule rm <id>';
 
@@ -72,8 +73,17 @@ const flagText = (flags: Flags, name: string): Checked<string | undefined> => {
     return { ok: true, value };
 };
 
-/** `daily 09:00`, `weekdays 09:00`, `mon,wed 09:00`, `every 30m`, `every 2h`. */
+const pad2 = (n: number): string => String(n).padStart(2, '0');
+
+const formatTime = (ms: number): string => {
+    if (!Number.isFinite(new Date(ms).getTime())) return '-';
+    const d = new Date(ms);
+    return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+};
+
+/** `daily 09:00`, `weekdays 09:00`, `mon,wed 09:00`, `every 30m`, `every 2h`, `once 2026-10-24 09:00` (local time). */
 export const describeWhen = (when: ScheduleWhen): string => {
+    if (when.kind === 'once') return `once ${formatTime(Date.parse(when.at))}`;
     if (when.kind === 'every') return when.minutes % 60 === 0 ? `every ${when.minutes / 60}h` : `every ${when.minutes}m`;
     const days = when.days.join(',');
     const label = days === ALL_DAYS.join(',') ? 'daily' : days === WEEKDAYS.join(',') ? 'weekdays' : when.days.map((d) => DAY_NAMES[d]).join(',');
@@ -99,13 +109,15 @@ export const buildSchedule = async (words: string[], deps: ScheduleCommandDeps):
     if (flags._arg1) return { ok: false, error: `unexpected word '${String(flags._arg1)}'` };
 
     const read = (name: string): Checked<string | undefined> => flagText(flags, name);
-    const [at, days, every, prompt, label, wt, maxRuntime] = ['at', 'days', 'every', 'prompt', 'label', 'wt', 'max-runtime'].map(read);
-    const bad = [at, days, every, prompt, label, wt, maxRuntime].find((r) => !r.ok);
+    const [at, days, every, on, prompt, label, wt, maxRuntime] = ['at', 'days', 'every', 'on', 'prompt', 'label', 'wt', 'max-runtime'].map(read);
+    const bad = [at, days, every, on, prompt, label, wt, maxRuntime].find((r) => !r.ok);
     if (bad && !bad.ok) return bad;
     const value = (r: Checked<string | undefined>): string | undefined => (r.ok ? r.value : undefined);
 
-    const when = parseWhen({ at: value(at), days: value(days), every: value(every) });
+    const when = parseWhen({ at: value(at), days: value(days), every: value(every), on: value(on) });
     if (!when.ok) return when;
+    const past = pastWhen(when.value, deps.now());
+    if (past) return { ok: false, error: `--on ${value(on)} --at ${value(at)}: ${past}` };
     if (value(prompt) !== undefined && value(prompt)!.trim() === '') return { ok: false, error: '--prompt must not be empty' };
     if (value(prompt) !== undefined && !deps.promptKinds().includes(agent.kind)) {
         const names = REMOTE_AGENTS.filter((a) => deps.promptKinds().includes(a.kind)).map((a) => a.subcommands[0]).join(', ');
@@ -167,18 +179,17 @@ export const buildSchedule = async (words: string[], deps: ScheduleCommandDeps):
 /** An ISO date, or null for a time outside what a Date holds (a damaged or hand-edited file). */
 const isoOrNull = (ms: number | null): string | null => (ms !== null && Number.isFinite(new Date(ms).getTime()) ? new Date(ms).toISOString() : null);
 
-const formatTime = (ms: number): string => {
-    if (!Number.isFinite(new Date(ms).getTime())) return '-';
-    const d = new Date(ms);
-    const pad = (n: number): string => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-};
-
 const handleAdd = async (words: string[], json: boolean, deps: ScheduleCommandDeps): Promise<number> => {
     const built = await buildSchedule(words, deps);
     if (!built.ok) {
         deps.err(`hwip schedule: ${built.error}`);
         return 2;
+    }
+    // A listener older than `once` would skip the file, and the schedule would never run.
+    const probe = built.value.make('aaaaaa');
+    if (probe.when.kind === 'once' && deps.listenerRunning() && !(await deps.refreshListener())) {
+        deps.err('hwip schedule: the listener running is an older hwip that could not be replaced, and it would not run this schedule: restart it, then add again');
+        return 1;
     }
     const added = addSchedule(built.value.make);
     if (!added.ok) {
@@ -271,14 +282,29 @@ export const onStderr = async (work: () => Promise<void>): Promise<void> => {
     }
 };
 
-/** The schedule's new `when` from the flags given: what is not given is kept, so `--at` keeps the days and `--days` the time. */
-const editedWhen = (current: ScheduleWhen, at: string | undefined, days: string | undefined, every: string | undefined): Checked<ScheduleWhen | undefined> => {
-    if (at === undefined && days === undefined && every === undefined) return { ok: true, value: undefined };
+/** The local date (`YYYY-MM-DD`) and time (`HH:MM`) of a `once` schedule, as `--on` and `--at` take them. */
+const onceParts = (when: Extract<ScheduleWhen, { kind: 'once' }>): { on: string; at: string } => {
+    const d = new Date(when.at);
+    return { on: `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`, at: `${pad2(d.getHours())}:${pad2(d.getMinutes())}` };
+};
+
+/**
+ * The schedule's new `when` from the flags given: what is not given is kept, so `--at` keeps the days (or, for a
+ * `once`, the date), `--days` the time and `--on` the time of day.
+ */
+const editedWhen = (current: ScheduleWhen, input: { at?: string; days?: string; every?: string; on?: string }): Checked<ScheduleWhen | undefined> => {
+    const { at, days, every, on } = input;
+    if (at === undefined && days === undefined && every === undefined && on === undefined) return { ok: true, value: undefined };
+    const keptOnce = current.kind === 'once' && days === undefined && every === undefined;
+    if (on !== undefined || keptOnce) {
+        const kept = current.kind === 'once' ? onceParts(current) : undefined;
+        return parseWhen({ on: on ?? kept?.on, at: at ?? kept?.at, days, every });
+    }
     if (every !== undefined || at !== undefined) {
         const keptDays = current.kind === 'daily' ? current.days.map((day) => DAY_NAMES[day]).join(',') : undefined;
         return parseWhen({ at, every, days: days ?? (every === undefined ? keptDays : undefined) });
     }
-    if (current.kind !== 'daily') return { ok: false, error: '--days needs --at HH:MM for a schedule that runs --every' };
+    if (current.kind !== 'daily') return { ok: false, error: `--days needs --at HH:MM for a schedule that runs ${current.kind === 'once' ? 'once' : '--every'}` };
     return parseWhen({ at: current.at, days });
 };
 
@@ -287,12 +313,12 @@ const buildChange = (current: Schedule, flags: Flags, deps: ScheduleCommandDeps)
     const fixed = ['label', 'wt'].find((name) => flags[name] !== undefined);
     if (fixed) return { ok: false, error: `--${fixed} cannot be edited: the session is named for it; remove the schedule and add it again` };
     const read = (name: string): Checked<string | undefined> => flagText(flags, name);
-    const [at, days, every, prompt, maxRuntime] = ['at', 'days', 'every', 'prompt', 'max-runtime'].map(read);
-    const bad = [at, days, every, prompt, maxRuntime].find((r) => !r.ok);
+    const [at, days, every, on, prompt, maxRuntime] = ['at', 'days', 'every', 'on', 'prompt', 'max-runtime'].map(read);
+    const bad = [at, days, every, on, prompt, maxRuntime].find((r) => !r.ok);
     if (bad && !bad.ok) return bad;
     const value = (r: Checked<string | undefined>): string | undefined => (r.ok ? r.value : undefined);
 
-    const when = editedWhen(current.when, value(at), value(days), value(every));
+    const when = editedWhen(current.when, { at: value(at), days: value(days), every: value(every), on: value(on) });
     if (!when.ok) return when;
     const change: ScheduleChange = when.value === undefined ? {} : { when: when.value };
     const text = value(prompt);
@@ -308,7 +334,7 @@ const buildChange = (current: Schedule, flags: Flags, deps: ScheduleCommandDeps)
         if (!parsed.ok) return parsed;
         change.maxRuntimeMin = parsed.value;
     }
-    if (Object.keys(change).length === 0) return { ok: false, error: 'edit needs --at, --days, --every, --prompt or --max-runtime' };
+    if (Object.keys(change).length === 0) return { ok: false, error: 'edit needs --at, --days, --on, --every, --prompt or --max-runtime' };
     return { ok: true, value: change };
 };
 

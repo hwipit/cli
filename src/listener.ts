@@ -138,7 +138,7 @@ import { liveRunIdOf, liveSessionNames, sessionExists, sessionLiveness } from '.
 import { familyNames } from './wrapper.js';
 import { noteRunSeqs, runSeqsByRun, runSeqsKey, type RunSeqs } from './run-seqs.js';
 import { FlagValueError, flagOn } from './args.js';
-import { listSchedules, readScheduleState, writeScheduleState } from './schedule.js';
+import { listSchedules, readScheduleState, removeSchedule, writeScheduleState } from './schedule.js';
 import { launchHwip } from './schedule-launch.js';
 import { applyPhoneSchedule, livePhoneScheduleDeps, scheduleAnswer, type PhoneScheduleDeps } from './schedule-remote.js';
 import { createScheduleRunner, notifyFailureOutcome, PROMPT_POLL_MS, TICK_MS as SCHEDULE_TICK_MS, type NotifyOutcome, type ScheduleRunnerDeps } from './schedule-runner.js';
@@ -6880,6 +6880,7 @@ export const liveScheduleRunnerDeps = (notify: ScheduleRunnerDeps['notify']): Sc
         );
     },
     notify,
+    removeSchedule,
 });
 
 export const handleListener = async (args: Record<string, string | boolean>): Promise<number> => {

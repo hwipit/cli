@@ -2,8 +2,8 @@
  * Scheduled sessions (F8): what a schedule is, when it comes due, and the files it lives in.
  *
  * A schedule is one file, `<stateDir>/schedules/<id>.json` (0600). `hwip schedule` writes and
- * deletes them, the listener only reads them, and nothing reads-then-rewrites a file, so the two
- * never lose each other's change. What the listener has done about each one lives in its own file
+ * deletes them, the listener only reads them — except a `once` schedule that has run, which the listener
+ * deletes — and nothing reads-then-rewrites a file, so the two never lose each other's change. What the listener has done about each one lives in its own file
  * (`schedule-state.json`, `schedule-runner.ts`).
  *
  * Everything here is pure or touches only that directory. The clock is a parameter.
@@ -18,7 +18,9 @@ import { replaceFile } from './replace-file.js';
 
 export type ScheduleWhen =
     | { kind: 'daily'; at: string; days: number[] }
-    | { kind: 'every'; minutes: number };
+    | { kind: 'every'; minutes: number }
+    /** Runs one time, at `at` (an ISO 8601 instant), and is removed after (`schedule-runner.ts`). */
+    | { kind: 'once'; at: string };
 
 export interface Schedule {
     v: 1;
@@ -73,6 +75,9 @@ const DAY_NUMBER: Readonly<Record<string, number>> = Object.fromEntries(DAY_NAME
 export const ALL_DAYS: readonly number[] = [0, 1, 2, 3, 4, 5, 6];
 export const WEEKDAYS: readonly number[] = [1, 2, 3, 4, 5];
 const AT_TIME = /^([01]\d|2[0-3]):([0-5]\d)$/;
+const ON_DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
+/** An instant with its offset: a time without one would move with the machine's time zone. */
+const AT_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?(Z|[+-]\d{2}:\d{2})$/;
 
 const parseDays = (raw: string): Checked<number[]> => {
     const word = raw.trim().toLowerCase();
@@ -103,9 +108,30 @@ const parseEvery = (raw: string): Checked<number> => {
     return { ok: true, value: minutes };
 };
 
-/** `--at HH:MM [--days …]` or `--every <N>m|<N>h`, not both and not neither. */
-export const parseWhen = (input: { at?: string; days?: string; every?: string }): Checked<ScheduleWhen> => {
-    const { at, days, every } = input;
+/** `--on YYYY-MM-DD` and `--at HH:MM` as the instant that local date and time is. */
+const parseOnce = (on: string, at: string | undefined): Checked<ScheduleWhen> => {
+    if (at === undefined) return fail('--on needs --at HH:MM');
+    if (!AT_TIME.test(at.trim())) return fail(`--at takes a 24-hour local time like 09:00 (got '${at}')`);
+    const date = ON_DATE.exec(on.trim());
+    const [year, month, day] = date ? [Number(date[1]), Number(date[2]) - 1, Number(date[3])] : [0, 0, 0];
+    const [hour, minute] = at.trim().split(':').map(Number);
+    const local = new Date(year, month, day, hour, minute);
+    // `Date` rolls an impossible day (Feb 30) into the next month; that is not the day that was asked for.
+    if (!date || local.getFullYear() !== year || local.getMonth() !== month || local.getDate() !== day) {
+        return fail(`--on takes a date like 2026-10-24 (got '${on}')`);
+    }
+    // And a time the clocks skip (spring forward) into the next hour.
+    if (local.getHours() !== hour || local.getMinutes() !== minute) return fail(`${on} ${at.trim()} does not exist here: the clocks skip it`);
+    return { ok: true, value: { kind: 'once', at: local.toISOString() } };
+};
+
+/** `--at HH:MM [--days …]`, `--on YYYY-MM-DD --at HH:MM` or `--every <N>m|<N>h`, one of them and not neither. */
+export const parseWhen = (input: { at?: string; days?: string; every?: string; on?: string }): Checked<ScheduleWhen> => {
+    const { at, days, every, on } = input;
+    if (on !== undefined) {
+        if (days !== undefined || every !== undefined) return fail('--on cannot be combined with --days or --every');
+        return parseOnce(on, at);
+    }
     if (every !== undefined) {
         if (at !== undefined || days !== undefined) return fail('--every cannot be combined with --at or --days');
         const minutes = parseEvery(every);
@@ -157,6 +183,10 @@ const timeOnDay = (when: Extract<ScheduleWhen, { kind: 'daily' }>, day: Date): n
 export const occurrencesBetween = (when: ScheduleWhen, after: number, until: number, anchor: number): Occurrences => {
     // A cursor read from a damaged state file may not be a number; the day walk below would never end on one.
     if (!Number.isFinite(after) || !Number.isFinite(until) || until <= after) return { count: 0, latest: null };
+    if (when.kind === 'once') {
+        const at = Date.parse(when.at);
+        return at > after && at <= until ? { count: 1, latest: at } : { count: 0, latest: null };
+    }
     if (when.kind === 'every') {
         const period = when.minutes * 60_000;
         const upTo = periodsSince(anchor, period, until);
@@ -178,8 +208,12 @@ export const occurrencesBetween = (when: ScheduleWhen, after: number, until: num
     return { count, latest };
 };
 
-/** The first time after `after` the schedule comes due; null for a `daily` with no days (a file `validateSchedule` would refuse). */
+/** The first time after `after` the schedule comes due; null for a `once` that is past and a `daily` with no days (a file `validateSchedule` would refuse). */
 export const nextOccurrence = (when: ScheduleWhen, after: number, anchor: number): number | null => {
+    if (when.kind === 'once') {
+        const at = Date.parse(when.at);
+        return at > after ? at : null;
+    }
     if (when.kind === 'every') {
         const period = when.minutes * 60_000;
         return anchor + (periodsSince(anchor, period, after) + 1) * period;
@@ -221,7 +255,12 @@ const checkWhen = (raw: unknown): string | null => {
         if (Object.keys(raw).some((k) => k !== 'kind' && k !== 'minutes')) return 'when has a field it does not know';
         return isInt(raw.minutes, MIN_EVERY_MIN, MAX_EVERY_MIN) ? null : `when.minutes must be a whole number of at least ${MIN_EVERY_MIN}`;
     }
-    if (raw.kind !== 'daily') return "when.kind must be 'daily' or 'every'";
+    if (raw.kind === 'once') {
+        if (Object.keys(raw).some((k) => k !== 'kind' && k !== 'at')) return 'when has a field it does not know';
+        const wellFormed = typeof raw.at === 'string' && AT_INSTANT.test(raw.at) && Number.isFinite(Date.parse(raw.at));
+        return wellFormed ? null : 'when.at must be an ISO 8601 time with its offset';
+    }
+    if (raw.kind !== 'daily') return "when.kind must be 'daily', 'every' or 'once'";
     if (Object.keys(raw).some((k) => k !== 'kind' && k !== 'at' && k !== 'days')) return 'when has a field it does not know';
     if (typeof raw.at !== 'string' || !AT_TIME.test(raw.at)) return 'when.at must be HH:MM';
     const days = raw.days;
@@ -358,6 +397,9 @@ export const addSchedule = (make: (id: string) => Schedule, newId: () => string 
         const schedule = make(id);
         const checked = validateSchedule(schedule);
         if (!checked.ok) return { ok: false, error: checked.error };
+        // A `once` made after its time would never run: the runner counts from `createdAt`.
+        const past = pastWhen(schedule.when, Date.parse(schedule.createdAt));
+        if (past) return { ok: false, error: past };
         if (schedule.id !== id) return { ok: false, error: 'schedule.id is not the id it was made for' };
         try {
             mkdirHandedBack(schedulesDir(), 0o700);
@@ -407,6 +449,8 @@ export const updateSchedule = (id: string, change: UncheckedScheduleChange, now:
     const retimed = change.when !== undefined && JSON.stringify(change.when) !== JSON.stringify(current.when);
     const checked = validateSchedule({ ...current, ...change, ...(retimed ? { updatedAt: new Date(now).toISOString() } : {}) });
     if (!checked.ok) return { ok: false, error: checked.error, failure: 'invalid' };
+    const past = retimed ? pastWhen(checked.value.when, now) : null;
+    if (past) return { ok: false, error: past, failure: 'invalid' };
     try {
         replaceFile(schedulePath(id), `${JSON.stringify(checked.value, null, 2)}\n`, undefined, 0o600);
         return { ok: true, schedule: checked.value };
@@ -414,6 +458,10 @@ export const updateSchedule = (id: string, change: UncheckedScheduleChange, now:
         return { ok: false, error: `could not write the schedule: ${err instanceof Error ? err.message : String(err)}`, failure: 'io' };
     }
 };
+
+/** Why `when` cannot be given to a schedule at `now`: a `once` whose time has passed would never run. Null when it can. */
+export const pastWhen = (when: ScheduleWhen, now: number): string | null =>
+    when.kind === 'once' && Date.parse(when.at) <= now ? 'that time has already passed' : null;
 
 /** The time a schedule's runs are counted from: its last edit, else its creation. */
 export const scheduleAnchor = (schedule: Schedule): number => Date.parse(schedule.updatedAt ?? schedule.createdAt);

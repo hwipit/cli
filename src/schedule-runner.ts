@@ -5,16 +5,31 @@
  *
  * What a tick decides, per schedule: how many due times passed since its cursor, whether the newest is still
  * worth running (`GRACE_MS`; older ones are `missed` and never run late), and whether the session may start.
+ * A `once` schedule that has run (or was missed), and whose session and report are done with, has its file removed.
  * The cursor is written before anything is launched, so a listener killed in between skips that run instead of
  * starting it twice.
  */
 
-import { occurrencesBetween, scheduleAnchor, type Schedule, type ScheduleList, type ScheduleOutcome, type ScheduleRunState, type ScheduleStateFile } from './schedule.js';
+import {
+    occurrencesBetween,
+    scheduleAnchor,
+    type RemoveResult,
+    type Schedule,
+    type ScheduleList,
+    type ScheduleOutcome,
+    type ScheduleRunState,
+    type ScheduleStateFile,
+} from './schedule.js';
 
 /** How often the listener ticks. */
 export const TICK_MS = 30_000;
 /** A due time older than this when the tick sees it (the machine slept, the listener was down) is missed, not run. */
 export const GRACE_MS = 120_000;
+/**
+ * The same for a `once` schedule: there is no next time to wait for, and a person who asked for "at 3 pm" still wants
+ * it at 3:20 after the laptop woke up.
+ */
+export const ONCE_GRACE_MS = 30 * 60_000;
 /** After a launch exits 0, how long before the session has to be there. */
 export const START_CHECK_MS = 2_000;
 /** A launch that has not exited by then is given up on. */
@@ -88,6 +103,8 @@ export interface ScheduleRunnerDeps {
     endSession: (session: string) => void;
     /** Tells the person (title, body). */
     notify: (title: string, body: string) => Promise<NotifyOutcome>;
+    /** Deletes a schedule's file (`removeSchedule`): a `once` that is done. It may throw when the file cannot be removed. */
+    removeSchedule: (id: string) => RemoveResult;
     /** The wall clock (default `Date.now`); a launch takes seconds, and the schedules after it are judged by the time it ends. */
     clock?: () => number;
 }
@@ -186,6 +203,48 @@ export const createScheduleRunner = (deps: ScheduleRunnerDeps): ScheduleRunner =
     const launchedBefore = new Map<string, number>();
     // Sessions already asked to end for their runtime cap, so a state file that cannot be written does not ask again every tick.
     const cappedAsked = new Set<string>();
+    // `once` schedules whose file could not be removed, so the log says it once, not every tick.
+    const unremovable = new Set<string>();
+
+    /**
+     * Removes the `once` schedules that are done: their time has been dealt with (run, failed or missed), their session is
+     * no longer running and their report has gone out. Until then the schedule stays, so its prompt, its runtime cap and
+     * its push are still looked after. Its cursor is past its time, so one that cannot be removed is never run again.
+     * A cursor can also pass the time without a run judging it (a damaged state file starts from now): that is told as
+     * missed first, never removed in silence.
+     */
+    const removeFinished = (schedules: Schedule[], state: Record<string, ScheduleRunState>, now: number): { live: Schedule[]; changed: boolean } => {
+        let changed = false;
+        const live = schedules.filter((schedule) => {
+            const st = state[schedule.id]!;
+            const passed = schedule.when.kind === 'once' && st.cursor >= Date.parse(schedule.when.at);
+            if (!passed || st.running || st.pending) return true;
+            if (!st.last) {
+                st.last = { outcome: 'missed', at: now };
+                addPending(st, 'missed', 1, now);
+                changed = true;
+                deps.log(`schedule ${schedule.id} (${schedule.label}): its time went by without a record; missed`);
+                return true;
+            }
+            let removed: RemoveResult | Error;
+            try {
+                removed = deps.removeSchedule(schedule.id);
+            } catch (e) {
+                removed = e instanceof Error ? e : new Error(String(e));
+            }
+            if (removed instanceof Error || removed === 'invalid') {
+                if (!unremovable.has(schedule.id)) deps.log(`! schedule ${schedule.id} (${schedule.label}): ran once, but could not remove it: ${removed instanceof Error ? removed.message : 'not a schedule id'}`);
+                unremovable.add(schedule.id);
+                return true;
+            }
+            unremovable.delete(schedule.id);
+            delete state[schedule.id];
+            deps.log(`schedule ${schedule.id} (${schedule.label}): ran once, removed`);
+            changed = true;
+            return false;
+        });
+        return { live, changed };
+    };
 
     const load = (tickNow: number): Loaded => {
         const { schedules, unreadable, incomplete } = deps.listSchedules();
@@ -245,12 +304,14 @@ export const createScheduleRunner = (deps: ScheduleRunnerDeps): ScheduleRunner =
             sentReports = [];
             pushing = false;
         }
+        const { live, changed } = removeFinished(schedules, state, tickNow);
+        if (changed) dirty = true;
         const save = (): boolean => {
             const saved = deps.writeState({ v: 1, schedules: state });
             if (!saved) deps.log('! schedules: could not write the state file');
             return saved;
         };
-        return { schedules, state, dirty, save };
+        return { schedules: live, state, dirty, save };
     };
 
     const run = async (tickNow: number): Promise<Report | null> => {
@@ -265,7 +326,7 @@ export const createScheduleRunner = (deps: ScheduleRunnerDeps): ScheduleRunner =
             const now = tickNow + (clock() - tickStart);
             const due = occurrencesBetween(schedule.when, st.cursor, now, scheduleAnchor(schedule));
             if (due.count === 0 || due.latest === null) continue;
-            const runs = now - due.latest <= GRACE_MS;
+            const runs = now - due.latest <= (schedule.when.kind === 'once' ? ONCE_GRACE_MS : GRACE_MS);
             const missed = runs ? due.count - 1 : due.count;
             const before = structuredClone(st);
             st.cursor = due.latest;

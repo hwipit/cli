@@ -431,3 +431,47 @@ describe('describeWhen', () => {
         expect(describeWhen(when as never)).toBe(text);
     });
 });
+
+describe('when kind once', () => {
+    const AT = new Date(2026, 9, 11, 9, 0).getTime();
+
+    it('adds a schedule that runs once on --on at --at, and says so', async () => {
+        const r = rig();
+        expect(await runSchedule(['add', 'cc', '--on', '2026-10-11', '--at', '09:00', '--prompt', 'carry on'], r.deps)).toBe(0);
+        expect(only()).toMatchObject({ when: { kind: 'once', at: new Date(AT).toISOString() }, prompt: 'carry on', maxRuntimeMin: 120 });
+        expect(r.out.join('\n')).toContain('once 2026-10-11 09:00, next 2026-10-11 09:00');
+    });
+
+    it('refuses a time that has already passed, and writes nothing', async () => {
+        const r = rig();
+        expect(await runSchedule(['add', 'cc', '--on', '2026-10-07', '--at', '09:00'], r.deps)).toBe(2);
+        expect(r.err.join('\n')).toContain('has already passed');
+        expect(() => readdirSync(schedulesDir())).toThrow();
+    });
+
+    it('refuses to add one when an older listener that cannot read it keeps running', async () => {
+        const r = rig({ refreshListener: async () => false });
+        expect(await runSchedule(['add', 'cc', '--on', '2026-10-11', '--at', '09:00'], r.deps)).toBe(1);
+        expect(r.err.join('\n')).toContain('older hwip');
+        expect(() => readdirSync(schedulesDir())).toThrow();
+    });
+
+    it('lists it with its date', async () => {
+        const r = rig();
+        await runSchedule(['add', 'cc', '--on', '2026-10-11', '--at', '09:00'], r.deps);
+        r.out.length = 0;
+        expect(await runSchedule(['list'], r.deps)).toBe(0);
+        expect(r.out.join('\n')).toContain('once 2026-10-11 09:00');
+    });
+
+    it('keeps the date when only --at is edited, and the time when only --on is', async () => {
+        const r = rig();
+        await runSchedule(['add', 'cc', '--on', '2026-10-11', '--at', '09:00'], r.deps);
+        const { id } = only();
+        expect(await runSchedule(['edit', id, '--at', '10:30'], r.deps)).toBe(0);
+        expect(only().when).toEqual({ kind: 'once', at: new Date(2026, 9, 11, 10, 30).toISOString() });
+        expect(await runSchedule(['edit', id, '--on', '2026-10-12'], r.deps)).toBe(0);
+        expect(only().when).toEqual({ kind: 'once', at: new Date(2026, 9, 12, 10, 30).toISOString() });
+        expect(await runSchedule(['edit', id, '--days', 'weekdays'], r.deps)).toBe(2);
+    });
+});

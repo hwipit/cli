@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
     createScheduleRunner,
     GRACE_MS,
+    ONCE_GRACE_MS,
     LAUNCH_TIMEOUT_MS,
     LAUNCH_WT_TIMEOUT_MS,
     launchArgs,
@@ -47,6 +48,7 @@ interface World {
     typed: { session: string; prompt: string }[];
     ended: string[];
     notes: { title: string; body: string }[];
+    removed: string[];
 }
 
 const world = (
@@ -64,6 +66,7 @@ const world = (
         typed: [],
         ended: [],
         notes: [],
+        removed: [],
         deps: undefined as never,
         runner: undefined as never,
     };
@@ -104,6 +107,11 @@ const world = (
         notify: async (title, body) => {
             w.notes.push({ title, body });
             return 'sent';
+        },
+        removeSchedule: (id) => {
+            w.removed.push(id);
+            w.schedules = w.schedules.filter((s) => s.id !== id);
+            return 'removed';
         },
         ...rest,
     };
@@ -1048,5 +1056,92 @@ describe('a running session when its schedule is edited [F8-edit]', () => {
         await w.runner.tick(START + 5 * MIN + 1);
         expect(w.ended).toEqual(['hwip-app-sched-aaaaaa']);
         expect(w.launched).toHaveLength(1);
+    });
+});
+
+describe('when kind once', () => {
+    const AT = T0 + 30 * MIN;
+    const once = (id: string, over: Partial<Schedule> = {}): Schedule =>
+        schedule(id, { when: { kind: 'once', at: new Date(AT).toISOString() }, maxRuntimeMin: 120, ...over });
+
+    it('runs at its time, is removed once its session has ended, and never runs again', async () => {
+        const w = world([once('aaaaaa')]);
+        await w.runner.tick(AT - 10_000);
+        expect(w.launched).toEqual([]);
+        await w.runner.tick(AT + 10_000);
+        expect(w.launched).toHaveLength(1);
+        expect(last(w, 'aaaaaa')).toBe('started');
+        // Its session still runs: the schedule stays, so the runtime cap and the prompt are still looked after.
+        await w.runner.tick(AT + 40_000);
+        expect(w.removed).toEqual([]);
+        w.sessions.clear();
+        await w.runner.tick(AT + 70_000);
+        expect(w.removed).toEqual(['aaaaaa']);
+        expect(w.state.schedules.aaaaaa).toBeUndefined();
+        await w.runner.tick(AT + 24 * HOUR);
+        expect(w.launched).toHaveLength(1);
+    });
+
+    it('still runs 29 minutes late, after the listener was down', async () => {
+        const w = world([once('aaaaaa')]);
+        await w.runner.tick(AT + 29 * MIN);
+        expect(w.launched).toHaveLength(1);
+        expect(ONCE_GRACE_MS).toBe(30 * MIN);
+    });
+
+    it('is missed 31 minutes late: not run, told, then removed', async () => {
+        const w = world([once('aaaaaa')]);
+        await w.runner.tick(AT + 31 * MIN);
+        expect(w.launched).toEqual([]);
+        expect(last(w, 'aaaaaa')).toBe('missed');
+        expect(w.notes).toEqual([{ title: '예약 건너뜀', body: 'sched-aaaaaa · 놓침 1회' }]);
+        await w.runner.tick(AT + 32 * MIN);
+        expect(w.removed).toEqual(['aaaaaa']);
+        expect(w.notes).toHaveLength(1);
+    });
+
+    it('is removed after a run that failed to start, once that was told', async () => {
+        const w = world([once('aaaaaa')], { launchResult: { ok: false, error: 'boom' } });
+        await w.runner.tick(AT + 10_000);
+        expect(last(w, 'aaaaaa')).toBe('start_failed');
+        expect(w.notes).toHaveLength(1);
+        await w.runner.tick(AT + 40_000);
+        expect(w.removed).toEqual(['aaaaaa']);
+        expect(w.launched).toHaveLength(1);
+    });
+
+    it('stays until its report has gone out when the push keeps failing', async () => {
+        const w = world([once('aaaaaa')], { notify: async () => 'retry' });
+        await w.runner.tick(AT + 31 * MIN);
+        await w.runner.tick(AT + 32 * MIN);
+        expect(w.removed).toEqual([]);
+        expect(w.state.schedules.aaaaaa?.pending?.counts).toEqual({ missed: 1 });
+    });
+
+    it('reports a once whose time went by without a record (a damaged state file) as missed before removing it', async () => {
+        const w = world([once('aaaaaa')], { readState: () => ({ v: 1, schedules: {}, damaged: true }) });
+        await w.runner.tick(AT + 5 * MIN);
+        expect(w.launched).toEqual([]);
+        expect(w.notes).toEqual([{ title: '예약 건너뜀', body: 'sched-aaaaaa · 놓침 1회' }]);
+        expect(w.removed).toEqual([]);
+    });
+
+    it('keeps the schedule when its id cannot name a file', async () => {
+        const w = world([once('aaaaaa')], { removeSchedule: () => 'invalid' });
+        await w.runner.tick(AT + 31 * MIN);
+        await w.runner.tick(AT + 32 * MIN);
+        expect(w.state.schedules.aaaaaa).toBeDefined();
+        expect(w.logs.join('\n')).toContain('could not remove');
+        expect(w.logs.join('\n')).not.toContain('ran once, removed');
+    });
+
+    it('is not run again when its file cannot be removed', async () => {
+        const w = world([once('aaaaaa')], { removeSchedule: () => { throw new Error('EACCES'); } });
+        await w.runner.tick(AT + 31 * MIN);
+        await w.runner.tick(AT + 32 * MIN);
+        await w.runner.tick(AT + 33 * MIN);
+        expect(w.launched).toEqual([]);
+        expect(w.notes).toHaveLength(1);
+        expect(w.logs.filter((l) => l.includes('could not remove'))).toHaveLength(1);
     });
 });

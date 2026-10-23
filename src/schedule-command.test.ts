@@ -26,6 +26,9 @@ const rig = (over: Partial<ScheduleCommandDeps> = {}): Rig => {
         listenerRunning: () => true,
         promptKinds: () => ['claude', 'pi'],
         refreshListener: async () => true,
+        sessionTarget: (name) => (name === 'hwip-app'
+            ? { ok: true, value: { agentKind: 'claude', cwd: '/work/app', runId: '1760000000' } }
+            : { ok: false, error: `${name} is not running` }),
         out: (line) => out.push(line),
         err: (line) => err.push(line),
         ...over,
@@ -429,5 +432,122 @@ describe('describeWhen', () => {
     ] as const)('%j reads %s', (when, text) => {
         // The table's literal types are wider than `ScheduleWhen`'s; the values are valid.
         expect(describeWhen(when as never)).toBe(text);
+    });
+});
+
+describe('when kind once', () => {
+    const AT = new Date(2026, 9, 11, 9, 0).getTime();
+
+    it('adds a schedule that runs once on --on at --at, and says so', async () => {
+        const r = rig();
+        expect(await runSchedule(['add', 'cc', '--on', '2026-10-11', '--at', '09:00', '--prompt', 'carry on'], r.deps)).toBe(0);
+        expect(only()).toMatchObject({ when: { kind: 'once', at: new Date(AT).toISOString() }, prompt: 'carry on', maxRuntimeMin: 120 });
+        expect(r.out.join('\n')).toContain('once 2026-10-11 09:00, next 2026-10-11 09:00');
+    });
+
+    it('refuses a time that has already passed, and writes nothing', async () => {
+        const r = rig();
+        expect(await runSchedule(['add', 'cc', '--on', '2026-10-07', '--at', '09:00'], r.deps)).toBe(2);
+        expect(r.err.join('\n')).toContain('has already passed');
+        expect(() => readdirSync(schedulesDir())).toThrow();
+    });
+
+    it('refuses to add one when an older listener that cannot read it keeps running', async () => {
+        const r = rig({ refreshListener: async () => false });
+        expect(await runSchedule(['add', 'cc', '--on', '2026-10-11', '--at', '09:00'], r.deps)).toBe(1);
+        expect(r.err.join('\n')).toContain('older hwip');
+        expect(() => readdirSync(schedulesDir())).toThrow();
+    });
+
+    it('lists it with its date', async () => {
+        const r = rig();
+        await runSchedule(['add', 'cc', '--on', '2026-10-11', '--at', '09:00'], r.deps);
+        r.out.length = 0;
+        expect(await runSchedule(['list'], r.deps)).toBe(0);
+        expect(r.out.join('\n')).toContain('once 2026-10-11 09:00');
+    });
+
+    it('keeps the date when only --at is edited, and the time when only --on is', async () => {
+        const r = rig();
+        await runSchedule(['add', 'cc', '--on', '2026-10-11', '--at', '09:00'], r.deps);
+        const { id } = only();
+        expect(await runSchedule(['edit', id, '--at', '10:30'], r.deps)).toBe(0);
+        expect(only().when).toEqual({ kind: 'once', at: new Date(2026, 9, 11, 10, 30).toISOString() });
+        expect(await runSchedule(['edit', id, '--on', '2026-10-12'], r.deps)).toBe(0);
+        expect(only().when).toEqual({ kind: 'once', at: new Date(2026, 9, 12, 10, 30).toISOString() });
+        expect(await runSchedule(['edit', id, '--days', 'weekdays'], r.deps)).toBe(2);
+    });
+});
+
+describe('session target', () => {
+    const add = (r: Rig, ...extra: string[]): Promise<number> =>
+        runSchedule(['add', '--session', 'hwip-app', '--on', '2026-10-11', '--at', '09:00', '--prompt', 'carry on', ...extra], r.deps);
+
+    it('adds a schedule that types into the running session, bound to its run', async () => {
+        const r = rig();
+        expect(await add(r)).toBe(0);
+        expect(only()).toMatchObject({
+            target: 'session', runId: '1760000000', session: 'hwip-app', agentKind: 'claude', cwd: '/work/app', prompt: 'carry on',
+            when: { kind: 'once', at: new Date(2026, 9, 11, 9, 0).toISOString() },
+        });
+        expect(r.out.join('\n')).toContain('into session hwip-app');
+    });
+
+    it('needs a prompt', async () => {
+        const r = rig();
+        expect(await runSchedule(['add', '--session', 'hwip-app', '--on', '2026-10-11', '--at', '09:00'], r.deps)).toBe(2);
+        expect(r.err.join('\n')).toContain('--session needs --prompt');
+    });
+
+    it('refuses a session that is not running, with why', async () => {
+        const r = rig();
+        expect(await runSchedule(['add', '--session', 'hwip-gone', '--at', '09:00', '--prompt', 'x'], r.deps)).toBe(2);
+        expect(r.err.join('\n')).toContain('hwip-gone is not running');
+        expect(() => readdirSync(schedulesDir())).toThrow();
+    });
+
+    it('refuses an agent hwip cannot tell is idle', async () => {
+        const r = rig({ promptKinds: () => ['pi'] });
+        expect(await add(r)).toBe(2);
+        expect(r.err.join('\n')).toContain('cannot take a scheduled --prompt');
+    });
+
+    it.each([
+        ['an agent', ['add', 'cc', '--session', 'hwip-app', '--at', '09:00', '--prompt', 'x']],
+        ['--wt', ['add', '--session', 'hwip-app', '--at', '09:00', '--prompt', 'x', '--wt', 'feat/x']],
+        ['--label', ['add', '--session', 'hwip-app', '--at', '09:00', '--prompt', 'x', '--label', 'x']],
+        ['--max-runtime', ['add', '--session', 'hwip-app', '--at', '09:00', '--prompt', 'x', '--max-runtime', '30m']],
+        ['agent arguments', ['add', '--session', 'hwip-app', '--at', '09:00', '--prompt', 'x', '--', '--model', 'opus']],
+    ])('refuses %s with --session', async (_name, words) => {
+        const r = rig();
+        expect(await runSchedule(words, r.deps)).toBe(2);
+        expect(r.err.join('\n')).toContain('--session');
+    });
+
+    it('refuses to add one when an older listener that cannot read it keeps running', async () => {
+        const r = rig({ refreshListener: async () => false });
+        expect(await runSchedule(['add', '--session', 'hwip-app', '--at', '09:00', '--prompt', 'x'], r.deps)).toBe(1);
+        expect(r.err.join('\n')).toContain('older hwip');
+    });
+
+    it('takes a new time of any kind on edit, and refuses --max-runtime: it has no runtime cap', async () => {
+        const r = rig();
+        await add(r);
+        const { id } = only();
+        expect(await runSchedule(['edit', id, '--every', '30m'], r.deps)).toBe(0);
+        expect(only().when).toEqual({ kind: 'every', minutes: 30 });
+        expect(await runSchedule(['edit', id, '--max-runtime', '20m'], r.deps)).toBe(2);
+        expect(r.err.join('\n')).toContain('--max-runtime');
+    });
+
+    it('lists where it types, and says so in --json', async () => {
+        const r = rig();
+        await add(r);
+        r.out.length = 0;
+        await runSchedule(['list'], r.deps);
+        expect(r.out.join('\n')).toContain('into hwip-app');
+        r.out.length = 0;
+        await runSchedule(['list', '--json'], r.deps);
+        expect(JSON.parse(r.out[0]!)[0]).toMatchObject({ target: 'session', runId: '1760000000', session: 'hwip-app' });
     });
 });

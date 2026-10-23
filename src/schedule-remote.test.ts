@@ -3,7 +3,7 @@ import { join } from 'path';
 import { describe, expect, it } from 'vitest';
 import { withTmpStateDir } from './test-state-dir.js';
 import { addSchedule, listSchedules, schedulesDir, writeScheduleState, type Schedule } from './schedule.js';
-import { applyPhoneSchedule, LIST_PROMPT_CHARS, phoneScheduleList, type PhoneScheduleDeps, type PhoneScheduleResult } from './schedule-remote.js';
+import { applyPhoneSchedule, LIST_PROMPT_CHARS, phoneScheduleList, scheduleAnswer, type PhoneScheduleDeps, type PhoneScheduleResult } from './schedule-remote.js';
 
 const stateRoot = withTmpStateDir('hwip-schedule-remote-');
 
@@ -91,6 +91,8 @@ describe('applyPhoneSchedule update [F8-edit]', () => {
         recall: () => null,
         directoryExists: () => true,
         canPrompt: (kind) => kind === 'claude',
+        currentRun: () => null,
+        recallRunOf: () => null,
         ...over,
     });
     const refused = (result: PhoneScheduleResult, reason: string) => expect(result).toMatchObject({ ok: false, reason });
@@ -181,6 +183,8 @@ describe('applyPhoneSchedule', () => {
         recall: (name, kind) => (name === 'hwip-api' && (kind === undefined || kind === 'claude') ? entry : null),
         directoryExists: () => true,
         canPrompt: (kind) => kind === 'claude',
+        currentRun: () => null,
+        recallRunOf: () => null,
         ...over,
     });
     const create = (over: Record<string, unknown> = {}) => ({
@@ -306,5 +310,99 @@ describe('applyPhoneSchedule', () => {
 
     it.each([[undefined], [null], ['create'], [[]], [{}], [{ op: 'pause', id: 'abcdef' }], [{ op: 'Update', id: 'abcdef', maxRuntimeMin: 20 }]])('refuses %j as a request', (request) => {
         refused(applyPhoneSchedule(request, 'hwip-api', deps()), 'schedule_invalid');
+    });
+});
+
+describe('session target wire', () => {
+    const NOW = Date.parse('2026-10-05T00:00:00.000Z');
+    const RUN = '1760000000';
+    const entry = { name: 'hwip-api', cwd: '/work/api', agentKind: 'claude', runId: RUN, lastSeenAt: '2026-10-05T00:00:00.000Z' };
+    const deps = (over: Partial<PhoneScheduleDeps> = {}): PhoneScheduleDeps => ({
+        now: () => NOW,
+        recall: (name) => (name === 'hwip-api' ? entry : null),
+        directoryExists: () => true,
+        canPrompt: (kind) => kind === 'claude',
+        currentRun: (name) => (name === 'hwip-api' ? RUN : null),
+        recallRunOf: (name, runId) => (name === 'hwip-api' && runId === RUN ? entry : null),
+        ...over,
+    });
+    const AT = '2026-10-05T06:00:00.000Z';
+    const create = (over: Record<string, unknown> = {}) => ({ op: 'create', target: 'session', when: { kind: 'once', at: AT }, prompt: 'carry on', ...over });
+    const refused = (result: PhoneScheduleResult, reason: string) => expect(result).toMatchObject({ ok: false, reason });
+
+    it('creates a schedule into the addressed session, bound to the run it holds now', () => {
+        expect(applyPhoneSchedule(create(), 'hwip-api', deps())).toEqual({ ok: true });
+        const [saved] = listSchedules().schedules;
+        expect(saved).toMatchObject({
+            source: 'phone', target: 'session', runId: RUN, session: 'hwip-api', agentKind: 'claude', cwd: '/work/api',
+            prompt: 'carry on', when: { kind: 'once', at: AT },
+        });
+        expect(saved!.label).toBe(`sched-${saved!.id}`);
+    });
+
+    it('refuses a session that is not running as unknown_session, and a tmux that does not answer as schedule_failed', () => {
+        refused(applyPhoneSchedule(create(), 'hwip-api', deps({ currentRun: () => null })), 'unknown_session');
+        refused(applyPhoneSchedule(create(), 'hwip-api', deps({ currentRun: () => undefined })), 'schedule_failed');
+        refused(applyPhoneSchedule(create(), 'hwip-api', deps({ recallRunOf: () => null })), 'unknown_session');
+        expect(listSchedules().schedules).toEqual([]);
+    });
+
+    it('takes a run time and ignores it: the apps send one, and a session target has no cap', () => {
+        expect(applyPhoneSchedule(create({ maxRuntimeMin: 30 }), 'hwip-api', deps())).toEqual({ ok: true });
+        expect(listSchedules().schedules[0]!.maxRuntimeMin).toBe(120);
+    });
+
+    it('answers schedule_failed, not unknown_session, when this machine cannot read its own record of sessions', () => {
+        refused(applyPhoneSchedule(create(), 'hwip-api', deps({ recallRunOf: () => 'unreadable' })), 'schedule_failed');
+    });
+
+    it('refuses a target it does not know, an agent without an idle rule, and a time that has passed', () => {
+        refused(applyPhoneSchedule(create({ target: 'new' }), 'hwip-api', deps()), 'schedule_invalid');
+        refused(applyPhoneSchedule(create(), 'hwip-api', deps({ canPrompt: () => false })), 'schedule_invalid');
+        refused(applyPhoneSchedule(create({ when: { kind: 'once', at: '2026-10-04T00:00:00.000Z' } }), 'hwip-api', deps()), 'schedule_invalid');
+        expect(listSchedules().schedules).toEqual([]);
+    });
+
+    it('takes the target on create only, and an update with the run time the apps always send', () => {
+        applyPhoneSchedule(create(), 'hwip-api', deps());
+        const { id } = listSchedules().schedules[0]!;
+        refused(applyPhoneSchedule({ op: 'update', id, target: 'session' }, 'hwip-api', deps()), 'schedule_invalid');
+        const when = { kind: 'every', minutes: 30 };
+        expect(applyPhoneSchedule({ op: 'update', id, when, prompt: 'new words', maxRuntimeMin: 120 }, 'hwip-api', deps())).toEqual({ ok: true });
+        expect(listSchedules().schedules[0]).toMatchObject({ when, prompt: 'new words', maxRuntimeMin: 120, target: 'session' });
+    });
+
+    it('lists the target, the run and whether that run has ended, asking tmux for names once', () => {
+        put('aaaaaa', { target: 'session', runId: RUN, session: 'hwip-api', prompt: 'a' });
+        put('bbbbbb', { target: 'session', runId: '1760000001', session: 'hwip-web', prompt: 'b' });
+        put('cccccc');
+        const calls = { names: 0, runIdOf: 0 };
+        const tmux = {
+            names: () => { calls.names += 1; return ['hwip-api']; },
+            runIdOf: (name: string) => { calls.runIdOf += 1; return name === 'hwip-api' ? RUN : null; },
+        };
+        const [a, b, c] = phoneScheduleList(NOW, LIST_PROMPT_CHARS, tmux)!.schedules;
+        expect(a).toMatchObject({ target: 'session', runId: RUN });
+        expect(a!.sessionEnded).toBeUndefined();
+        expect(b).toMatchObject({ target: 'session', runId: '1760000001', sessionEnded: true });
+        expect(c!.target).toBeUndefined();
+        expect(c!.sessionEnded).toBeUndefined();
+        expect(calls.names).toBe(1);
+    });
+
+    it('says nothing about a run tmux could not find out about', () => {
+        put('aaaaaa', { target: 'session', runId: RUN, session: 'hwip-api', prompt: 'a' });
+        const [a] = phoneScheduleList(NOW, LIST_PROMPT_CHARS, { names: () => null, runIdOf: () => undefined })!.schedules;
+        expect(a!.sessionEnded).toBeUndefined();
+    });
+
+    it('asks tmux once per answer, however many times the prompts are cut to fit', () => {
+        for (const id of ['aaaaaa', 'bbbbbb', 'cccccc', 'dddddd', 'eeeeee', 'ffffff']) {
+            put(id, { target: 'session', runId: RUN, session: 'hwip-api', prompt: 'x'.repeat(3900) });
+        }
+        const calls = { names: 0 };
+        const answer = scheduleAnswer(NOW, 'req-1', '2026-10-05T00:00:00.000Z', { names: () => { calls.names += 1; return []; }, runIdOf: () => null });
+        expect(answer.ok).toBe(true);
+        expect(calls.names).toBe(1);
     });
 });

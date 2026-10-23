@@ -61,6 +61,7 @@ import {
     continuedRunId,
     forgetSession,
     knownSessions,
+    liveSessionOfRun,
     recallRun,
     runKey,
     recallSession,
@@ -127,18 +128,18 @@ import { createLanTransfer, type LanTransfer } from './lan-transfer.js';
 import { createDeviceKeyRegistration, type DeviceKeyRegistration } from './device-presence.js';
 import { PAYLOAD_LIMIT_BYTES, scanAgentCommands, type AgentCommandCatalog, type ScanResult } from './command-scan.js';
 import { hashListenerId, readMachineId, readStickyListenerId, rememberListenerId } from './listener-device-id.js';
-import { createPaneFitter, macosLastKeyAt, releaseStaleFits } from './pane-fit.js';
+import { createPaneFitter, lastClientUse, macosLastKeyAt, releaseStaleFits } from './pane-fit.js';
 import { log, silenceListenerLog } from './listener-log.js';
 import { invalidateTmuxSocketCache, tmuxArgs } from './tmux-socket.js';
 import {
     detectRemoteAgent, FIELD_SEP, isSubagentSessionName, readPaneInfo, recordSubagentTranscripts, recordTargets,
     subagentTranscriptFor, tmuxTargetFor, type PaneInfo,
 } from './tmux-pane.js';
-import { liveRunIdOf, liveSessionNames, sessionExists, sessionLiveness } from './tmux-liveness.js';
+import { liveRunIdOf, liveSessionNames, liveTmuxRuns, sessionExists, sessionLiveness } from './tmux-liveness.js';
 import { familyNames } from './wrapper.js';
 import { noteRunSeqs, runSeqsByRun, runSeqsKey, type RunSeqs } from './run-seqs.js';
 import { FlagValueError, flagOn } from './args.js';
-import { listSchedules, readScheduleState, writeScheduleState } from './schedule.js';
+import { listSchedules, readScheduleState, removeSchedule, writeScheduleState } from './schedule.js';
 import { launchHwip } from './schedule-launch.js';
 import { applyPhoneSchedule, livePhoneScheduleDeps, scheduleAnswer, type PhoneScheduleDeps } from './schedule-remote.js';
 import { createScheduleRunner, notifyFailureOutcome, PROMPT_POLL_MS, TICK_MS as SCHEDULE_TICK_MS, type NotifyOutcome, type ScheduleRunnerDeps } from './schedule-runner.js';
@@ -875,8 +876,10 @@ const worktreeCleanup = createWorktreeCleanup({
     tmux: (args, timeoutMs) => tmuxRun(tmuxArgs(args), timeoutMs),
 });
 
+/** The desktop's key clock (pane-fit.ts): a mouse move over a session's terminal is not someone typing. */
+const desktopKeyClock = macosLastKeyAt();
 /** Sizes a watched window to its viewer while the phone is its latest user (pane-fit.ts). */
-const paneFitter = createPaneFitter(runTmux, undefined, macosLastKeyAt());
+const paneFitter = createPaneFitter(runTmux, undefined, desktopKeyClock);
 /** Test hook. */
 export const resetPaneFitClaims = (): void => paneFitter.forgetClaims();
 /** How often fitted windows are checked for a desktop that took them back; idle windows cost nothing. */
@@ -6880,6 +6883,9 @@ export const liveScheduleRunnerDeps = (notify: ScheduleRunnerDeps['notify']): Sc
         );
     },
     notify,
+    sessionOfRun: (runId, lastName, boundAt) => liveSessionOfRun(runId, lastName, liveTmuxRuns, Date.now(), boundAt),
+    lastClientActivity: (session) => lastClientUse(runTmux, session, desktopKeyClock),
+    removeSchedule,
 });
 
 export const handleListener = async (args: Record<string, string | boolean>): Promise<number> => {

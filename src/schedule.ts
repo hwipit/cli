@@ -2,8 +2,8 @@
  * Scheduled sessions (F8): what a schedule is, when it comes due, and the files it lives in.
  *
  * A schedule is one file, `<stateDir>/schedules/<id>.json` (0600). `hwip schedule` writes and
- * deletes them, the listener only reads them, and nothing reads-then-rewrites a file, so the two
- * never lose each other's change. What the listener has done about each one lives in its own file
+ * deletes them, the listener only reads them — except a `once` schedule that has run, which the listener
+ * deletes — and nothing reads-then-rewrites a file, so the two never lose each other's change. What the listener has done about each one lives in its own file
  * (`schedule-state.json`, `schedule-runner.ts`).
  *
  * Everything here is pure or touches only that directory. The clock is a parameter.
@@ -18,7 +18,9 @@ import { replaceFile } from './replace-file.js';
 
 export type ScheduleWhen =
     | { kind: 'daily'; at: string; days: number[] }
-    | { kind: 'every'; minutes: number };
+    | { kind: 'every'; minutes: number }
+    /** Runs one time, at `at` (an ISO 8601 instant), and is removed after (`schedule-runner.ts`). */
+    | { kind: 'once'; at: string };
 
 export interface Schedule {
     v: 1;
@@ -33,8 +35,18 @@ export interface Schedule {
     cwd: string;
     /** Passed to `hwip <agent> --label`; the default is `sched-<id>`. */
     label: string;
-    /** The tmux session the launch will create, worked out when the schedule is made. */
+    /**
+     * The tmux session the launch will create, worked out when the schedule is made. For a `target: 'session'` schedule,
+     * the session the run was in when the schedule was made: where the runner looks for it first.
+     */
     session: string;
+    /**
+     * `session`: no session is started; at its time the prompt is typed into the run `runId` is, wherever it goes on
+     * (`liveSessionOfRun`). Absent: a new session is started (`hwip <agent> --detach`). Fixed once made.
+     */
+    target?: 'session';
+    /** The run (hwip docs/session-runs.md) a `target: 'session'` schedule types into, and only with it. */
+    runId?: string;
     /** `--wt <branch>`. From the command line only. */
     wt?: string;
     /** Arguments after `--`. From the command line only. */
@@ -43,6 +55,13 @@ export interface Schedule {
     when: ScheduleWhen;
     maxRuntimeMin: number;
 }
+
+/**
+ * Advertised in the listener's presence (`device-presence.ts`): this build runs `once` schedules and schedules into a
+ * session (`target: 'session'`). An older listener refuses both as fields it does not know, so the apps offer them only
+ * to a computer that lists this.
+ */
+export const SCHEDULE_SESSION_CAPABILITY = 'schedule-session-v1';
 
 export type Checked<T> = { ok: true; value: T } | { ok: false; error: string };
 
@@ -73,6 +92,9 @@ const DAY_NUMBER: Readonly<Record<string, number>> = Object.fromEntries(DAY_NAME
 export const ALL_DAYS: readonly number[] = [0, 1, 2, 3, 4, 5, 6];
 export const WEEKDAYS: readonly number[] = [1, 2, 3, 4, 5];
 const AT_TIME = /^([01]\d|2[0-3]):([0-5]\d)$/;
+const ON_DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
+/** An instant with its offset: a time without one would move with the machine's time zone. */
+const AT_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?(Z|[+-]\d{2}:\d{2})$/;
 
 const parseDays = (raw: string): Checked<number[]> => {
     const word = raw.trim().toLowerCase();
@@ -103,9 +125,30 @@ const parseEvery = (raw: string): Checked<number> => {
     return { ok: true, value: minutes };
 };
 
-/** `--at HH:MM [--days …]` or `--every <N>m|<N>h`, not both and not neither. */
-export const parseWhen = (input: { at?: string; days?: string; every?: string }): Checked<ScheduleWhen> => {
-    const { at, days, every } = input;
+/** `--on YYYY-MM-DD` and `--at HH:MM` as the instant that local date and time is. */
+const parseOnce = (on: string, at: string | undefined): Checked<ScheduleWhen> => {
+    if (at === undefined) return fail('--on needs --at HH:MM');
+    if (!AT_TIME.test(at.trim())) return fail(`--at takes a 24-hour local time like 09:00 (got '${at}')`);
+    const date = ON_DATE.exec(on.trim());
+    const [year, month, day] = date ? [Number(date[1]), Number(date[2]) - 1, Number(date[3])] : [0, 0, 0];
+    const [hour, minute] = at.trim().split(':').map(Number);
+    const local = new Date(year, month, day, hour, minute);
+    // `Date` rolls an impossible day (Feb 30) into the next month; that is not the day that was asked for.
+    if (!date || local.getFullYear() !== year || local.getMonth() !== month || local.getDate() !== day) {
+        return fail(`--on takes a date like 2026-10-24 (got '${on}')`);
+    }
+    // And a time the clocks skip (spring forward) into the next hour.
+    if (local.getHours() !== hour || local.getMinutes() !== minute) return fail(`${on} ${at.trim()} does not exist here: the clocks skip it`);
+    return { ok: true, value: { kind: 'once', at: local.toISOString() } };
+};
+
+/** `--at HH:MM [--days …]`, `--on YYYY-MM-DD --at HH:MM` or `--every <N>m|<N>h`, one of them and not neither. */
+export const parseWhen = (input: { at?: string; days?: string; every?: string; on?: string }): Checked<ScheduleWhen> => {
+    const { at, days, every, on } = input;
+    if (on !== undefined) {
+        if (days !== undefined || every !== undefined) return fail('--on cannot be combined with --days or --every');
+        return parseOnce(on, at);
+    }
     if (every !== undefined) {
         if (at !== undefined || days !== undefined) return fail('--every cannot be combined with --at or --days');
         const minutes = parseEvery(every);
@@ -157,6 +200,10 @@ const timeOnDay = (when: Extract<ScheduleWhen, { kind: 'daily' }>, day: Date): n
 export const occurrencesBetween = (when: ScheduleWhen, after: number, until: number, anchor: number): Occurrences => {
     // A cursor read from a damaged state file may not be a number; the day walk below would never end on one.
     if (!Number.isFinite(after) || !Number.isFinite(until) || until <= after) return { count: 0, latest: null };
+    if (when.kind === 'once') {
+        const at = Date.parse(when.at);
+        return at > after && at <= until ? { count: 1, latest: at } : { count: 0, latest: null };
+    }
     if (when.kind === 'every') {
         const period = when.minutes * 60_000;
         const upTo = periodsSince(anchor, period, until);
@@ -178,8 +225,12 @@ export const occurrencesBetween = (when: ScheduleWhen, after: number, until: num
     return { count, latest };
 };
 
-/** The first time after `after` the schedule comes due; null for a `daily` with no days (a file `validateSchedule` would refuse). */
+/** The first time after `after` the schedule comes due; null for a `once` that is past and a `daily` with no days (a file `validateSchedule` would refuse). */
 export const nextOccurrence = (when: ScheduleWhen, after: number, anchor: number): number | null => {
+    if (when.kind === 'once') {
+        const at = Date.parse(when.at);
+        return at > after ? at : null;
+    }
     if (when.kind === 'every') {
         const period = when.minutes * 60_000;
         return anchor + (periodsSince(anchor, period, after) + 1) * period;
@@ -196,7 +247,9 @@ export const nextOccurrence = (when: ScheduleWhen, after: number, anchor: number
 const SCHEDULE_ID = /^[a-z0-9]{6}$/;
 const LABEL = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const AGENT_KIND = /^[A-Za-z0-9_-]{1,32}$/;
-const KEYS = new Set(['v', 'id', 'createdAt', 'updatedAt', 'source', 'agentKind', 'cwd', 'label', 'session', 'wt', 'agentArgs', 'prompt', 'when', 'maxRuntimeMin']);
+const KEYS = new Set(['v', 'id', 'createdAt', 'updatedAt', 'source', 'agentKind', 'cwd', 'label', 'session', 'target', 'runId', 'wt', 'agentArgs', 'prompt', 'when', 'maxRuntimeMin']);
+/** A tmux `session_created`, as the registry keeps a run id. */
+const RUN_ID = /^\d{1,12}$/;
 
 export const isScheduleId = (value: unknown): value is string => typeof value === 'string' && SCHEDULE_ID.test(value);
 
@@ -221,7 +274,12 @@ const checkWhen = (raw: unknown): string | null => {
         if (Object.keys(raw).some((k) => k !== 'kind' && k !== 'minutes')) return 'when has a field it does not know';
         return isInt(raw.minutes, MIN_EVERY_MIN, MAX_EVERY_MIN) ? null : `when.minutes must be a whole number of at least ${MIN_EVERY_MIN}`;
     }
-    if (raw.kind !== 'daily') return "when.kind must be 'daily' or 'every'";
+    if (raw.kind === 'once') {
+        if (Object.keys(raw).some((k) => k !== 'kind' && k !== 'at')) return 'when has a field it does not know';
+        const wellFormed = typeof raw.at === 'string' && AT_INSTANT.test(raw.at) && Number.isFinite(Date.parse(raw.at));
+        return wellFormed ? null : 'when.at must be an ISO 8601 time with its offset';
+    }
+    if (raw.kind !== 'daily') return "when.kind must be 'daily', 'every' or 'once'";
     if (Object.keys(raw).some((k) => k !== 'kind' && k !== 'at' && k !== 'days')) return 'when has a field it does not know';
     if (typeof raw.at !== 'string' || !AT_TIME.test(raw.at)) return 'when.at must be HH:MM';
     const days = raw.days;
@@ -238,7 +296,7 @@ export const validateSchedule = (input: unknown): Checked<Schedule> => {
     if (!isRecord(input)) return fail('a schedule must be an object');
     const unknownKey = Object.keys(input).find((k) => !KEYS.has(k));
     if (unknownKey !== undefined) return fail(`schedule has a field it does not know: ${unknownKey}`);
-    const { v, id, createdAt, updatedAt, source, agentKind, cwd, label, session, wt, agentArgs, prompt, when, maxRuntimeMin } = input;
+    const { v, id, createdAt, updatedAt, source, agentKind, cwd, label, session, target, runId, wt, agentArgs, prompt, when, maxRuntimeMin } = input;
 
     if (v !== 1) return fail('schedule.v must be 1');
     if (!isScheduleId(id)) return fail('schedule.id must be 6 lowercase letters or digits');
@@ -270,11 +328,22 @@ export const validateSchedule = (input: unknown): Checked<Schedule> => {
     }
     if (source === 'phone' && prompt === undefined) return fail('a schedule from the phone needs a prompt');
 
+    if (target !== undefined && target !== 'session') return fail("schedule.target must be 'session' when given");
+    if (target === 'session') {
+        if (typeof runId !== 'string' || !RUN_ID.test(runId)) return fail('schedule.runId must be the run the session target types into');
+        if (prompt === undefined) return fail('a schedule into a session needs a prompt');
+        if (wt !== undefined) return fail('a schedule into a session carries no wt');
+        if (agentArgs !== undefined) return fail('a schedule into a session carries no agentArgs');
+    } else if (runId !== undefined) {
+        return fail("schedule.runId belongs to target 'session' only");
+    }
+
     const badWhen = checkWhen(when);
     if (badWhen) return fail(badWhen);
     const checkedWhen = when as ScheduleWhen; // checkWhen accepted its shape
     if (!isInt(maxRuntimeMin, MIN_MAX_RUNTIME_MIN, MAX_MAX_RUNTIME_MIN)) return fail(`schedule.maxRuntimeMin must be ${MIN_MAX_RUNTIME_MIN} to ${MAX_MAX_RUNTIME_MIN}`);
-    if (checkedWhen.kind === 'every' && maxRuntimeMin > checkedWhen.minutes) return fail('schedule.maxRuntimeMin cannot be longer than the --every period');
+    // A session target has no runtime cap (the session is not the schedule's): its `maxRuntimeMin` bounds nothing.
+    if (checkedWhen.kind === 'every' && target !== 'session' && maxRuntimeMin > checkedWhen.minutes) return fail('schedule.maxRuntimeMin cannot be longer than the --every period');
 
     // Every field of `Schedule` was checked above; `input` is a record, which TypeScript cannot narrow field by field.
     return { ok: true, value: input as unknown as Schedule };
@@ -358,6 +427,9 @@ export const addSchedule = (make: (id: string) => Schedule, newId: () => string 
         const schedule = make(id);
         const checked = validateSchedule(schedule);
         if (!checked.ok) return { ok: false, error: checked.error };
+        // A `once` made after its time would never run: the runner counts from `createdAt`.
+        const past = pastWhen(schedule.when, Date.parse(schedule.createdAt));
+        if (past) return { ok: false, error: past };
         if (schedule.id !== id) return { ok: false, error: 'schedule.id is not the id it was made for' };
         try {
             mkdirHandedBack(schedulesDir(), 0o700);
@@ -407,6 +479,8 @@ export const updateSchedule = (id: string, change: UncheckedScheduleChange, now:
     const retimed = change.when !== undefined && JSON.stringify(change.when) !== JSON.stringify(current.when);
     const checked = validateSchedule({ ...current, ...change, ...(retimed ? { updatedAt: new Date(now).toISOString() } : {}) });
     if (!checked.ok) return { ok: false, error: checked.error, failure: 'invalid' };
+    const past = retimed ? pastWhen(checked.value.when, now) : null;
+    if (past) return { ok: false, error: past, failure: 'invalid' };
     try {
         replaceFile(schedulePath(id), `${JSON.stringify(checked.value, null, 2)}\n`, undefined, 0o600);
         return { ok: true, schedule: checked.value };
@@ -414,6 +488,10 @@ export const updateSchedule = (id: string, change: UncheckedScheduleChange, now:
         return { ok: false, error: `could not write the schedule: ${err instanceof Error ? err.message : String(err)}`, failure: 'io' };
     }
 };
+
+/** Why `when` cannot be given to a schedule at `now`: a `once` whose time has passed would never run. Null when it can. */
+export const pastWhen = (when: ScheduleWhen, now: number): string | null =>
+    when.kind === 'once' && Date.parse(when.at) <= now ? 'that time has already passed' : null;
 
 /** The time a schedule's runs are counted from: its last edit, else its creation. */
 export const scheduleAnchor = (schedule: Schedule): number => Date.parse(schedule.updatedAt ?? schedule.createdAt);
@@ -436,6 +514,8 @@ export const removeSchedule = (id: string): RemoveResult => {
 
 const SCHEDULE_OUTCOMES = [
     'started', 'missed', 'overlap', 'busy', 'start_failed', 'missing_directory', 'unknown_agent', 'prompt_undelivered', 'prompt_unsupported', 'capped',
+    // A session target only: the run stayed busy past the wait, or it is over.
+    'session_busy', 'session_ended',
 ] as const;
 export type ScheduleOutcome = (typeof SCHEDULE_OUTCOMES)[number];
 
@@ -445,6 +525,11 @@ export interface ScheduleRunState {
     cursor: number;
     /** `capped`: the runtime cap passed and the session was asked to end; it keeps counting as running until it is gone. */
     running?: { session: string; startedAt: number; promptPending: boolean; capped?: true };
+    /**
+     * A session target whose time came and whose prompt waits for its session to be idle. `session` is where the run was
+     * last seen; `since` is when the wait began, and the wait is given up on 30 minutes after it (`schedule-runner.ts`).
+     */
+    delivering?: { session: string; since: number };
     last?: { outcome: ScheduleOutcome; at: number };
     /** Results not yet told to the person, by reason, and when the first of them was added. */
     pending?: { since: number; counts: Partial<Record<ScheduleOutcome, number>> };
@@ -467,9 +552,12 @@ const isNumber = (value: unknown): value is number => typeof value === 'number' 
 const readRunState = (raw: unknown): ScheduleRunState | null => {
     if (!isRecord(raw) || !isNumber(raw.cursor)) return null;
     const state: ScheduleRunState = { cursor: raw.cursor };
-    const { running, last, pending } = raw;
+    const { running, delivering, last, pending } = raw;
     if (isRecord(running) && isSessionName(running.session) && isNumber(running.startedAt) && typeof running.promptPending === 'boolean') {
         state.running = { session: running.session, startedAt: running.startedAt, promptPending: running.promptPending, ...(running.capped === true ? { capped: true as const } : {}) };
+    }
+    if (isRecord(delivering) && isSessionName(delivering.session) && isNumber(delivering.since)) {
+        state.delivering = { session: delivering.session, since: delivering.since };
     }
     if (isRecord(last) && isOutcome(last.outcome) && isNumber(last.at)) state.last = { outcome: last.outcome, at: last.at };
     if (isRecord(pending) && isNumber(pending.since) && isRecord(pending.counts)) {

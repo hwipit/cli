@@ -23,12 +23,15 @@
  *
  * The same frame says what this build opens (`capabilities`): a sender seals
  * a file in chunks only for a device that lists `file-chunk-v1`, and one over
- * the relay's ceiling over LAN only to one that lists `lan-large-v1`. In one frame
+ * the relay's ceiling over LAN only to one that lists `lan-large-v1`; an app
+ * offers `once` schedules and schedules into a session only to one that lists
+ * `schedule-session-v1`. In one frame
  * with the key, because a server from before `capabilities` answers a frame
  * that carries nothing else it knows with an error.
  */
 import { FILE_CHUNK_CAPABILITY } from './file-crypto.js';
 import { LAN_LARGE_CAPABILITY } from './lan-receiver.js';
+import { SCHEDULE_SESSION_CAPABILITY } from './schedule.js';
 
 /** The one message both halves of presence ride; the server answers
  *  `listener.presence.ack` or `listener.presence.error`. */
@@ -56,7 +59,7 @@ export const createDeviceKeyRegistration = (deps: DeviceKeyRegistrationDeps): De
     const register = async (): Promise<boolean> => {
         try {
             const publicKey = await deps.publicKey();
-            const sent = deps.send({ type: LISTENER_PRESENCE, data: { publicKey, capabilities: [FILE_CHUNK_CAPABILITY, LAN_LARGE_CAPABILITY] } });
+            const sent = deps.send({ type: LISTENER_PRESENCE, data: { publicKey, capabilities: [FILE_CHUNK_CAPABILITY, LAN_LARGE_CAPABILITY, SCHEDULE_SESSION_CAPABILITY] } });
             if (!sent) deps.log('device key: not registered — no connection right now, retried at the next open');
             return sent;
         } catch (err) {

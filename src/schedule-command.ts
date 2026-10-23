@@ -16,6 +16,7 @@ import {
     nextOccurrence,
     parseDuration,
     parseWhen,
+    pastWhen,
     readScheduleState,
     removeSchedule,
     scheduleAnchor,
@@ -32,6 +33,8 @@ import { checkoutOf, VERSION } from './config.js';
 import { runningListenerPid, runningListenerVersion } from './listener-process.js';
 import { findAgentBySubcommand, REMOTE_AGENTS } from './remote-agents.js';
 import { promptableScheduleKinds } from './schedule-ready.js';
+import { recallSession } from './session-registry.js';
+import { liveRunOf } from './tmux-liveness.js';
 import { detectProjectDir, ensureListenerRunning, listenerVersionDrifted, safeBasename, sanitizeLabel, tmuxSessionName } from './wrapper.js';
 import { isValidBranchName, worktreeDirName } from './worktree.js';
 
@@ -51,12 +54,21 @@ export interface ScheduleCommandDeps {
      * False when one still runs after it.
      */
     refreshListener: () => Promise<boolean>;
+    /** The running session `name` as a schedule types into it: its agent, directory and current run; why not, when it is not running. */
+    sessionTarget: (name: string) => Checked<SessionTarget>;
     out: (line: string) => void;
     err: (line: string) => void;
 }
 
-const USAGE = "usage: hwip schedule add <agent> (--at HH:MM [--days daily|weekdays|mon,wed,…] | --every <N>m|<N>h) [--prompt <text>] [--label <x>] [--wt <branch>] [--max-runtime <N>m|<N>h] [-- <agent args…>]\n"
-    + '       hwip schedule edit <id> [--at HH:MM] [--days …] [--every <N>m|<N>h] [--prompt <text>] [--max-runtime <N>m|<N>h]\n'
+export interface SessionTarget {
+    agentKind: string;
+    cwd: string;
+    runId: string;
+}
+
+const USAGE = "usage: hwip schedule add <agent> (--at HH:MM [--days daily|weekdays|mon,wed,…] | --on YYYY-MM-DD --at HH:MM | --every <N>m|<N>h) [--prompt <text>] [--label <x>] [--wt <branch>] [--max-runtime <N>m|<N>h] [-- <agent args…>]\n"
+    + '       hwip schedule add --session <name> (--at HH:MM [--days …] | --on YYYY-MM-DD --at HH:MM | --every <N>m|<N>h) --prompt <text>\n'
+    + '       hwip schedule edit <id> [--at HH:MM] [--days …] [--on YYYY-MM-DD] [--every <N>m|<N>h] [--prompt <text>] [--max-runtime <N>m|<N>h]\n'
     + '       hwip schedule [list] [--json]\n'
     + '       hwip schedule rm <id>';
 
@@ -72,8 +84,17 @@ const flagText = (flags: Flags, name: string): Checked<string | undefined> => {
     return { ok: true, value };
 };
 
-/** `daily 09:00`, `weekdays 09:00`, `mon,wed 09:00`, `every 30m`, `every 2h`. */
+const pad2 = (n: number): string => String(n).padStart(2, '0');
+
+const formatTime = (ms: number): string => {
+    if (!Number.isFinite(new Date(ms).getTime())) return '-';
+    const d = new Date(ms);
+    return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+};
+
+/** `daily 09:00`, `weekdays 09:00`, `mon,wed 09:00`, `every 30m`, `every 2h`, `once 2026-10-24 09:00` (local time). */
 export const describeWhen = (when: ScheduleWhen): string => {
+    if (when.kind === 'once') return `once ${formatTime(Date.parse(when.at))}`;
     if (when.kind === 'every') return when.minutes % 60 === 0 ? `every ${when.minutes / 60}h` : `every ${when.minutes}m`;
     const days = when.days.join(',');
     const label = days === ALL_DAYS.join(',') ? 'daily' : days === WEEKDAYS.join(',') ? 'weekdays' : when.days.map((d) => DAY_NAMES[d]).join(',');
@@ -85,6 +106,61 @@ interface Built {
     agentName: string;
 }
 
+/**
+ * `hwip schedule add --session <name> …`: a schedule that types its prompt into a session already running, bound to the
+ * run it holds now. Everything that would shape a new session (an agent, `--wt`, `--label`, a runtime cap, agent
+ * arguments) has no meaning for it and is refused rather than ignored.
+ */
+const buildSessionSchedule = (flags: Flags, agentArgs: string[], deps: ScheduleCommandDeps): Checked<Built> => {
+    const name = flagText(flags, 'session');
+    if (!name.ok) return name;
+    if (flags._command) return { ok: false, error: `--session types into a session already running: give no agent ('${String(flags._command)}')` };
+    if (agentArgs.length > 0) return { ok: false, error: '--session takes no agent arguments: the session is already running' };
+    const fixed = ['wt', 'label', 'max-runtime'].find((flag) => flags[flag] !== undefined);
+    if (fixed) return { ok: false, error: `--${fixed} cannot be combined with --session: the session is already running` };
+
+    const read = (flag: string): Checked<string | undefined> => flagText(flags, flag);
+    const [at, days, every, on, prompt] = ['at', 'days', 'every', 'on', 'prompt'].map(read);
+    const bad = [at, days, every, on, prompt].find((r) => !r.ok);
+    if (bad && !bad.ok) return bad;
+    const value = (r: Checked<string | undefined>): string | undefined => (r.ok ? r.value : undefined);
+
+    const when = parseWhen({ at: value(at), days: value(days), every: value(every), on: value(on) });
+    if (!when.ok) return when;
+    const past = pastWhen(when.value, deps.now());
+    if (past) return { ok: false, error: `--on ${value(on)} --at ${value(at)}: ${past}` };
+    const text = value(prompt);
+    if (text === undefined || text.trim() === '') return { ok: false, error: '--session needs --prompt: the prompt is what it types into the session' };
+
+    const session = name.value ?? '';
+    const target = deps.sessionTarget(session);
+    if (!target.ok) return target;
+    const { agentKind, cwd, runId } = target.value;
+    if (!deps.promptKinds().includes(agentKind)) {
+        return { ok: false, error: `${agentKind} cannot take a scheduled --prompt: hwip has no rule that tells when it is idle, and a prompt typed into a dialog would answer it` };
+    }
+    const createdAt = new Date(deps.now()).toISOString();
+    const make = (id: string): Schedule => ({
+        v: 1,
+        id,
+        createdAt,
+        source: 'cli',
+        agentKind,
+        cwd,
+        label: `sched-${id}`,
+        session,
+        target: 'session',
+        runId,
+        prompt: text,
+        when: when.value,
+        // Kept for the file's shape; a session target has no runtime cap (the session is not the schedule's).
+        maxRuntimeMin: defaultMaxRuntimeMin(when.value),
+    });
+    const probe = validateSchedule(make('aaaaaa'));
+    const agentName = REMOTE_AGENTS.find((a) => a.kind === agentKind)?.displayName ?? agentKind;
+    return probe.ok ? { ok: true, value: { make, agentName } } : probe;
+};
+
 /** The schedule `hwip schedule add <words>` asks for, before it has an id. */
 export const buildSchedule = async (words: string[], deps: ScheduleCommandDeps): Promise<Checked<Built>> => {
     const cut = words.indexOf('--');
@@ -92,6 +168,7 @@ export const buildSchedule = async (words: string[], deps: ScheduleCommandDeps):
     const agentArgs = cut < 0 ? [] : words.slice(cut + 1);
     // `parseArgs` reads the words after the program name and script; the first word is the agent.
     const flags = parseArgs(['node', 'hwip', ...own]);
+    if (flags.session !== undefined) return buildSessionSchedule(flags, agentArgs, deps);
     const agentWord = String(flags._command);
     if (!agentWord) return { ok: false, error: 'schedule add needs an agent (hwip cc, codex, …)' };
     const agent = findAgentBySubcommand(agentWord);
@@ -99,13 +176,15 @@ export const buildSchedule = async (words: string[], deps: ScheduleCommandDeps):
     if (flags._arg1) return { ok: false, error: `unexpected word '${String(flags._arg1)}'` };
 
     const read = (name: string): Checked<string | undefined> => flagText(flags, name);
-    const [at, days, every, prompt, label, wt, maxRuntime] = ['at', 'days', 'every', 'prompt', 'label', 'wt', 'max-runtime'].map(read);
-    const bad = [at, days, every, prompt, label, wt, maxRuntime].find((r) => !r.ok);
+    const [at, days, every, on, prompt, label, wt, maxRuntime] = ['at', 'days', 'every', 'on', 'prompt', 'label', 'wt', 'max-runtime'].map(read);
+    const bad = [at, days, every, on, prompt, label, wt, maxRuntime].find((r) => !r.ok);
     if (bad && !bad.ok) return bad;
     const value = (r: Checked<string | undefined>): string | undefined => (r.ok ? r.value : undefined);
 
-    const when = parseWhen({ at: value(at), days: value(days), every: value(every) });
+    const when = parseWhen({ at: value(at), days: value(days), every: value(every), on: value(on) });
     if (!when.ok) return when;
+    const past = pastWhen(when.value, deps.now());
+    if (past) return { ok: false, error: `--on ${value(on)} --at ${value(at)}: ${past}` };
     if (value(prompt) !== undefined && value(prompt)!.trim() === '') return { ok: false, error: '--prompt must not be empty' };
     if (value(prompt) !== undefined && !deps.promptKinds().includes(agent.kind)) {
         const names = REMOTE_AGENTS.filter((a) => deps.promptKinds().includes(a.kind)).map((a) => a.subcommands[0]).join(', ');
@@ -167,18 +246,18 @@ export const buildSchedule = async (words: string[], deps: ScheduleCommandDeps):
 /** An ISO date, or null for a time outside what a Date holds (a damaged or hand-edited file). */
 const isoOrNull = (ms: number | null): string | null => (ms !== null && Number.isFinite(new Date(ms).getTime()) ? new Date(ms).toISOString() : null);
 
-const formatTime = (ms: number): string => {
-    if (!Number.isFinite(new Date(ms).getTime())) return '-';
-    const d = new Date(ms);
-    const pad = (n: number): string => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-};
-
 const handleAdd = async (words: string[], json: boolean, deps: ScheduleCommandDeps): Promise<number> => {
     const built = await buildSchedule(words, deps);
     if (!built.ok) {
         deps.err(`hwip schedule: ${built.error}`);
         return 2;
+    }
+    // A listener older than `once` and session targets would skip the file, and the schedule would never run.
+    const probe = built.value.make('aaaaaa');
+    const needsNewListener = probe.when.kind === 'once' || probe.target === 'session';
+    if (needsNewListener && deps.listenerRunning() && !(await deps.refreshListener())) {
+        deps.err('hwip schedule: the listener running is an older hwip that could not be replaced, and it would not run this schedule: restart it, then add again');
+        return 1;
     }
     const added = addSchedule(built.value.make);
     if (!added.ok) {
@@ -189,6 +268,9 @@ const handleAdd = async (words: string[], json: boolean, deps: ScheduleCommandDe
     const next = nextOccurrence(schedule.when, deps.now(), scheduleAnchor(schedule));
     if (json) {
         deps.out(JSON.stringify({ ...schedule, nextAt: isoOrNull(next) }));
+    } else if (schedule.target === 'session') {
+        deps.out(`scheduled ${schedule.id}: a prompt into session ${schedule.session} (${built.value.agentName}), ${describeWhen(schedule.when)}`
+            + `${next === null ? '' : `, next ${formatTime(next)}`}. It waits up to 30 min for the session to be idle and nobody typing at its terminal.`);
     } else {
         deps.out(`scheduled ${schedule.id}: ${built.value.agentName} in ${safeBasename(schedule.cwd)}, ${describeWhen(schedule.when)}`
             + `${next === null ? '' : `, next ${formatTime(next)}`} (session ${schedule.session}, ends after ${schedule.maxRuntimeMin}m)`);
@@ -213,6 +295,7 @@ const handleList = (json: boolean, deps: ScheduleCommandDeps): number => {
             cwd: schedule.cwd,
             label: schedule.label,
             session: schedule.session,
+            ...(schedule.target === 'session' ? { target: schedule.target, runId: schedule.runId } : {}),
             when: schedule.when,
             maxRuntimeMin: schedule.maxRuntimeMin,
             source: schedule.source,
@@ -231,6 +314,7 @@ const handleList = (json: boolean, deps: ScheduleCommandDeps): number => {
                 describeWhen(schedule.when),
                 `next ${next === null ? '-' : formatTime(next)}`,
                 `last ${last ? `${last.outcome} ${formatTime(last.at)}` : '-'}${running ? ' (running)' : ''}`,
+                ...(schedule.target === 'session' ? [`into ${schedule.session}`] : []),
             ].join('  '));
         }
     }
@@ -271,14 +355,29 @@ export const onStderr = async (work: () => Promise<void>): Promise<void> => {
     }
 };
 
-/** The schedule's new `when` from the flags given: what is not given is kept, so `--at` keeps the days and `--days` the time. */
-const editedWhen = (current: ScheduleWhen, at: string | undefined, days: string | undefined, every: string | undefined): Checked<ScheduleWhen | undefined> => {
-    if (at === undefined && days === undefined && every === undefined) return { ok: true, value: undefined };
+/** The local date (`YYYY-MM-DD`) and time (`HH:MM`) of a `once` schedule, as `--on` and `--at` take them. */
+const onceParts = (when: Extract<ScheduleWhen, { kind: 'once' }>): { on: string; at: string } => {
+    const d = new Date(when.at);
+    return { on: `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`, at: `${pad2(d.getHours())}:${pad2(d.getMinutes())}` };
+};
+
+/**
+ * The schedule's new `when` from the flags given: what is not given is kept, so `--at` keeps the days (or, for a
+ * `once`, the date), `--days` the time and `--on` the time of day.
+ */
+const editedWhen = (current: ScheduleWhen, input: { at?: string; days?: string; every?: string; on?: string }): Checked<ScheduleWhen | undefined> => {
+    const { at, days, every, on } = input;
+    if (at === undefined && days === undefined && every === undefined && on === undefined) return { ok: true, value: undefined };
+    const keptOnce = current.kind === 'once' && days === undefined && every === undefined;
+    if (on !== undefined || keptOnce) {
+        const kept = current.kind === 'once' ? onceParts(current) : undefined;
+        return parseWhen({ on: on ?? kept?.on, at: at ?? kept?.at, days, every });
+    }
     if (every !== undefined || at !== undefined) {
         const keptDays = current.kind === 'daily' ? current.days.map((day) => DAY_NAMES[day]).join(',') : undefined;
         return parseWhen({ at, every, days: days ?? (every === undefined ? keptDays : undefined) });
     }
-    if (current.kind !== 'daily') return { ok: false, error: '--days needs --at HH:MM for a schedule that runs --every' };
+    if (current.kind !== 'daily') return { ok: false, error: `--days needs --at HH:MM for a schedule that runs ${current.kind === 'once' ? 'once' : '--every'}` };
     return parseWhen({ at: current.at, days });
 };
 
@@ -287,12 +386,12 @@ const buildChange = (current: Schedule, flags: Flags, deps: ScheduleCommandDeps)
     const fixed = ['label', 'wt'].find((name) => flags[name] !== undefined);
     if (fixed) return { ok: false, error: `--${fixed} cannot be edited: the session is named for it; remove the schedule and add it again` };
     const read = (name: string): Checked<string | undefined> => flagText(flags, name);
-    const [at, days, every, prompt, maxRuntime] = ['at', 'days', 'every', 'prompt', 'max-runtime'].map(read);
-    const bad = [at, days, every, prompt, maxRuntime].find((r) => !r.ok);
+    const [at, days, every, on, prompt, maxRuntime] = ['at', 'days', 'every', 'on', 'prompt', 'max-runtime'].map(read);
+    const bad = [at, days, every, on, prompt, maxRuntime].find((r) => !r.ok);
     if (bad && !bad.ok) return bad;
     const value = (r: Checked<string | undefined>): string | undefined => (r.ok ? r.value : undefined);
 
-    const when = editedWhen(current.when, value(at), value(days), value(every));
+    const when = editedWhen(current.when, { at: value(at), days: value(days), every: value(every), on: value(on) });
     if (!when.ok) return when;
     const change: ScheduleChange = when.value === undefined ? {} : { when: when.value };
     const text = value(prompt);
@@ -304,11 +403,12 @@ const buildChange = (current: Schedule, flags: Flags, deps: ScheduleCommandDeps)
         change.prompt = text;
     }
     if (value(maxRuntime) !== undefined) {
+        if (current.target === 'session') return { ok: false, error: '--max-runtime does not apply to a schedule into a session: it has no runtime cap' };
         const parsed = parseDuration(value(maxRuntime)!, '--max-runtime', '90m or 2h');
         if (!parsed.ok) return parsed;
         change.maxRuntimeMin = parsed.value;
     }
-    if (Object.keys(change).length === 0) return { ok: false, error: 'edit needs --at, --days, --every, --prompt or --max-runtime' };
+    if (Object.keys(change).length === 0) return { ok: false, error: 'edit needs --at, --days, --on, --every, --prompt or --max-runtime' };
     return { ok: true, value: change };
 };
 
@@ -391,6 +491,15 @@ export const liveScheduleDeps = (): ScheduleCommandDeps => ({
     refreshListener: async () => {
         await onStderr(() => ensureListenerRunning(false));
         return runningListenerPid() === null || !listenerVersionDrifted(runningListenerVersion(), VERSION);
+    },
+    sessionTarget: (name) => {
+        const runId = liveRunOf(name);
+        if (runId === undefined) return { ok: false, error: 'tmux did not answer (or gave an answer hwip could not read), so the session cannot be looked up' };
+        if (runId === null) return { ok: false, error: `${name} is not running ('hwip agent list' shows the sessions)` };
+        // The run as the listener wrote it down: its agent and directory, never a guess from an older run of the name.
+        const known = recallSession(name, Date.now(), runId);
+        if (!known) return { ok: false, error: `${name} is not a session the listener has seen: one hwip did not start, or one started moments ago (try again in a minute)` };
+        return { ok: true, value: { agentKind: known.agentKind, cwd: known.cwd, runId } };
     },
     out: (line) => console.log(line),
     err: (line) => console.error(line),

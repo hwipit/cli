@@ -31,7 +31,14 @@ describe('createDeviceKeyRegistration', () => {
     it('sends the public key and what this build opens, and nothing else, on the presence message', async () => {
         const h = harness();
         expect(await h.reg.onOpen()).toBe(true);
-        expect(h.sent).toEqual([{ type: LISTENER_PRESENCE, data: { publicKey: 'PUBKEY', capabilities: ['file-chunk-v1', 'lan-large-v1'] } }]);
+        expect(h.sent).toEqual([{ type: LISTENER_PRESENCE, data: { publicKey: 'PUBKEY', capabilities: ['file-chunk-v1', 'lan-large-v1', 'schedule-session-v1'] } }]);
+    });
+
+    // The apps show "into this session" and "once" only to a listener that can run them: an older one refuses both.
+    it('advertises schedules into a session and once (session target wire)', async () => {
+        const h = harness();
+        await h.reg.onOpen();
+        expect(h.sent[0]).toMatchObject({ data: { capabilities: expect.arrayContaining(['schedule-session-v1']) } });
     });
 
     it('registers again on every open — a recreated record has lost its key', async () => {

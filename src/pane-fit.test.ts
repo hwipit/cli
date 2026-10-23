@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { clampViewerCols, createPaneFitter, macosLastKeyAt, releaseStaleFits, type TmuxRun } from './pane-fit.js';
+import { clampViewerCols, createPaneFitter, lastClientUse, macosLastKeyAt, releaseStaleFits, type TmuxRun } from './pane-fit.js';
 
 const SEP = '␟';
 
@@ -500,5 +500,28 @@ describe('macosLastKeyAt', () => {
             expect(s.calls.filter((c) => c === 'osascript')).toHaveLength(1);
             clock.ms += 20_000;
         }
+    });
+});
+
+describe('lastClientUse (session target)', () => {
+    const SEP = '\u241f';
+    const clients = (lines: string[] | null): { run: TmuxRun; asked: string[][] } => {
+        const asked: string[][] = [];
+        return { asked, run: (args) => { asked.push(args); return lines === null ? { status: 1, stdout: '' } : { status: 0, stdout: lines.join('\n') }; } };
+    };
+
+    it('is the newest use of the terminals attached to exactly that session, in ms', () => {
+        const t = clients([`100${SEP}50${SEP}11`, `300${SEP}60${SEP}12`]);
+        expect(lastClientUse(t.run, 'hwip-app')).toBe(300_000);
+        expect(t.asked[0]).toEqual(expect.arrayContaining(['list-clients', '-t', '=hwip-app']));
+    });
+
+    it('counts a client only up to the last key press when the key clock knows it', () => {
+        expect(lastClientUse(clients([`300${SEP}50${SEP}11`]).run, 'hwip-app', () => 200)).toBe(200_000);
+    });
+
+    it('is null with no terminal attached, and undefined when tmux cannot say', () => {
+        expect(lastClientUse(clients([]).run, 'hwip-app')).toBeNull();
+        expect(lastClientUse(clients(null).run, 'hwip-app')).toBeUndefined();
     });
 });

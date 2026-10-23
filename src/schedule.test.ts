@@ -18,6 +18,7 @@ import {
     schedulesDir,
     updateSchedule,
     validateSchedule,
+    writeScheduleState,
     type Schedule,
     type ScheduleWhen,
 } from './schedule.js';
@@ -494,5 +495,95 @@ describe('updateSchedule [F8-edit]', () => {
     it('counts from the edit when there was one, else from the creation', () => {
         expect(scheduleAnchor(make('abc123'))).toBe(Date.parse('2026-10-01T00:00:00.000Z'));
         expect(scheduleAnchor(make('abc123', { updatedAt: '2026-10-20T00:00:00.000Z' }))).toBe(Date.parse('2026-10-20T00:00:00.000Z'));
+    });
+});
+
+describe('when kind once', () => {
+    const AT = new Date(2026, 9, 24, 9, 0).getTime();
+    const once = { kind: 'once', at: new Date(AT).toISOString() } as const;
+
+    it('reads --on with --at as that local date and time, one instant', () => {
+        expect(ok(parseWhen({ on: '2026-10-24', at: '09:00' }))).toEqual(once);
+    });
+
+    it('takes --on only with --at, and never with --days or --every', () => {
+        expect(parseWhen({ on: '2026-10-24' })).toMatchObject({ ok: false, error: expect.stringContaining('--on needs --at') });
+        expect(parseWhen({ on: '2026-10-24', at: '09:00', days: 'weekdays' })).toMatchObject({ ok: false, error: expect.stringContaining('--on') });
+        expect(parseWhen({ on: '2026-10-24', every: '30m' })).toMatchObject({ ok: false, error: expect.stringContaining('--on') });
+    });
+
+    it.each(['2026-02-30', '24-10-2026', 'tomorrow', '2026-10-24T09:00'])('refuses %s as a date', (on) => {
+        expect(parseWhen({ on, at: '09:00' })).toMatchObject({ ok: false, error: expect.stringContaining('--on takes') });
+    });
+
+    it('comes due once, at its time, and never again', () => {
+        expect(occurrencesBetween(once, AT - HOUR, AT + 10 * MIN, 0)).toEqual({ count: 1, latest: AT });
+        expect(occurrencesBetween(once, AT, AT + 365 * 24 * HOUR, 0)).toEqual({ count: 0, latest: null });
+        expect(occurrencesBetween(once, AT - HOUR, AT - 1, 0)).toEqual({ count: 0, latest: null });
+    });
+
+    it('has a next time only before its time', () => {
+        expect(nextOccurrence(once, AT - 1, 0)).toBe(AT);
+        expect(nextOccurrence(once, AT, 0)).toBeNull();
+    });
+
+    it('is a schedule a file may hold, with an ISO instant and nothing else', () => {
+        expect(validateSchedule(make('abc123', { when: once, maxRuntimeMin: 120 })).ok).toBe(true);
+        expect(validateSchedule(make('abc123', { when: { kind: 'once', at: '2026-10-24T09:00:00+09:00' }, maxRuntimeMin: 120 })).ok).toBe(true);
+        expect(validateSchedule({ ...make('abc123'), when: { kind: 'once', at: 'tomorrow 9am' } }).ok).toBe(false);
+        expect(validateSchedule({ ...make('abc123'), when: { kind: 'once', at: '2026-10-24' } }).ok).toBe(false);
+        expect(validateSchedule({ ...make('abc123'), when: { ...once, days: [1] } }).ok).toBe(false);
+    });
+
+    it('cannot be added for a time that had passed when it was made, by any caller', () => {
+        const r = addSchedule((id) => make(id, { createdAt: new Date(AT + MIN).toISOString(), when: once, maxRuntimeMin: 120 }), () => 'abc123');
+        expect(r).toMatchObject({ ok: false, error: expect.stringContaining('passed') });
+        expect(existsSync(join(schedulesDir(), 'abc123.json'))).toBe(false);
+    });
+
+    it('refuses a local time the clocks skip instead of moving it', () => {
+        // 2026-03-08 02:30 does not exist in New York: the clocks go from 02:00 to 03:00.
+        expect(parseWhen({ on: '2026-03-08', at: '02:30' })).toMatchObject({ ok: false, error: expect.stringContaining('does not exist') });
+    });
+
+    it('cannot be moved to a time that has passed', () => {
+        addSchedule((id) => make(id), () => 'abc123');
+        const r = updateSchedule('abc123', { when: once }, AT + MIN);
+        expect(r).toMatchObject({ ok: false, failure: 'invalid', error: expect.stringContaining('passed') });
+        expect(updateSchedule('abc123', { when: once }, AT - MIN).ok).toBe(true);
+    });
+});
+
+describe('session target', () => {
+    const into = (over: Partial<Schedule> = {}): Schedule =>
+        make('abc123', { target: 'session', runId: '1760000000', session: 'hwip-app', prompt: 'carry on', ...over });
+
+    it('is a schedule a file may hold: the run it types into and a prompt', () => {
+        expect(validateSchedule(into()).ok).toBe(true);
+    });
+
+    it.each([
+        ['no run', { runId: undefined }, 'runId'],
+        ['a run that is not a tmux run id', { runId: 'abc' }, 'runId'],
+        ['no prompt', { prompt: undefined }, 'prompt'],
+        ['a worktree', { wt: 'feat/x' }, 'wt'],
+        ['agent arguments', { agentArgs: ['--model', 'opus'] }, 'agentArgs'],
+    ] as const)('refuses %s', (_name, over, word) => {
+        const schedule: Record<string, unknown> = { ...into() };
+        for (const [k, v] of Object.entries(over)) {
+            if (v === undefined) delete schedule[k];
+            else schedule[k] = v;
+        }
+        expect(validateSchedule(schedule)).toMatchObject({ ok: false, error: expect.stringContaining(word) });
+    });
+
+    it('refuses a run without the session target, and a target it does not know', () => {
+        expect(validateSchedule(make('abc123', { runId: '1760000000' })).ok).toBe(false);
+        expect(validateSchedule({ ...make('abc123'), target: 'new' }).ok).toBe(false);
+    });
+
+    it('keeps a delivery in progress in the state file', () => {
+        writeScheduleState({ v: 1, schedules: { abc123: { cursor: 5, delivering: { session: 'hwip-app', since: 7 } } } });
+        expect(readScheduleState().schedules.abc123).toEqual({ cursor: 5, delivering: { session: 'hwip-app', since: 7 } });
     });
 });

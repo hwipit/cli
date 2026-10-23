@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
     createScheduleRunner,
     GRACE_MS,
+    ONCE_GRACE_MS,
     LAUNCH_TIMEOUT_MS,
     LAUNCH_WT_TIMEOUT_MS,
     launchArgs,
@@ -9,6 +10,8 @@ import {
     notifyFailureOutcome,
     PROMPT_POLL_MS,
     PROMPT_WAIT_MS,
+    SESSION_QUIET_MS,
+    SESSION_WAIT_MS,
     START_CHECK_MS,
     type LaunchResult,
     type ScheduleRunnerDeps,
@@ -47,6 +50,11 @@ interface World {
     typed: { session: string; prompt: string }[];
     ended: string[];
     notes: { title: string; body: string }[];
+    removed: string[];
+    /** Where each run is (`deps.sessionOfRun`); a run not here has ended. */
+    runs: Map<string, { name: string } | 'ended' | 'unknown'>;
+    /** What `deps.lastClientActivity` answers (ms), for every session. */
+    activity: number | null | undefined;
 }
 
 const world = (
@@ -64,6 +72,9 @@ const world = (
         typed: [],
         ended: [],
         notes: [],
+        removed: [],
+        runs: new Map(),
+        activity: null,
         deps: undefined as never,
         runner: undefined as never,
     };
@@ -104,6 +115,13 @@ const world = (
         notify: async (title, body) => {
             w.notes.push({ title, body });
             return 'sent';
+        },
+        sessionOfRun: (runId) => w.runs.get(runId) ?? 'ended',
+        lastClientActivity: () => w.activity,
+        removeSchedule: (id) => {
+            w.removed.push(id);
+            w.schedules = w.schedules.filter((s) => s.id !== id);
+            return 'removed';
         },
         ...rest,
     };
@@ -1048,5 +1066,307 @@ describe('a running session when its schedule is edited [F8-edit]', () => {
         await w.runner.tick(START + 5 * MIN + 1);
         expect(w.ended).toEqual(['hwip-app-sched-aaaaaa']);
         expect(w.launched).toHaveLength(1);
+    });
+});
+
+describe('when kind once', () => {
+    const AT = T0 + 30 * MIN;
+    const once = (id: string, over: Partial<Schedule> = {}): Schedule =>
+        schedule(id, { when: { kind: 'once', at: new Date(AT).toISOString() }, maxRuntimeMin: 120, ...over });
+
+    it('runs at its time, is removed once its session has ended, and never runs again', async () => {
+        const w = world([once('aaaaaa')]);
+        await w.runner.tick(AT - 10_000);
+        expect(w.launched).toEqual([]);
+        await w.runner.tick(AT + 10_000);
+        expect(w.launched).toHaveLength(1);
+        expect(last(w, 'aaaaaa')).toBe('started');
+        // Its session still runs: the schedule stays, so the runtime cap and the prompt are still looked after.
+        await w.runner.tick(AT + 40_000);
+        expect(w.removed).toEqual([]);
+        w.sessions.clear();
+        await w.runner.tick(AT + 70_000);
+        expect(w.removed).toEqual(['aaaaaa']);
+        expect(w.state.schedules.aaaaaa).toBeUndefined();
+        await w.runner.tick(AT + 24 * HOUR);
+        expect(w.launched).toHaveLength(1);
+    });
+
+    it('still runs 29 minutes late, after the listener was down', async () => {
+        const w = world([once('aaaaaa')]);
+        await w.runner.tick(AT + 29 * MIN);
+        expect(w.launched).toHaveLength(1);
+        expect(ONCE_GRACE_MS).toBe(30 * MIN);
+    });
+
+    it('is missed 31 minutes late: not run, told, then removed', async () => {
+        const w = world([once('aaaaaa')]);
+        await w.runner.tick(AT + 31 * MIN);
+        expect(w.launched).toEqual([]);
+        expect(last(w, 'aaaaaa')).toBe('missed');
+        expect(w.notes).toEqual([{ title: '예약 건너뜀', body: 'sched-aaaaaa · 놓침 1회' }]);
+        await w.runner.tick(AT + 32 * MIN);
+        expect(w.removed).toEqual(['aaaaaa']);
+        expect(w.notes).toHaveLength(1);
+    });
+
+    it('is removed after a run that failed to start, once that was told', async () => {
+        const w = world([once('aaaaaa')], { launchResult: { ok: false, error: 'boom' } });
+        await w.runner.tick(AT + 10_000);
+        expect(last(w, 'aaaaaa')).toBe('start_failed');
+        expect(w.notes).toHaveLength(1);
+        await w.runner.tick(AT + 40_000);
+        expect(w.removed).toEqual(['aaaaaa']);
+        expect(w.launched).toHaveLength(1);
+    });
+
+    it('stays until its report has gone out when the push keeps failing', async () => {
+        const w = world([once('aaaaaa')], { notify: async () => 'retry' });
+        await w.runner.tick(AT + 31 * MIN);
+        await w.runner.tick(AT + 32 * MIN);
+        expect(w.removed).toEqual([]);
+        expect(w.state.schedules.aaaaaa?.pending?.counts).toEqual({ missed: 1 });
+    });
+
+    it('reports a once whose time went by without a record (a damaged state file) as missed before removing it', async () => {
+        const w = world([once('aaaaaa')], { readState: () => ({ v: 1, schedules: {}, damaged: true }) });
+        await w.runner.tick(AT + 5 * MIN);
+        expect(w.launched).toEqual([]);
+        expect(w.notes).toEqual([{ title: '예약 건너뜀', body: 'sched-aaaaaa · 놓침 1회' }]);
+        expect(w.removed).toEqual([]);
+    });
+
+    it('keeps the schedule when its id cannot name a file', async () => {
+        const w = world([once('aaaaaa')], { removeSchedule: () => 'invalid' });
+        await w.runner.tick(AT + 31 * MIN);
+        await w.runner.tick(AT + 32 * MIN);
+        expect(w.state.schedules.aaaaaa).toBeDefined();
+        expect(w.logs.join('\n')).toContain('could not remove');
+        expect(w.logs.join('\n')).not.toContain('ran once, removed');
+    });
+
+    it('is not run again when its file cannot be removed', async () => {
+        const w = world([once('aaaaaa')], { removeSchedule: () => { throw new Error('EACCES'); } });
+        await w.runner.tick(AT + 31 * MIN);
+        await w.runner.tick(AT + 32 * MIN);
+        await w.runner.tick(AT + 33 * MIN);
+        expect(w.launched).toEqual([]);
+        expect(w.notes).toHaveLength(1);
+        expect(w.logs.filter((l) => l.includes('could not remove'))).toHaveLength(1);
+    });
+});
+
+describe('session target', () => {
+    const AT = T0 + 30 * MIN;
+    const RUN = '1760000000';
+    const into = (id: string, over: Partial<Schedule> = {}): Schedule => schedule(id, {
+        when: { kind: 'once', at: new Date(AT).toISOString() },
+        target: 'session',
+        runId: RUN,
+        session: 'hwip-app',
+        label: `sched-${id}`,
+        prompt: `prompt ${id}`,
+        maxRuntimeMin: 120,
+        ...over,
+    });
+    const alive = (w: World, name = 'hwip-app'): void => {
+        w.runs.set(RUN, { name });
+        w.sessions.add(name);
+    };
+
+    it('types the prompt into the running session instead of starting one, and says nothing', async () => {
+        const w = world([into('aaaaaa')]);
+        alive(w);
+        w.pane.ready = true;
+        await w.runner.tick(AT + 10_000);
+        expect(w.launched).toEqual([]);
+        expect(w.typed).toEqual([{ session: 'hwip-app', prompt: 'prompt aaaaaa' }]);
+        expect(last(w, 'aaaaaa')).toBe('started');
+        expect(w.notes).toEqual([]);
+    });
+
+    it('waits while the session works, and types when it is idle', async () => {
+        const w = world([into('aaaaaa')]);
+        alive(w);
+        await w.runner.tick(AT + 10_000);
+        expect(w.typed).toEqual([]);
+        expect(w.state.schedules.aaaaaa!.delivering).toEqual({ session: 'hwip-app', since: AT + 10_000 });
+        await w.runner.poll(AT + 20 * MIN);
+        expect(w.typed).toEqual([]);
+        w.pane.ready = true;
+        await w.runner.poll(AT + 25 * MIN);
+        expect(w.typed).toHaveLength(1);
+        expect(w.state.schedules.aaaaaa?.delivering).toBeUndefined();
+    });
+
+    it('gives up as session_busy after 30 minutes of waiting, counted from when the wait began', async () => {
+        const w = world([into('aaaaaa')]);
+        alive(w);
+        await w.runner.tick(AT + 10_000);
+        await w.runner.poll(AT + 10_000 + SESSION_WAIT_MS);
+        expect(last(w, 'aaaaaa')).toBeUndefined();
+        await w.runner.tick(AT + 10_000 + SESSION_WAIT_MS + 1);
+        expect(last(w, 'aaaaaa')).toBe('session_busy');
+        expect(w.typed).toEqual([]);
+        expect(w.notes).toEqual([{ title: '예약 건너뜀', body: 'sched-aaaaaa · 세션이 계속 작업 중이라 건너뜀 1회' }]);
+        expect(SESSION_WAIT_MS).toBe(30 * MIN);
+    });
+
+    it('keeps the wait it had across a listener restart', async () => {
+        const w = world([into('aaaaaa')]);
+        alive(w);
+        await w.runner.tick(AT + 10_000);
+        const again = world([into('aaaaaa')], { state: w.state });
+        alive(again);
+        await again.runner.tick(AT + 10_000 + SESSION_WAIT_MS + 1);
+        expect(last(again, 'aaaaaa')).toBe('session_busy');
+    });
+
+    it('fails as session_ended when the run is over, and tells a repeating schedule only the first time', async () => {
+        const w = world([into('aaaaaa', { when: { kind: 'every', minutes: 15 } })]);
+        await w.runner.tick(T0 + 15 * MIN + 10_000);
+        expect(last(w, 'aaaaaa')).toBe('session_ended');
+        expect(w.notes).toEqual([{ title: '예약 세션 종료됨', body: 'sched-aaaaaa · 세션 종료됨 1회' }]);
+        await w.runner.tick(T0 + 30 * MIN + 10_000);
+        expect(last(w, 'aaaaaa')).toBe('session_ended');
+        expect(w.notes).toHaveLength(1);
+        expect(w.launched).toEqual([]);
+    });
+
+    it('keeps waiting, not failing, while tmux cannot say where the run is', async () => {
+        const w = world([into('aaaaaa')]);
+        w.runs.set(RUN, 'unknown');
+        await w.runner.tick(AT + 10_000);
+        await w.runner.poll(AT + 5 * MIN);
+        expect(last(w, 'aaaaaa')).toBeUndefined();
+        expect(w.state.schedules.aaaaaa!.delivering).toBeDefined();
+        alive(w);
+        w.pane.ready = true;
+        await w.runner.poll(AT + 6 * MIN);
+        expect(w.typed).toHaveLength(1);
+    });
+
+    it('follows the run when it was resumed under another name while the prompt waited', async () => {
+        const w = world([into('aaaaaa')]);
+        alive(w);
+        await w.runner.tick(AT + 10_000);
+        alive(w, 'hwip-app-2');
+        w.pane.ready = true;
+        await w.runner.poll(AT + MIN);
+        expect(w.typed).toEqual([{ session: 'hwip-app-2', prompt: 'prompt aaaaaa' }]);
+    });
+
+    it('waits while someone typed at an attached terminal in the last 3 minutes, and not without one', async () => {
+        const w = world([into('aaaaaa')]);
+        alive(w);
+        w.pane.ready = true;
+        w.activity = AT;
+        await w.runner.tick(AT + 10_000);
+        await w.runner.poll(AT + SESSION_QUIET_MS - 1);
+        expect(w.typed).toEqual([]);
+        await w.runner.poll(AT + SESSION_QUIET_MS);
+        expect(w.typed).toHaveLength(1);
+        expect(SESSION_QUIET_MS).toBe(3 * MIN);
+
+        const unsure = world([into('bbbbbb')]);
+        alive(unsure);
+        unsure.pane.ready = true;
+        unsure.activity = undefined;
+        await unsure.runner.tick(AT + 10_000);
+        expect(unsure.typed).toEqual([]);
+    });
+
+    it('gives up as session_busy when the terminal stays busy for 30 minutes', async () => {
+        const w = world([into('aaaaaa')]);
+        alive(w);
+        w.pane.ready = true;
+        w.activity = AT;
+        await w.runner.tick(AT + 10_000);
+        for (let t = AT + MIN; t <= AT + 10_000 + SESSION_WAIT_MS; t += MIN) {
+            w.activity = t;
+            await w.runner.poll(t);
+        }
+        await w.runner.tick(AT + 10_000 + SESSION_WAIT_MS + 1);
+        expect(w.typed).toEqual([]);
+        expect(last(w, 'aaaaaa')).toBe('session_busy');
+    });
+
+    it('types two prompts due together one at a time, in their order', async () => {
+        const w = world([into('bbbbbb', { when: { kind: 'once', at: new Date(AT + 1).toISOString() } }), into('aaaaaa')]);
+        alive(w);
+        w.pane.ready = true;
+        await w.runner.tick(AT + 10_000);
+        expect(w.typed.map((t) => t.prompt)).toEqual(['prompt aaaaaa']);
+        await w.runner.poll(AT + 15_000);
+        expect(w.typed.map((t) => t.prompt)).toEqual(['prompt aaaaaa', 'prompt bbbbbb']);
+    });
+
+    it('does not count against the running limit, has no runtime cap and never ends the session', async () => {
+        const busy = Array.from({ length: MAX_RUNNING }, (_, i) => schedule(`r${i}aaaa`));
+        const w = world([...busy, into('aaaaaa', { when: { kind: 'every', minutes: 15 }, maxRuntimeMin: 5 })]);
+        alive(w);
+        await w.runner.tick(T0 + 15 * MIN + 10_000);
+        expect(w.launched).toHaveLength(MAX_RUNNING);
+        await w.runner.tick(T0 + 15 * MIN + 20 * MIN);
+        expect(w.state.schedules.aaaaaa!.delivering).toBeDefined();
+        expect(w.ended.filter((s) => s === 'hwip-app')).toEqual([]);
+        w.pane.ready = true;
+        await w.runner.poll(T0 + 15 * MIN + 21 * MIN);
+        expect(w.typed).toEqual([{ session: 'hwip-app', prompt: 'prompt aaaaaa' }]);
+    });
+
+    it('removes a once after its prompt went in', async () => {
+        const w = world([into('aaaaaa')]);
+        alive(w);
+        w.pane.ready = true;
+        await w.runner.tick(AT + 10_000);
+        await w.runner.tick(AT + 40_000);
+        expect(w.removed).toEqual(['aaaaaa']);
+    });
+
+    it('fails as session_ended, not session_busy, when the run ends while the prompt waits', async () => {
+        const w = world([into('aaaaaa')]);
+        alive(w);
+        await w.runner.tick(AT + 10_000);
+        w.runs.delete(RUN);
+        await w.runner.tick(AT + 10_000 + SESSION_WAIT_MS + 1);
+        expect(last(w, 'aaaaaa')).toBe('session_ended');
+    });
+
+    it('fails as prompt_undelivered when the prompt would not go in until the wait ran out', async () => {
+        const w = world([into('aaaaaa')]);
+        alive(w);
+        w.pane.ready = true;
+        w.pane.injectOk = false;
+        await w.runner.tick(AT + 10_000);
+        await w.runner.tick(AT + 10_000 + SESSION_WAIT_MS + 1);
+        expect(last(w, 'aaaaaa')).toBe('prompt_undelivered');
+        expect(w.logs.join('\n')).toContain('would not go in');
+    });
+
+    it('says why the wait ran out when tmux could not be asked', async () => {
+        const w = world([into('aaaaaa')]);
+        w.runs.set(RUN, 'unknown');
+        await w.runner.tick(AT + 10_000);
+        await w.runner.tick(AT + 10_000 + SESSION_WAIT_MS + 1);
+        expect(last(w, 'aaaaaa')).toBe('session_busy');
+        expect(w.logs.join('\n')).toContain('tmux could not say');
+    });
+
+    it('tells every time that an agent without an idle rule got no prompt', async () => {
+        const w = world([into('aaaaaa', { when: { kind: 'every', minutes: 15 } })], { canPrompt: () => false });
+        alive(w);
+        await w.runner.tick(T0 + 15 * MIN + 10_000);
+        await w.runner.tick(T0 + 30 * MIN + 10_000);
+        expect(w.notes).toHaveLength(2);
+    });
+
+    it('is not typed for an agent without an idle rule', async () => {
+        const w = world([into('aaaaaa')], { canPrompt: () => false });
+        alive(w);
+        w.pane.ready = true;
+        await w.runner.tick(AT + 10_000);
+        expect(w.typed).toEqual([]);
+        expect(last(w, 'aaaaaa')).toBe('prompt_unsupported');
     });
 });

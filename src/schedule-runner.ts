@@ -6,10 +6,15 @@
  * What a tick decides, per schedule: how many due times passed since its cursor, whether the newest is still
  * worth running (`GRACE_MS`; older ones are `missed` and never run late), and whether the session may start.
  * A `once` schedule that has run (or was missed), and whose session and report are done with, has its file removed.
+ *
+ * A session target (`target: 'session'`) starts nothing: at its time it waits (`delivering`) for the run it is bound to
+ * to be idle with nobody typing at its terminal, and types the prompt in. It never counts as running, has no runtime
+ * cap and is never asked to end — the session is the person's, not the schedule's.
  * The cursor is written before anything is launched, so a listener killed in between skips that run instead of
  * starting it twice.
  */
 
+import type { RunWhereabouts } from './session-registry.js';
 import {
     occurrencesBetween,
     scheduleAnchor,
@@ -47,6 +52,10 @@ export const PROMPT_POLL_MS = 5_000;
  * the session is idle, and a retry after a failed inject two polls later.
  */
 export const PROMPT_WAIT_MS = 90_000;
+/** How long a session target's prompt waits for its session to be idle (and its terminal quiet) before it is `session_busy`. */
+export const SESSION_WAIT_MS = 30 * 60_000;
+/** A terminal attached to the session that had a key pressed this recently is someone typing: the prompt is not typed after their words. */
+export const SESSION_QUIET_MS = 3 * 60_000;
 /** A report that has waited this long for a push that would not go through is dropped, not sent as news. */
 const PENDING_MAX_MS = 24 * 60 * 60 * 1000;
 /** Scheduled sessions running at once. */
@@ -103,6 +112,13 @@ export interface ScheduleRunnerDeps {
     endSession: (session: string) => void;
     /** Tells the person (title, body). */
     notify: (title: string, body: string) => Promise<NotifyOutcome>;
+    /** Where the run `runId` (last seen in session `lastName`, tied to at `boundAt`) goes on now (`liveSessionOfRun`). */
+    sessionOfRun: (runId: string, lastName: string, boundAt: number) => RunWhereabouts;
+    /**
+     * When a terminal attached to `session` was last used (ms since the epoch); null when none is attached, undefined
+     * when tmux could not say.
+     */
+    lastClientActivity: (session: string) => number | null | undefined;
     /** Deletes a schedule's file (`removeSchedule`): a `once` that is done. It may throw when the file cannot be removed. */
     removeSchedule: (id: string) => RemoveResult;
     /** The wall clock (default `Date.now`); a launch takes seconds, and the schedules after it are judged by the time it ends. */
@@ -120,6 +136,8 @@ const REASON_TEXT: Record<Exclude<ScheduleOutcome, 'started'>, string> = {
     prompt_undelivered: '할 일 입력 못 함',
     prompt_unsupported: '할 일 입력 불가(이 에이전트는 입력 준비를 판정할 규칙이 없음)',
     capped: '실행 시간 초과',
+    session_busy: '세션이 계속 작업 중이라 건너뜀',
+    session_ended: '세션 종료됨',
 };
 
 /** The push title for each result: what kind of news it is. A report that mixes kinds gets the general one. */
@@ -135,6 +153,8 @@ const TITLE_OF: Record<Exclude<ScheduleOutcome, 'started'>, string> = {
     prompt_undelivered: PROMPT_NOT_TYPED,
     prompt_unsupported: PROMPT_NOT_TYPED,
     capped: '예약 실행 시간 초과',
+    session_busy: SKIPPED,
+    session_ended: '예약 세션 종료됨',
 };
 const MIXED_TITLE = '예약 알림';
 
@@ -218,7 +238,7 @@ export const createScheduleRunner = (deps: ScheduleRunnerDeps): ScheduleRunner =
         const live = schedules.filter((schedule) => {
             const st = state[schedule.id]!;
             const passed = schedule.when.kind === 'once' && st.cursor >= Date.parse(schedule.when.at);
-            if (!passed || st.running || st.pending) return true;
+            if (!passed || st.running || st.delivering || st.pending) return true;
             if (!st.last) {
                 st.last = { outcome: 'missed', at: now };
                 addPending(st, 'missed', 1, now);
@@ -314,6 +334,32 @@ export const createScheduleRunner = (deps: ScheduleRunnerDeps): ScheduleRunner =
         return { schedules: live, state, dirty, save };
     };
 
+    /** The end of a session target's time: what became of it, told unless it is the same as the last time (a streak). */
+    const settle = (st: ScheduleRunState, outcome: ScheduleOutcome, now: number): void => {
+        delete st.delivering;
+        // As with overlap and busy: a run that is over, or never idle, stays so for every time until someone acts.
+        const repeat = (outcome === 'session_busy' || outcome === 'session_ended') && st.last?.outcome === outcome;
+        st.last = { outcome, at: now };
+        if (outcome !== 'started' && !repeat) addPending(st, outcome, 1, now);
+    };
+
+    /** A session target's time came: its wait begins, or (when it cannot) what that means. Returns what to log. */
+    const beginDelivery = (schedule: Schedule, st: ScheduleRunState, now: number): string => {
+        if (!deps.canPrompt(schedule.agentKind)) {
+            settle(st, 'prompt_unsupported', now);
+            return `${schedule.agentKind} has no rule that says idle, so its prompt is not typed`;
+        }
+        // The last time's prompt is still waiting: this one is not queued behind it.
+        if (st.delivering) {
+            const { delivering } = st;
+            settle(st, 'session_busy', now);
+            st.delivering = delivering;
+            return 'session_busy (the last prompt is still waiting)';
+        }
+        st.delivering = { session: schedule.session, since: now };
+        return `waiting for ${schedule.session} to be idle`;
+    };
+
     const run = async (tickNow: number): Promise<Report | null> => {
         const tickStart = clock();
         const loaded = load(tickNow);
@@ -335,13 +381,17 @@ export const createScheduleRunner = (deps: ScheduleRunnerDeps): ScheduleRunner =
                 st.last = { outcome: 'missed', at: now };
                 addPending(st, 'missed', missed, now);
             }
+            const intoSession = runs && schedule.target === 'session';
+            // Saved with the cursor: a wait that is on disk is never begun twice, nor lost.
+            const begun = intoSession ? beginDelivery(schedule, st, now) : null;
             if (!save()) {
                 state[schedule.id] = before;
                 continue;
             }
             loaded.dirty = false;
             if (missed > 0) deps.log(`schedule ${schedule.id} (${schedule.label}): missed ${missed} run${missed === 1 ? '' : 's'}`);
-            if (runs) toStart.push({ schedule, st, before, at: now });
+            if (begun) deps.log(`schedule ${schedule.id} (${schedule.label}): ${begun}`);
+            if (runs && !intoSession) toStart.push({ schedule, st, before, at: now });
         }
         for (const { schedule, st, before, at: now } of toStart) {
             // A prompt is only ever typed when the agent's own rules can tell idle from a dialog; otherwise the session still starts, without it.
@@ -409,12 +459,96 @@ export const createScheduleRunner = (deps: ScheduleRunnerDeps): ScheduleRunner =
     // Prompts typed whose "done" could not be written (`session@startedAt`); in memory, so only for this listener's life.
     const delivered = new Set<string>();
 
-    // Whether any running session is still waiting for its prompt: `poll` costs nothing while none is.
+    // Whether any prompt is still waiting (a started session's or a session target's): `poll` costs nothing while none is.
     let watching = true;
 
-    /** Delivers the prompts of running sessions and ends those past their runtime cap, then saves what changed. */
+    // Why each session target's wait has not typed yet (`<id>@<since>`), for the log and outcome when it runs out. In
+    // memory: after a restart the reason starts over, which only changes the log line.
+    const waitNotes = new Map<string, { reason: string; injectFailed?: true }>();
+
+    /**
+     * Types the prompts of session targets into their runs: when the run is idle and nobody has used a terminal attached
+     * to it for `SESSION_QUIET_MS`. One prompt per session per pass, the earliest due first — the next waits for the
+     * session to be idle again. A run that is over fails the wait; one tmux cannot find right now is waited for.
+     */
+    const deliver = (loaded: Loaded, now: number): void => {
+        const { schedules, state } = loaded;
+        const typedInto = new Set<string>();
+        const waiting = schedules
+            .filter((schedule) => state[schedule.id]!.delivering)
+            .sort((a, b) => state[a.id]!.cursor - state[b.id]!.cursor || a.id.localeCompare(b.id));
+        for (const schedule of waiting) {
+            const st = state[schedule.id]!;
+            const delivering = st.delivering!;
+            const label = `schedule ${schedule.id} (${schedule.label})`;
+            const deliveredKey = `${schedule.id}@${delivering.since}`;
+            if (delivered.has(deliveredKey)) {
+                delete st.delivering;
+                loaded.dirty = true;
+                continue;
+            }
+            if (schedule.prompt === undefined || schedule.runId === undefined) {
+                // `validateSchedule` gives every session target both; a wait without them has nothing to type.
+                deps.log(`! ${label}: a session target without a prompt or a run; its wait is dropped`);
+                delete st.delivering;
+                loaded.dirty = true;
+                continue;
+            }
+            const note = waitNotes.get(deliveredKey) ?? { reason: 'it was not idle' };
+            waitNotes.set(deliveredKey, note);
+            // Asked before the deadline: a run that ended while its prompt waited is over, not busy.
+            const where = deps.sessionOfRun(schedule.runId, delivering.session, Date.parse(schedule.createdAt));
+            if (where === 'ended') {
+                waitNotes.delete(deliveredKey);
+                settle(st, 'session_ended', now);
+                deps.log(`${label}: the session it types into has ended`);
+                saveNow(loaded);
+                continue;
+            }
+            if (now - delivering.since > SESSION_WAIT_MS) {
+                waitNotes.delete(deliveredKey);
+                settle(st, note.injectFailed ? 'prompt_undelivered' : 'session_busy', now);
+                deps.log(`${label}: not typed within ${SESSION_WAIT_MS / 60_000} min (${note.reason}); skipped`);
+                saveNow(loaded);
+                continue;
+            }
+            if (where === 'unknown') {
+                note.reason = 'tmux could not say where the run is';
+                continue;
+            }
+            if (where.name !== delivering.session) {
+                delivering.session = where.name;
+                loaded.dirty = true;
+            }
+            if (typedInto.has(where.name)) continue;
+            const used = deps.lastClientActivity(where.name);
+            if (used === undefined || (used !== null && now - used < SESSION_QUIET_MS)) {
+                note.reason = used === undefined ? 'tmux could not say who uses its terminal' : 'someone was typing at its terminal';
+                continue;
+            }
+            if (!deps.ready(where.name, schedule.agentKind)) {
+                note.reason = 'it was not idle';
+                continue;
+            }
+            if (!deps.inject(where.name, schedule.prompt)) {
+                // Rate limit, no pane …: the next poll tries again, and the wait ends as undelivered, not busy.
+                note.reason = 'the prompt would not go in';
+                note.injectFailed = true;
+                continue;
+            }
+            waitNotes.delete(deliveredKey);
+            typedInto.add(where.name);
+            settle(st, 'started', now);
+            deps.log(`${label}: prompt typed into ${where.name}`);
+            // On disk right away, as for a started session's prompt: a restart must not type it again.
+            if (!saveNow(loaded)) delivered.add(deliveredKey);
+        }
+    };
+
+    /** Delivers the prompts of running sessions and session targets, ends sessions past their runtime cap, then saves what changed. */
     const supervise = (loaded: Loaded, now: number): void => {
         const { schedules, state } = loaded;
+        deliver(loaded, now);
         for (const schedule of schedules) {
             const st = state[schedule.id]!;
             const running = st.running;
@@ -476,7 +610,7 @@ export const createScheduleRunner = (deps: ScheduleRunnerDeps): ScheduleRunner =
                 saveNow(loaded);
             }
         }
-        watching = Object.values(state).some((st) => st.running?.promptPending);
+        watching = Object.values(state).some((st) => st.running?.promptPending || st.delivering);
         if (loaded.dirty) loaded.save();
     };
 

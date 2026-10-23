@@ -18,6 +18,7 @@ import {
     schedulesDir,
     updateSchedule,
     validateSchedule,
+    writeScheduleState,
     type Schedule,
     type ScheduleWhen,
 } from './schedule.js';
@@ -550,5 +551,39 @@ describe('when kind once', () => {
         const r = updateSchedule('abc123', { when: once }, AT + MIN);
         expect(r).toMatchObject({ ok: false, failure: 'invalid', error: expect.stringContaining('passed') });
         expect(updateSchedule('abc123', { when: once }, AT - MIN).ok).toBe(true);
+    });
+});
+
+describe('session target', () => {
+    const into = (over: Partial<Schedule> = {}): Schedule =>
+        make('abc123', { target: 'session', runId: '1760000000', session: 'hwip-app', prompt: 'carry on', ...over });
+
+    it('is a schedule a file may hold: the run it types into and a prompt', () => {
+        expect(validateSchedule(into()).ok).toBe(true);
+    });
+
+    it.each([
+        ['no run', { runId: undefined }, 'runId'],
+        ['a run that is not a tmux run id', { runId: 'abc' }, 'runId'],
+        ['no prompt', { prompt: undefined }, 'prompt'],
+        ['a worktree', { wt: 'feat/x' }, 'wt'],
+        ['agent arguments', { agentArgs: ['--model', 'opus'] }, 'agentArgs'],
+    ] as const)('refuses %s', (_name, over, word) => {
+        const schedule: Record<string, unknown> = { ...into() };
+        for (const [k, v] of Object.entries(over)) {
+            if (v === undefined) delete schedule[k];
+            else schedule[k] = v;
+        }
+        expect(validateSchedule(schedule)).toMatchObject({ ok: false, error: expect.stringContaining(word) });
+    });
+
+    it('refuses a run without the session target, and a target it does not know', () => {
+        expect(validateSchedule(make('abc123', { runId: '1760000000' })).ok).toBe(false);
+        expect(validateSchedule({ ...make('abc123'), target: 'new' }).ok).toBe(false);
+    });
+
+    it('keeps a delivery in progress in the state file', () => {
+        writeScheduleState({ v: 1, schedules: { abc123: { cursor: 5, delivering: { session: 'hwip-app', since: 7 } } } });
+        expect(readScheduleState().schedules.abc123).toEqual({ cursor: 5, delivering: { session: 'hwip-app', since: 7 } });
     });
 });

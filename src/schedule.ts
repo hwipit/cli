@@ -35,8 +35,18 @@ export interface Schedule {
     cwd: string;
     /** Passed to `hwip <agent> --label`; the default is `sched-<id>`. */
     label: string;
-    /** The tmux session the launch will create, worked out when the schedule is made. */
+    /**
+     * The tmux session the launch will create, worked out when the schedule is made. For a `target: 'session'` schedule,
+     * the session the run was in when the schedule was made: where the runner looks for it first.
+     */
     session: string;
+    /**
+     * `session`: no session is started; at its time the prompt is typed into the run `runId` is, wherever it goes on
+     * (`liveSessionOfRun`). Absent: a new session is started (`hwip <agent> --detach`). Fixed once made.
+     */
+    target?: 'session';
+    /** The run (hwip docs/session-runs.md) a `target: 'session'` schedule types into, and only with it. */
+    runId?: string;
     /** `--wt <branch>`. From the command line only. */
     wt?: string;
     /** Arguments after `--`. From the command line only. */
@@ -230,7 +240,9 @@ export const nextOccurrence = (when: ScheduleWhen, after: number, anchor: number
 const SCHEDULE_ID = /^[a-z0-9]{6}$/;
 const LABEL = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const AGENT_KIND = /^[A-Za-z0-9_-]{1,32}$/;
-const KEYS = new Set(['v', 'id', 'createdAt', 'updatedAt', 'source', 'agentKind', 'cwd', 'label', 'session', 'wt', 'agentArgs', 'prompt', 'when', 'maxRuntimeMin']);
+const KEYS = new Set(['v', 'id', 'createdAt', 'updatedAt', 'source', 'agentKind', 'cwd', 'label', 'session', 'target', 'runId', 'wt', 'agentArgs', 'prompt', 'when', 'maxRuntimeMin']);
+/** A tmux `session_created`, as the registry keeps a run id. */
+const RUN_ID = /^\d{1,12}$/;
 
 export const isScheduleId = (value: unknown): value is string => typeof value === 'string' && SCHEDULE_ID.test(value);
 
@@ -277,7 +289,7 @@ export const validateSchedule = (input: unknown): Checked<Schedule> => {
     if (!isRecord(input)) return fail('a schedule must be an object');
     const unknownKey = Object.keys(input).find((k) => !KEYS.has(k));
     if (unknownKey !== undefined) return fail(`schedule has a field it does not know: ${unknownKey}`);
-    const { v, id, createdAt, updatedAt, source, agentKind, cwd, label, session, wt, agentArgs, prompt, when, maxRuntimeMin } = input;
+    const { v, id, createdAt, updatedAt, source, agentKind, cwd, label, session, target, runId, wt, agentArgs, prompt, when, maxRuntimeMin } = input;
 
     if (v !== 1) return fail('schedule.v must be 1');
     if (!isScheduleId(id)) return fail('schedule.id must be 6 lowercase letters or digits');
@@ -309,11 +321,22 @@ export const validateSchedule = (input: unknown): Checked<Schedule> => {
     }
     if (source === 'phone' && prompt === undefined) return fail('a schedule from the phone needs a prompt');
 
+    if (target !== undefined && target !== 'session') return fail("schedule.target must be 'session' when given");
+    if (target === 'session') {
+        if (typeof runId !== 'string' || !RUN_ID.test(runId)) return fail('schedule.runId must be the run the session target types into');
+        if (prompt === undefined) return fail('a schedule into a session needs a prompt');
+        if (wt !== undefined) return fail('a schedule into a session carries no wt');
+        if (agentArgs !== undefined) return fail('a schedule into a session carries no agentArgs');
+    } else if (runId !== undefined) {
+        return fail("schedule.runId belongs to target 'session' only");
+    }
+
     const badWhen = checkWhen(when);
     if (badWhen) return fail(badWhen);
     const checkedWhen = when as ScheduleWhen; // checkWhen accepted its shape
     if (!isInt(maxRuntimeMin, MIN_MAX_RUNTIME_MIN, MAX_MAX_RUNTIME_MIN)) return fail(`schedule.maxRuntimeMin must be ${MIN_MAX_RUNTIME_MIN} to ${MAX_MAX_RUNTIME_MIN}`);
-    if (checkedWhen.kind === 'every' && maxRuntimeMin > checkedWhen.minutes) return fail('schedule.maxRuntimeMin cannot be longer than the --every period');
+    // A session target has no runtime cap (the session is not the schedule's): its `maxRuntimeMin` bounds nothing.
+    if (checkedWhen.kind === 'every' && target !== 'session' && maxRuntimeMin > checkedWhen.minutes) return fail('schedule.maxRuntimeMin cannot be longer than the --every period');
 
     // Every field of `Schedule` was checked above; `input` is a record, which TypeScript cannot narrow field by field.
     return { ok: true, value: input as unknown as Schedule };
@@ -484,6 +507,8 @@ export const removeSchedule = (id: string): RemoveResult => {
 
 const SCHEDULE_OUTCOMES = [
     'started', 'missed', 'overlap', 'busy', 'start_failed', 'missing_directory', 'unknown_agent', 'prompt_undelivered', 'prompt_unsupported', 'capped',
+    // A session target only: the run stayed busy past the wait, or it is over.
+    'session_busy', 'session_ended',
 ] as const;
 export type ScheduleOutcome = (typeof SCHEDULE_OUTCOMES)[number];
 
@@ -493,6 +518,11 @@ export interface ScheduleRunState {
     cursor: number;
     /** `capped`: the runtime cap passed and the session was asked to end; it keeps counting as running until it is gone. */
     running?: { session: string; startedAt: number; promptPending: boolean; capped?: true };
+    /**
+     * A session target whose time came and whose prompt waits for its session to be idle. `session` is where the run was
+     * last seen; `since` is when the wait began, and the wait is given up on 30 minutes after it (`schedule-runner.ts`).
+     */
+    delivering?: { session: string; since: number };
     last?: { outcome: ScheduleOutcome; at: number };
     /** Results not yet told to the person, by reason, and when the first of them was added. */
     pending?: { since: number; counts: Partial<Record<ScheduleOutcome, number>> };
@@ -515,9 +545,12 @@ const isNumber = (value: unknown): value is number => typeof value === 'number' 
 const readRunState = (raw: unknown): ScheduleRunState | null => {
     if (!isRecord(raw) || !isNumber(raw.cursor)) return null;
     const state: ScheduleRunState = { cursor: raw.cursor };
-    const { running, last, pending } = raw;
+    const { running, delivering, last, pending } = raw;
     if (isRecord(running) && isSessionName(running.session) && isNumber(running.startedAt) && typeof running.promptPending === 'boolean') {
         state.running = { session: running.session, startedAt: running.startedAt, promptPending: running.promptPending, ...(running.capped === true ? { capped: true as const } : {}) };
+    }
+    if (isRecord(delivering) && isSessionName(delivering.session) && isNumber(delivering.since)) {
+        state.delivering = { session: delivering.session, since: delivering.since };
     }
     if (isRecord(last) && isOutcome(last.outcome) && isNumber(last.at)) state.last = { outcome: last.outcome, at: last.at };
     if (isRecord(pending) && isNumber(pending.since) && isRecord(pending.counts)) {

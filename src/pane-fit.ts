@@ -153,6 +153,18 @@ const clientUse = (client: Client, lastKeyAt: LastKeyAt): number => {
     return keyAt === null ? client.activity : Math.max(Math.min(client.activity, keyAt), client.created);
 };
 
+/**
+ * When a terminal attached to `session` was last used (`clientUse`), in ms since the epoch; null when none is attached,
+ * undefined when tmux could not say. A schedule that types into the session waits while it is recent, so its prompt does
+ * not land after someone's half-typed words.
+ */
+export const lastClientUse = (run: TmuxRun, session: string, lastKeyAt: LastKeyAt = () => null): number | null | undefined => {
+    const clients = readClients(run, `=${session}`);
+    if (clients === null) return undefined;
+    if (clients.length === 0) return null;
+    return Math.max(...clients.map((client) => clientUse(client, lastKeyAt))) * 1000;
+};
+
 const readWindow = (run: TmuxRun, target: string): { attached: number; panes: number; width: number } | null => {
     const r = run(['display-message', '-p', '-t', target,
         `#{session_attached}${SEP}#{window_panes}${SEP}#{window_width}`]);

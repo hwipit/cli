@@ -29,6 +29,8 @@ const {
     forgetEnded,
     MAX_KNOWN_SESSIONS,
     KNOWN_SESSION_TTL_MS,
+    liveSessionOfRun,
+    UNRECORDED_RUN_GRACE_MS,
 } = await import('./session-registry.js');
 
 const T0 = Date.parse('2026-08-01T00:00:00.000Z');
@@ -489,5 +491,79 @@ describe('session registry: run title', () => {
         expect(byName.get('hwip-b')).toMatchObject({ providerSessionName: 'Fix login' });
         expect(byName.get('hwip-b')).not.toHaveProperty('providerSessionNameSource');
         expect(byName.get('hwip-c')).toMatchObject({ providerSessionName: 'Ship it', providerSessionNameSource: 'auto' });
+    });
+});
+
+describe('liveSessionOfRun (session target)', () => {
+    const entry = (name: string, runId: string, tmuxRunIds?: string[]) => ({
+        name, cwd: '/Users/me/work/api', agentKind: 'claude', runId, ...(tmuxRunIds ? { tmuxRunIds } : {}), lastSeenAt: new Date(T0).toISOString(),
+    });
+    const write = (entries: object[]): void => {
+        mkdirSync(dirname(knownSessionsPath()), { recursive: true });
+        writeFileSync(knownSessionsPath(), JSON.stringify(entries));
+    };
+    /** A tmux with `sessions` (name → its session_created); `calls` counts the reads. */
+    const tmux = (sessions: Record<string, string | undefined> | null) => {
+        const calls = { names: 0, runIdOf: 0 };
+        return {
+            calls,
+            names: () => { calls.names += 1; return sessions === null ? null : Object.keys(sessions); },
+            runIdOf: (name: string) => { calls.runIdOf += 1; return sessions === null ? undefined : name in sessions ? sessions[name] : null; },
+        };
+    };
+
+    it('finds the run under the name it had', () => {
+        write([entry('hwip-api', '100')]);
+        expect(liveSessionOfRun('100', 'hwip-api', tmux({ 'hwip-api': '100' }), T0)).toEqual({ name: 'hwip-api' });
+    });
+
+    it('follows a run resumed under another name, and not the run that took its old name', () => {
+        write([entry('hwip-api-2', '100', ['200']), entry('hwip-api', '100')]);
+        const t = tmux({ 'hwip-api': '300', 'hwip-api-2': '200' });
+        expect(liveSessionOfRun('100', 'hwip-api', t, T0)).toEqual({ name: 'hwip-api-2' });
+    });
+
+    it('follows a run carried on in a new tmux session of the same name', () => {
+        write([entry('hwip-api', '100', ['150'])]);
+        expect(liveSessionOfRun('100', 'hwip-api', tmux({ 'hwip-api': '150' }), T0)).toEqual({ name: 'hwip-api' });
+    });
+
+    it('finds a run the sweep has not written down yet under its last name', () => {
+        write([]);
+        expect(liveSessionOfRun('100', 'hwip-api', tmux({ 'hwip-api': '100' }), T0)).toEqual({ name: 'hwip-api' });
+    });
+
+    it('says ended only when tmux answered and no name holds the run', () => {
+        write([entry('hwip-api', '100')]);
+        expect(liveSessionOfRun('100', 'hwip-api', tmux({ 'hwip-api': '300' }), T0)).toBe('ended');
+        expect(liveSessionOfRun('100', 'hwip-api', tmux({}), T0)).toBe('ended');
+    });
+
+    it('says unknown for a run bound moments ago that the registry has not written down, and ended once it should have', () => {
+        write([]);
+        expect(liveSessionOfRun('100', 'hwip-api', tmux({ 'hwip-api': '300' }), T0, T0 - 60_000)).toBe('unknown');
+        writeFileSync(knownSessionsPath(), '{ not json');
+        expect(liveSessionOfRun('100', 'hwip-api', tmux({}), T0, T0 - 60_000)).toBe('unknown');
+        // Long after the binding: the record was there and went (expired after 30 days, or evicted): the run is over.
+        expect(liveSessionOfRun('100', 'hwip-api', tmux({}), T0, T0 - UNRECORDED_RUN_GRACE_MS - 1)).toBe('ended');
+    });
+
+    it('says ended for a run whose record expired', () => {
+        write([{ ...entry('hwip-api', '100'), lastSeenAt: new Date(T0 - KNOWN_SESSION_TTL_MS - 1).toISOString() }]);
+        expect(liveSessionOfRun('100', 'hwip-api', tmux({}), T0, T0 - KNOWN_SESSION_TTL_MS - 2)).toBe('ended');
+    });
+
+    it('says unknown, not ended, when tmux does not answer', () => {
+        write([entry('hwip-api', '100')]);
+        expect(liveSessionOfRun('100', 'hwip-api', tmux(null), T0)).toBe('unknown');
+        // The list came back but the run of the name could not be read.
+        expect(liveSessionOfRun('100', 'hwip-api', tmux({ 'hwip-api': undefined }), T0)).toBe('unknown');
+    });
+
+    it('asks tmux for the names once and for each candidate name once', () => {
+        write([entry('hwip-api-2', '100', ['200']), entry('hwip-api', '100'), entry('hwip-web', '999')]);
+        const t = tmux({ 'hwip-api': '300', 'hwip-api-2': '400', 'hwip-web': '999' });
+        expect(liveSessionOfRun('100', 'hwip-api', t, T0)).toBe('ended');
+        expect(t.calls).toEqual({ names: 1, runIdOf: 2 });
     });
 });

@@ -33,6 +33,8 @@ import { checkoutOf, VERSION } from './config.js';
 import { runningListenerPid, runningListenerVersion } from './listener-process.js';
 import { findAgentBySubcommand, REMOTE_AGENTS } from './remote-agents.js';
 import { promptableScheduleKinds } from './schedule-ready.js';
+import { recallSession, runOfTmuxSession } from './session-registry.js';
+import { liveRunIdOf } from './tmux-liveness.js';
 import { detectProjectDir, ensureListenerRunning, listenerVersionDrifted, safeBasename, sanitizeLabel, tmuxSessionName } from './wrapper.js';
 import { isValidBranchName, worktreeDirName } from './worktree.js';
 
@@ -52,11 +54,20 @@ export interface ScheduleCommandDeps {
      * False when one still runs after it.
      */
     refreshListener: () => Promise<boolean>;
+    /** The running session `name` as a schedule types into it: its agent, directory and current run; why not, when it is not running. */
+    sessionTarget: (name: string) => Checked<SessionTarget>;
     out: (line: string) => void;
     err: (line: string) => void;
 }
 
+export interface SessionTarget {
+    agentKind: string;
+    cwd: string;
+    runId: string;
+}
+
 const USAGE = "usage: hwip schedule add <agent> (--at HH:MM [--days daily|weekdays|mon,wed,…] | --on YYYY-MM-DD --at HH:MM | --every <N>m|<N>h) [--prompt <text>] [--label <x>] [--wt <branch>] [--max-runtime <N>m|<N>h] [-- <agent args…>]\n"
+    + '       hwip schedule add --session <name> (--at HH:MM [--days …] | --on YYYY-MM-DD --at HH:MM | --every <N>m|<N>h) --prompt <text>\n'
     + '       hwip schedule edit <id> [--at HH:MM] [--days …] [--on YYYY-MM-DD] [--every <N>m|<N>h] [--prompt <text>] [--max-runtime <N>m|<N>h]\n'
     + '       hwip schedule [list] [--json]\n'
     + '       hwip schedule rm <id>';
@@ -95,6 +106,61 @@ interface Built {
     agentName: string;
 }
 
+/**
+ * `hwip schedule add --session <name> …`: a schedule that types its prompt into a session already running, bound to the
+ * run it holds now. Everything that would shape a new session (an agent, `--wt`, `--label`, a runtime cap, agent
+ * arguments) has no meaning for it and is refused rather than ignored.
+ */
+const buildSessionSchedule = (flags: Flags, agentArgs: string[], deps: ScheduleCommandDeps): Checked<Built> => {
+    const name = flagText(flags, 'session');
+    if (!name.ok) return name;
+    if (flags._command) return { ok: false, error: `--session types into a session already running: give no agent ('${String(flags._command)}')` };
+    if (agentArgs.length > 0) return { ok: false, error: '--session takes no agent arguments: the session is already running' };
+    const fixed = ['wt', 'label', 'max-runtime'].find((flag) => flags[flag] !== undefined);
+    if (fixed) return { ok: false, error: `--${fixed} cannot be combined with --session: the session is already running` };
+
+    const read = (flag: string): Checked<string | undefined> => flagText(flags, flag);
+    const [at, days, every, on, prompt] = ['at', 'days', 'every', 'on', 'prompt'].map(read);
+    const bad = [at, days, every, on, prompt].find((r) => !r.ok);
+    if (bad && !bad.ok) return bad;
+    const value = (r: Checked<string | undefined>): string | undefined => (r.ok ? r.value : undefined);
+
+    const when = parseWhen({ at: value(at), days: value(days), every: value(every), on: value(on) });
+    if (!when.ok) return when;
+    const past = pastWhen(when.value, deps.now());
+    if (past) return { ok: false, error: `--on ${value(on)} --at ${value(at)}: ${past}` };
+    const text = value(prompt);
+    if (text === undefined || text.trim() === '') return { ok: false, error: '--session needs --prompt: the prompt is what it types into the session' };
+
+    const session = name.value ?? '';
+    const target = deps.sessionTarget(session);
+    if (!target.ok) return target;
+    const { agentKind, cwd, runId } = target.value;
+    if (!deps.promptKinds().includes(agentKind)) {
+        return { ok: false, error: `${agentKind} cannot take a scheduled --prompt: hwip has no rule that tells when it is idle, and a prompt typed into a dialog would answer it` };
+    }
+    const createdAt = new Date(deps.now()).toISOString();
+    const make = (id: string): Schedule => ({
+        v: 1,
+        id,
+        createdAt,
+        source: 'cli',
+        agentKind,
+        cwd,
+        label: `sched-${id}`,
+        session,
+        target: 'session',
+        runId,
+        prompt: text,
+        when: when.value,
+        // Kept for the file's shape; a session target has no runtime cap (the session is not the schedule's).
+        maxRuntimeMin: defaultMaxRuntimeMin(when.value),
+    });
+    const probe = validateSchedule(make('aaaaaa'));
+    const agentName = REMOTE_AGENTS.find((a) => a.kind === agentKind)?.displayName ?? agentKind;
+    return probe.ok ? { ok: true, value: { make, agentName } } : probe;
+};
+
 /** The schedule `hwip schedule add <words>` asks for, before it has an id. */
 export const buildSchedule = async (words: string[], deps: ScheduleCommandDeps): Promise<Checked<Built>> => {
     const cut = words.indexOf('--');
@@ -102,6 +168,7 @@ export const buildSchedule = async (words: string[], deps: ScheduleCommandDeps):
     const agentArgs = cut < 0 ? [] : words.slice(cut + 1);
     // `parseArgs` reads the words after the program name and script; the first word is the agent.
     const flags = parseArgs(['node', 'hwip', ...own]);
+    if (flags.session !== undefined) return buildSessionSchedule(flags, agentArgs, deps);
     const agentWord = String(flags._command);
     if (!agentWord) return { ok: false, error: 'schedule add needs an agent (hwip cc, codex, …)' };
     const agent = findAgentBySubcommand(agentWord);
@@ -185,9 +252,10 @@ const handleAdd = async (words: string[], json: boolean, deps: ScheduleCommandDe
         deps.err(`hwip schedule: ${built.error}`);
         return 2;
     }
-    // A listener older than `once` would skip the file, and the schedule would never run.
+    // A listener older than `once` and session targets would skip the file, and the schedule would never run.
     const probe = built.value.make('aaaaaa');
-    if (probe.when.kind === 'once' && deps.listenerRunning() && !(await deps.refreshListener())) {
+    const needsNewListener = probe.when.kind === 'once' || probe.target === 'session';
+    if (needsNewListener && deps.listenerRunning() && !(await deps.refreshListener())) {
         deps.err('hwip schedule: the listener running is an older hwip that could not be replaced, and it would not run this schedule: restart it, then add again');
         return 1;
     }
@@ -200,6 +268,9 @@ const handleAdd = async (words: string[], json: boolean, deps: ScheduleCommandDe
     const next = nextOccurrence(schedule.when, deps.now(), scheduleAnchor(schedule));
     if (json) {
         deps.out(JSON.stringify({ ...schedule, nextAt: isoOrNull(next) }));
+    } else if (schedule.target === 'session') {
+        deps.out(`scheduled ${schedule.id}: a prompt into session ${schedule.session} (${built.value.agentName}), ${describeWhen(schedule.when)}`
+            + `${next === null ? '' : `, next ${formatTime(next)}`}. It waits up to 30 min for the session to be idle and nobody typing at its terminal.`);
     } else {
         deps.out(`scheduled ${schedule.id}: ${built.value.agentName} in ${safeBasename(schedule.cwd)}, ${describeWhen(schedule.when)}`
             + `${next === null ? '' : `, next ${formatTime(next)}`} (session ${schedule.session}, ends after ${schedule.maxRuntimeMin}m)`);
@@ -224,6 +295,7 @@ const handleList = (json: boolean, deps: ScheduleCommandDeps): number => {
             cwd: schedule.cwd,
             label: schedule.label,
             session: schedule.session,
+            ...(schedule.target === 'session' ? { target: schedule.target, runId: schedule.runId } : {}),
             when: schedule.when,
             maxRuntimeMin: schedule.maxRuntimeMin,
             source: schedule.source,
@@ -242,6 +314,7 @@ const handleList = (json: boolean, deps: ScheduleCommandDeps): number => {
                 describeWhen(schedule.when),
                 `next ${next === null ? '-' : formatTime(next)}`,
                 `last ${last ? `${last.outcome} ${formatTime(last.at)}` : '-'}${running ? ' (running)' : ''}`,
+                ...(schedule.target === 'session' ? [`into ${schedule.session}`] : []),
             ].join('  '));
         }
     }
@@ -330,6 +403,7 @@ const buildChange = (current: Schedule, flags: Flags, deps: ScheduleCommandDeps)
         change.prompt = text;
     }
     if (value(maxRuntime) !== undefined) {
+        if (current.target === 'session') return { ok: false, error: '--max-runtime does not apply to a schedule into a session: it has no runtime cap' };
         const parsed = parseDuration(value(maxRuntime)!, '--max-runtime', '90m or 2h');
         if (!parsed.ok) return parsed;
         change.maxRuntimeMin = parsed.value;
@@ -417,6 +491,16 @@ export const liveScheduleDeps = (): ScheduleCommandDeps => ({
     refreshListener: async () => {
         await onStderr(() => ensureListenerRunning(false));
         return runningListenerPid() === null || !listenerVersionDrifted(runningListenerVersion(), VERSION);
+    },
+    sessionTarget: (name) => {
+        const tmuxRun = liveRunIdOf(name);
+        if (tmuxRun === undefined) return { ok: false, error: 'tmux did not answer (or gave an answer hwip could not read), so the session cannot be looked up' };
+        if (tmuxRun === null) return { ok: false, error: `${name} is not running ('hwip agent list' shows the sessions)` };
+        const runId = runOfTmuxSession(name, tmuxRun);
+        // The run as the listener wrote it down: its agent and directory, never a guess from an older run of the name.
+        const known = recallSession(name, Date.now(), runId);
+        if (!known) return { ok: false, error: `${name} is not a session the listener has seen: one hwip did not start, or one started moments ago (try again in a minute)` };
+        return { ok: true, value: { agentKind: known.agentKind, cwd: known.cwd, runId } };
     },
     out: (line) => console.log(line),
     err: (line) => console.error(line),

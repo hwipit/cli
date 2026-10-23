@@ -61,6 +61,7 @@ import {
     continuedRunId,
     forgetSession,
     knownSessions,
+    liveSessionOfRun,
     recallRun,
     runKey,
     recallSession,
@@ -127,7 +128,7 @@ import { createLanTransfer, type LanTransfer } from './lan-transfer.js';
 import { createDeviceKeyRegistration, type DeviceKeyRegistration } from './device-presence.js';
 import { PAYLOAD_LIMIT_BYTES, scanAgentCommands, type AgentCommandCatalog, type ScanResult } from './command-scan.js';
 import { hashListenerId, readMachineId, readStickyListenerId, rememberListenerId } from './listener-device-id.js';
-import { createPaneFitter, macosLastKeyAt, releaseStaleFits } from './pane-fit.js';
+import { createPaneFitter, lastClientUse, macosLastKeyAt, releaseStaleFits } from './pane-fit.js';
 import { log, silenceListenerLog } from './listener-log.js';
 import { invalidateTmuxSocketCache, tmuxArgs } from './tmux-socket.js';
 import {
@@ -6841,11 +6842,15 @@ export const listenerSettings = (args: Record<string, string | boolean>): Listen
     return { config, apiKey, baseUrl, features, ignored };
 };
 
+/** The desktop's key clock for `lastClientActivity`: a mouse move over a session's terminal is not someone typing. */
+const scheduleKeyClock = macosLastKeyAt();
+
 /**
  * What the schedule runner touches on this machine. A launch is `hwip <agent> --detach` run as a child of the
  * listener, in the schedule's directory with argv as an array; the project-dir env vars are dropped so the
  * child resolves its project from that directory, not from whatever shell started the listener.
  */
+
 export const liveScheduleRunnerDeps = (notify: ScheduleRunnerDeps['notify']): ScheduleRunnerDeps => ({
     listSchedules,
     readState: readScheduleState,
@@ -6880,6 +6885,8 @@ export const liveScheduleRunnerDeps = (notify: ScheduleRunnerDeps['notify']): Sc
         );
     },
     notify,
+    sessionOfRun: (runId, lastName, boundAt) => liveSessionOfRun(runId, lastName, { names: liveSessionNames, runIdOf: liveRunIdOf }, Date.now(), boundAt),
+    lastClientActivity: (session) => lastClientUse(runTmux, session, scheduleKeyClock),
     removeSchedule,
 });
 

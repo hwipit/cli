@@ -224,6 +224,54 @@ export const continuedRunId = (
 export const runOfTmuxSession = (name: string, tmuxRunId: string, now: number = Date.now()): string =>
     knownSessions(now).find((e) => e.name === name && e.tmuxRunIds?.includes(tmuxRunId))?.runId ?? tmuxRunId;
 
+/** How long after a schedule is tied to a run the registry may still be without a record of it (the listener's sweep writes it). */
+export const UNRECORDED_RUN_GRACE_MS = 10 * 60_000;
+
+/** What tmux is asked to find a run: `liveSessionNames` and `liveRunIdOf` (`tmux-liveness.ts`), passed in so this file stays free of tmux. */
+export interface TmuxRuns {
+    /** Every session name tmux holds; null when no tmux answered. */
+    names: () => string[] | null;
+    /** The `session_created` of the tmux session under `name`; null when there is none, undefined when tmux did not answer. */
+    runIdOf: (name: string) => string | null | undefined;
+}
+
+/** Where a run is now: the tmux session it goes on in, `ended` when tmux answered and none holds it, `unknown` when tmux could not say. */
+export type RunWhereabouts = { name: string } | 'ended' | 'unknown';
+
+/**
+ * The tmux session run `runId` goes on in now. The names it is looked for under are `lastName` (where it was last seen —
+ * the registry may not have written a new run down yet) and every name the registry has seen it under (a resume can
+ * carry it to another one). A name holds it when the tmux session under it is that run (`runOfTmuxSession`), so a name
+ * a new run took over does not count. tmux is asked for its names once and for each candidate once.
+ *
+ * "Ended" only when tmux answered for every candidate: a failure to ask is `unknown`, which a caller waits out rather
+ * than reporting the run as over. So is a run the registry has no record of within `UNRECORDED_RUN_GRACE_MS` of
+ * `boundAt` (when the caller tied itself to the run): the sweep may not have written it down yet, and it may have gone
+ * on under a name nobody knows. Later, no record means the record expired or was evicted — the run is over.
+ */
+export const liveSessionOfRun = (
+    runId: string,
+    lastName: string,
+    tmux: TmuxRuns,
+    now: number = Date.now(),
+    boundAt: number = now,
+): RunWhereabouts => {
+    const names = tmux.names();
+    if (names === null) return 'unknown';
+    const running = new Set(names);
+    const recorded = knownSessions(now).filter((e) => e.runId === runId);
+    const candidates = [...new Set([lastName, ...recorded.map((e) => e.name)])];
+    let unsure = false;
+    for (const name of candidates) {
+        if (!running.has(name)) continue;
+        const tmuxRunId = tmux.runIdOf(name);
+        if (tmuxRunId === undefined) unsure = true;
+        else if (tmuxRunId !== null && runOfTmuxSession(name, tmuxRunId, now) === runId) return { name };
+    }
+    const notWrittenYet = recorded.length === 0 && now - boundAt < UNRECORDED_RUN_GRACE_MS;
+    return unsure || notWrittenYet ? 'unknown' : 'ended';
+};
+
 let readOnly = false;
 
 /**

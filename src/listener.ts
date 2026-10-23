@@ -135,7 +135,7 @@ import {
     detectRemoteAgent, FIELD_SEP, isSubagentSessionName, readPaneInfo, recordSubagentTranscripts, recordTargets,
     subagentTranscriptFor, tmuxTargetFor, type PaneInfo,
 } from './tmux-pane.js';
-import { liveRunIdOf, liveSessionNames, sessionExists, sessionLiveness } from './tmux-liveness.js';
+import { liveRunIdOf, liveSessionNames, liveTmuxRuns, sessionExists, sessionLiveness } from './tmux-liveness.js';
 import { familyNames } from './wrapper.js';
 import { noteRunSeqs, runSeqsByRun, runSeqsKey, type RunSeqs } from './run-seqs.js';
 import { FlagValueError, flagOn } from './args.js';
@@ -876,8 +876,10 @@ const worktreeCleanup = createWorktreeCleanup({
     tmux: (args, timeoutMs) => tmuxRun(tmuxArgs(args), timeoutMs),
 });
 
+/** The desktop's key clock (pane-fit.ts): a mouse move over a session's terminal is not someone typing. */
+const desktopKeyClock = macosLastKeyAt();
 /** Sizes a watched window to its viewer while the phone is its latest user (pane-fit.ts). */
-const paneFitter = createPaneFitter(runTmux, undefined, macosLastKeyAt());
+const paneFitter = createPaneFitter(runTmux, undefined, desktopKeyClock);
 /** Test hook. */
 export const resetPaneFitClaims = (): void => paneFitter.forgetClaims();
 /** How often fitted windows are checked for a desktop that took them back; idle windows cost nothing. */
@@ -6842,15 +6844,11 @@ export const listenerSettings = (args: Record<string, string | boolean>): Listen
     return { config, apiKey, baseUrl, features, ignored };
 };
 
-/** The desktop's key clock for `lastClientActivity`: a mouse move over a session's terminal is not someone typing. */
-const scheduleKeyClock = macosLastKeyAt();
-
 /**
  * What the schedule runner touches on this machine. A launch is `hwip <agent> --detach` run as a child of the
  * listener, in the schedule's directory with argv as an array; the project-dir env vars are dropped so the
  * child resolves its project from that directory, not from whatever shell started the listener.
  */
-
 export const liveScheduleRunnerDeps = (notify: ScheduleRunnerDeps['notify']): ScheduleRunnerDeps => ({
     listSchedules,
     readState: readScheduleState,
@@ -6885,8 +6883,8 @@ export const liveScheduleRunnerDeps = (notify: ScheduleRunnerDeps['notify']): Sc
         );
     },
     notify,
-    sessionOfRun: (runId, lastName, boundAt) => liveSessionOfRun(runId, lastName, { names: liveSessionNames, runIdOf: liveRunIdOf }, Date.now(), boundAt),
-    lastClientActivity: (session) => lastClientUse(runTmux, session, scheduleKeyClock),
+    sessionOfRun: (runId, lastName, boundAt) => liveSessionOfRun(runId, lastName, liveTmuxRuns, Date.now(), boundAt),
+    lastClientActivity: (session) => lastClientUse(runTmux, session, desktopKeyClock),
     removeSchedule,
 });
 

@@ -26,12 +26,11 @@ import {
     recallRun,
     recallSession,
     registryUnreadable,
-    runOfTmuxSession,
     sessionDirectoryExists,
     type KnownSession,
     type TmuxRuns,
 } from './session-registry.js';
-import { liveRunIdOf, liveSessionNames } from './tmux-liveness.js';
+import { liveRunOf, liveTmuxRuns } from './tmux-liveness.js';
 import { safeBasename, tmuxSessionName } from './wrapper.js';
 
 /** One schedule as the app lists it. No directory path and no agent arguments: the phone never names or reads either. */
@@ -109,8 +108,6 @@ const askingOnce = (tmux: TmuxRuns): TmuxRuns => {
         },
     };
 };
-
-const liveTmuxRuns: TmuxRuns = { names: liveSessionNames, runIdOf: liveRunIdOf };
 
 /** What the list says about a session target's run: only `ended` is news (the app shows "session ended"). */
 const targetFields = (schedule: Schedule, now: number, tmux: TmuxRuns): Pick<PhoneScheduleItem, 'target' | 'runId' | 'sessionEnded'> => {
@@ -195,10 +192,7 @@ export const livePhoneScheduleDeps: PhoneScheduleDeps = {
     recall: (session, agentKind) => (agentKind === undefined ? recallSession(session) : recallRun(session, agentKind)),
     directoryExists: sessionDirectoryExists,
     canPrompt: canPromptKind,
-    currentRun: (session) => {
-        const tmuxRun = liveRunIdOf(session);
-        return typeof tmuxRun === 'string' ? runOfTmuxSession(session, tmuxRun) : tmuxRun;
-    },
+    currentRun: liveRunOf,
     recallRunOf: (session, runId, now) => recallSession(session, now, runId) ?? (registryUnreadable() ? 'unreadable' : null),
 };
 

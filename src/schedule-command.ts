@@ -33,8 +33,8 @@ import { checkoutOf, VERSION } from './config.js';
 import { runningListenerPid, runningListenerVersion } from './listener-process.js';
 import { findAgentBySubcommand, REMOTE_AGENTS } from './remote-agents.js';
 import { promptableScheduleKinds } from './schedule-ready.js';
-import { recallSession, runOfTmuxSession } from './session-registry.js';
-import { liveRunIdOf } from './tmux-liveness.js';
+import { recallSession } from './session-registry.js';
+import { liveRunOf } from './tmux-liveness.js';
 import { detectProjectDir, ensureListenerRunning, listenerVersionDrifted, safeBasename, sanitizeLabel, tmuxSessionName } from './wrapper.js';
 import { isValidBranchName, worktreeDirName } from './worktree.js';
 
@@ -493,10 +493,9 @@ export const liveScheduleDeps = (): ScheduleCommandDeps => ({
         return runningListenerPid() === null || !listenerVersionDrifted(runningListenerVersion(), VERSION);
     },
     sessionTarget: (name) => {
-        const tmuxRun = liveRunIdOf(name);
-        if (tmuxRun === undefined) return { ok: false, error: 'tmux did not answer (or gave an answer hwip could not read), so the session cannot be looked up' };
-        if (tmuxRun === null) return { ok: false, error: `${name} is not running ('hwip agent list' shows the sessions)` };
-        const runId = runOfTmuxSession(name, tmuxRun);
+        const runId = liveRunOf(name);
+        if (runId === undefined) return { ok: false, error: 'tmux did not answer (or gave an answer hwip could not read), so the session cannot be looked up' };
+        if (runId === null) return { ok: false, error: `${name} is not running ('hwip agent list' shows the sessions)` };
         // The run as the listener wrote it down: its agent and directory, never a guess from an older run of the name.
         const known = recallSession(name, Date.now(), runId);
         if (!known) return { ok: false, error: `${name} is not a session the listener has seen: one hwip did not start, or one started moments ago (try again in a minute)` };

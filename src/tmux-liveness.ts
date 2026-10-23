@@ -1,5 +1,5 @@
 import { spawnSync } from 'child_process';
-import type { SessionLiveness } from './session-registry.js';
+import { runOfTmuxSession, type SessionLiveness, type TmuxRuns } from './session-registry.js';
 import { isSubagentSessionName, subagentTranscriptsBySession, targetsBySession } from './tmux-pane.js';
 import { tmuxArgs } from './tmux-socket.js';
 
@@ -42,6 +42,15 @@ export const liveRunIdOf = (name: string): string | null | undefined => {
         if (tab > 0 && line.slice(0, tab) === name) return /^\d{1,12}$/.test(line.slice(tab + 1).trim()) ? line.slice(tab + 1).trim() : undefined;
     }
     return null;
+};
+
+/** What `liveSessionOfRun` (session-registry.ts) asks tmux. */
+export const liveTmuxRuns: TmuxRuns = { names: liveSessionNames, runIdOf: liveRunIdOf };
+
+/** The run going on under `name` now (`runOfTmuxSession`): null when the name is not running, undefined when no tmux answered. */
+export const liveRunOf = (name: string): string | null | undefined => {
+    const tmuxRun = liveRunIdOf(name);
+    return typeof tmuxRun === 'string' ? runOfTmuxSession(name, tmuxRun) : tmuxRun;
 };
 
 /**

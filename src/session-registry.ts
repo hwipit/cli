@@ -232,9 +232,9 @@ export const continuedRunId = (
     return earlier?.runId ?? tmuxRunId;
 };
 
-/** The run going on in tmux session `tmuxRunId` of `name`: the one it was joined to, else its own. */
-export const runOfTmuxSession = (name: string, tmuxRunId: string, now: number = Date.now()): string =>
-    knownSessions(now).find((e) => e.name === name && e.tmuxRunIds?.includes(tmuxRunId))?.runId ?? tmuxRunId;
+/** The run going on in tmux session `tmuxRunId` of `name`: the one it was joined to, else its own. `known` is the registry as read. */
+export const runOfTmuxSession = (name: string, tmuxRunId: string, now: number = Date.now(), known: KnownSession[] = knownSessions(now)): string =>
+    known.find((e) => e.name === name && e.tmuxRunIds?.includes(tmuxRunId))?.runId ?? tmuxRunId;
 
 /** How long after a schedule is tied to a run the registry may still be without a record of it (the listener's sweep writes it). */
 export const UNRECORDED_RUN_GRACE_MS = 10 * 60_000;
@@ -272,14 +272,15 @@ export const liveSessionOfRun = (
     const names = tmux.names();
     if (names === null) return 'unknown';
     const running = new Set(names);
-    const recorded = knownSessions(now).filter((e) => e.runId === runId);
+    const known = knownSessions(now);
+    const recorded = known.filter((e) => e.runId === runId);
     const candidates = [...new Set([lastName, ...recorded.map((e) => e.name)])];
     let unsure = false;
     for (const name of candidates) {
         if (!running.has(name)) continue;
         const tmuxRunId = tmux.runIdOf(name);
         if (tmuxRunId === undefined) unsure = true;
-        else if (tmuxRunId !== null && runOfTmuxSession(name, tmuxRunId, now) === runId) return { name };
+        else if (tmuxRunId !== null && runOfTmuxSession(name, tmuxRunId, now, known) === runId) return { name };
     }
     const noRecord = recorded.length === 0 && (now - boundAt < UNRECORDED_RUN_GRACE_MS || registryUnreadable());
     return unsure || noRecord ? 'unknown' : 'ended';

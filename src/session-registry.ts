@@ -147,6 +147,18 @@ const writeAll = (entries: KnownSession[]): void => {
 export const runKey = (name: string, agentKind: string, runId?: string): string =>
     `${name}\u0000${agentKind}\u0000${runId ?? ''}`;
 
+/**
+ * The registry file is there but would not read as a list: what `knownSessions` returns then is not all there is
+ * (it reads as empty). No file yet is not unreadable.
+ */
+export const registryUnreadable = (): boolean => {
+    try {
+        return !Array.isArray(JSON.parse(readFileSync(registryPath(), 'utf-8')));
+    } catch (e) {
+        return !(e instanceof Error && 'code' in e && e.code === 'ENOENT');
+    }
+};
+
 /** Sessions this machine has seen, newest first, expired ones dropped. */
 export const knownSessions = (now: number = Date.now()): KnownSession[] =>
     readAll()
@@ -247,7 +259,8 @@ export type RunWhereabouts = { name: string } | 'ended' | 'unknown';
  * "Ended" only when tmux answered for every candidate: a failure to ask is `unknown`, which a caller waits out rather
  * than reporting the run as over. So is a run the registry has no record of within `UNRECORDED_RUN_GRACE_MS` of
  * `boundAt` (when the caller tied itself to the run): the sweep may not have written it down yet, and it may have gone
- * on under a name nobody knows. Later, no record means the record expired or was evicted — the run is over.
+ * on under a name nobody knows. Later, no record means the record expired or was evicted — the run is over — unless
+ * the registry file would not read, which says nothing either way.
  */
 export const liveSessionOfRun = (
     runId: string,
@@ -268,8 +281,8 @@ export const liveSessionOfRun = (
         if (tmuxRunId === undefined) unsure = true;
         else if (tmuxRunId !== null && runOfTmuxSession(name, tmuxRunId, now) === runId) return { name };
     }
-    const notWrittenYet = recorded.length === 0 && now - boundAt < UNRECORDED_RUN_GRACE_MS;
-    return unsure || notWrittenYet ? 'unknown' : 'ended';
+    const noRecord = recorded.length === 0 && (now - boundAt < UNRECORDED_RUN_GRACE_MS || registryUnreadable());
+    return unsure || noRecord ? 'unknown' : 'ended';
 };
 
 let readOnly = false;

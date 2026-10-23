@@ -544,7 +544,10 @@ describe('liveSessionOfRun (session target)', () => {
         expect(liveSessionOfRun('100', 'hwip-api', tmux({ 'hwip-api': '300' }), T0, T0 - 60_000)).toBe('unknown');
         writeFileSync(knownSessionsPath(), '{ not json');
         expect(liveSessionOfRun('100', 'hwip-api', tmux({}), T0, T0 - 60_000)).toBe('unknown');
+        // A registry that would not read says nothing about the run, however long ago it was bound.
+        expect(liveSessionOfRun('100', 'hwip-api', tmux({}), T0, T0 - UNRECORDED_RUN_GRACE_MS - 1)).toBe('unknown');
         // Long after the binding: the record was there and went (expired after 30 days, or evicted): the run is over.
+        write([]);
         expect(liveSessionOfRun('100', 'hwip-api', tmux({}), T0, T0 - UNRECORDED_RUN_GRACE_MS - 1)).toBe('ended');
     });
 

@@ -56,6 +56,13 @@ export interface Schedule {
     maxRuntimeMin: number;
 }
 
+/**
+ * Advertised in the listener's presence (`device-presence.ts`): this build runs `once` schedules and schedules into a
+ * session (`target: 'session'`). An older listener refuses both as fields it does not know, so the apps offer them only
+ * to a computer that lists this.
+ */
+export const SCHEDULE_SESSION_CAPABILITY = 'schedule-session-v1';
+
 export type Checked<T> = { ok: true; value: T } | { ok: false; error: string };
 
 const isErrno = (err: unknown, code: string): boolean => err instanceof Error && 'code' in err && err.code === code;

@@ -28,6 +28,8 @@ import { projectTranscriptEntries, type TurnEvent } from './transcript-tail.js';
 // server — nothing here touches a listener, a network or the user's state.
 
 const DEVICE = 'dev_listener_abc123';
+/** The run every test session is in, unless a test says otherwise. */
+const RUN = '1789999999';
 const PHONE: RecorderRecipient = { deviceId: 'dev_phone', publicKey: 'phone-key' };
 
 let dir: string;
@@ -127,7 +129,7 @@ describe('first sight of a session', () => {
         const rig = newRig();
         writeFileSync(transcript('a'), prompt('hello') + answer('hi there') + tool('t1'));
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
 
         await advance(recorder, 1000);
 
@@ -148,7 +150,7 @@ describe('first sight of a session', () => {
         for (let i = 0; i < 600; i++) text += answer(`line ${i}`);
         writeFileSync(transcript('a'), text);
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
 
         await advance(recorder, 3000);
 
@@ -162,7 +164,7 @@ describe('first sight of a session', () => {
         const rig = newRig();
         writeFileSync(transcript('a'), prompt('x'));
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(recorder, 1000);
 
         const seq = rig.uploads[0]!.chunk.seq;
@@ -174,7 +176,7 @@ describe('first sight of a session', () => {
         const rig = newRig();
         writeFileSync(transcript('a'), prompt('x'));
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'gemini' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'gemini', runId: RUN } });
         await advance(recorder, 5000);
         expect(rig.uploads).toEqual([]);
     });
@@ -185,7 +187,7 @@ describe('when events go out', () => {
         const rig = newRig();
         writeFileSync(transcript('a'), prompt('first'));
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(recorder, 1000);
         rig.uploads.length = 0;
         return { rig, recorder };
@@ -252,14 +254,14 @@ describe('restarts and crashes', () => {
         const rig = newRig();
         writeFileSync(transcript('a'), prompt('one') + answer('two'));
         const first = makeRecorder(rig);
-        first.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        first.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(first, 1000);
         const sentBefore = eventsOf(rig).length;
 
         // The listener restarts; the conversation went on while it was down.
         appendFileSync(transcript('a'), prompt('three'));
         const second = makeRecorder(rig);
-        second.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        second.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(second, 1000);
 
         expect(sentBefore).toBe(2);
@@ -274,13 +276,13 @@ describe('restarts and crashes', () => {
         const cut = Math.floor(half.length / 2);
         writeFileSync(transcript('a'), prompt('whole') + half.slice(0, cut));
         const first = makeRecorder(rig);
-        first.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        first.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(first, 3000);
         expect(eventsOf(rig).map((e) => (e as { text?: string }).text)).toEqual(['whole']);
 
         appendFileSync(transcript('a'), half.slice(cut));
         const second = makeRecorder(rig);
-        second.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        second.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(second, 3000);
 
         expect(eventsOf(rig).map((e) => (e as { text?: string }).text)).toEqual(['whole', 'written in two goes']);
@@ -291,7 +293,7 @@ describe('restarts and crashes', () => {
         rig.outcome = () => ({ kind: 'retry', why: 'offline' });
         writeFileSync(transcript('a'), prompt('one'));
         const first = makeRecorder(rig);
-        first.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        first.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(first, 1000);
         const stored = readSessionState(stateDir, `${DEVICE}:hwip-a`)!.outbox;
         expect(stored).toHaveLength(1);
@@ -300,7 +302,7 @@ describe('restarts and crashes', () => {
         rig.outcome = () => ({ kind: 'ok' });
         appendFileSync(transcript('a'), prompt('two'));
         const second = makeRecorder(rig);
-        second.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        second.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(second, 1000);
 
         expect(rig.uploads[0]!.chunk).toEqual(stored[0]);
@@ -321,7 +323,7 @@ describe('restarts and crashes', () => {
             now: () => clock,
         });
         writeFileSync(transcript('a'), prompt('the password is hunter2') + answer('noted: hunter2'));
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(recorder, 3000);
 
         const files = readdirSync(stateDir);
@@ -337,14 +339,14 @@ describe('restarts and crashes', () => {
         const rig = newRig();
         writeFileSync(transcript('a'), prompt('one'));
         const first = makeRecorder(rig);
-        first.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        first.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(first, 1000);
         const file = join(stateDir, readdirSync(stateDir)[0]!);
         writeFileSync(file, '{not json');
 
         rig.uploads.length = 0;
         const second = makeRecorder(rig);
-        second.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        second.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(second, 1000);
 
         // A fresh start: the conversation is backfilled, not lost and not a crash.
@@ -358,7 +360,7 @@ describe('a transcript that changes while the listener is down', () => {
         const history = prompt('one');
         writeFileSync(transcript('old'), history);
         const first = makeRecorder(rig);
-        first.observe({ 'hwip-a': { path: transcript('old'), kind: 'claude' } });
+        first.observe({ 'hwip-a': { path: transcript('old'), kind: 'claude', runId: RUN } });
         await advance(first, 1000);
 
         // Listener down: the conversation went on in the old file, then /clear.
@@ -366,7 +368,7 @@ describe('a transcript that changes while the listener is down', () => {
         appendFileSync(transcript('old'), offline);
         writeFileSync(transcript('new'), prompt('after clear'));
         const second = makeRecorder(rig);
-        second.observe({ 'hwip-a': { path: transcript('new'), kind: 'claude' } });
+        second.observe({ 'hwip-a': { path: transcript('new'), kind: 'claude', runId: RUN } });
         await advance(second, 3000);
 
         expect(eventsOf(rig).map((e) => (e as { text?: string }).text)).toEqual(['one', 'said while offline', 'after clear']);
@@ -376,7 +378,7 @@ describe('a transcript that changes while the listener is down', () => {
         const rig = newRig();
         writeFileSync(transcript('old'), prompt('one'));
         const first = makeRecorder(rig);
-        first.observe({ 'hwip-a': { path: transcript('old'), kind: 'claude' } });
+        first.observe({ 'hwip-a': { path: transcript('old'), kind: 'claude', runId: RUN } });
         await advance(first, 1000);
 
         let big = '';
@@ -384,7 +386,7 @@ describe('a transcript that changes while the listener is down', () => {
         writeFileSync(transcript('new'), big);
         expect(statSync(transcript('new')).size).toBeGreaterThan(256 * 1024);
         const second = makeRecorder(rig);
-        second.observe({ 'hwip-a': { path: transcript('new'), kind: 'claude' } });
+        second.observe({ 'hwip-a': { path: transcript('new'), kind: 'claude', runId: RUN } });
         await advance(second, 60_000);
 
         const texts = eventsOf(rig).map((e) => (e as { text?: string }).text ?? '');
@@ -399,7 +401,7 @@ describe('a transcript that changes while the listener is down', () => {
         for (let i = 0; i < 3000; i++) history += answer(`h${i} ${'x'.repeat(80)}`);
         writeFileSync(transcript('old'), history);
         const first = makeRecorder(rig);
-        first.observe({ 'hwip-a': { path: transcript('old'), kind: 'claude' } });
+        first.observe({ 'hwip-a': { path: transcript('old'), kind: 'claude', runId: RUN } });
         await advance(first, 60_000);
         const sent = eventsOf(rig).length;
         expect(statSync(transcript('old')).size).toBeGreaterThan(256 * 1024);
@@ -408,7 +410,7 @@ describe('a transcript that changes while the listener is down', () => {
         writeFileSync(transcript('new'), history + prompt('later'));
         const second = makeRecorder(rig);
         for (let i = 0; i < 40; i++) {
-            second.observe({ 'hwip-a': { path: transcript('new'), kind: 'claude' } });
+            second.observe({ 'hwip-a': { path: transcript('new'), kind: 'claude', runId: RUN } });
             await advance(second, 1000);
         }
 
@@ -420,7 +422,7 @@ describe('a transcript that changes while the listener is down', () => {
         const history = prompt('one') + answer('two');
         writeFileSync(transcript('a'), history);
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(recorder, 1000);
 
         // Replaced in place (a new inode, same name), with the old entries first.
@@ -438,7 +440,7 @@ describe('what is stored when the key or the line is odd', () => {
         rig.ready = false;
         writeFileSync(transcript('a'), prompt('one'));
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(recorder, 3000);
         expect(readSessionState(stateDir, `${DEVICE}:hwip-a`)!.outbox).toHaveLength(1);
 
@@ -461,16 +463,16 @@ describe('what is stored when the key or the line is odd', () => {
         writeFileSync(transcript('a'), prompt('before'));
         const beforeEnd = statSync(transcript('a')).size;
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(recorder, 1000);
         appendFileSync(transcript('a'), '{"type":"user","pad":"' + 'z'.repeat(1_300_000));
         for (let i = 0; i < 12; i++) {
-            recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+            recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
             await advance(recorder, 1000);
         }
         rig.sealFails = false;
         for (let i = 0; i < 4; i++) {
-            recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+            recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
             await advance(recorder, 1000);
         }
         // A restart here must not resume inside that line: it resumes where the line began.
@@ -478,7 +480,7 @@ describe('what is stored when the key or the line is odd', () => {
 
         appendFileSync(transcript('a'), '"}\n' + prompt('after'));
         for (let i = 0; i < 4; i++) {
-            recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+            recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
             await advance(recorder, 1000);
         }
         expect(eventsOf(rig).map((e) => (e as { text?: string }).text)).toEqual(['before', 'after']);
@@ -490,14 +492,14 @@ describe('a file that ends badly, and copies without a time', () => {
         const rig = newRig();
         writeFileSync(transcript('old'), prompt('one'));
         const first = makeRecorder(rig);
-        first.observe({ 'hwip-a': { path: transcript('old'), kind: 'claude' } });
+        first.observe({ 'hwip-a': { path: transcript('old'), kind: 'claude', runId: RUN } });
         await advance(first, 1000);
 
         // The agent died inside a huge line, then /clear began another file.
         appendFileSync(transcript('old'), prompt('before tear') + '{"type":"user","pad":"' + 'z'.repeat(1_300_000));
         writeFileSync(transcript('new'), prompt('after clear'));
         for (let i = 0; i < 20; i++) {
-            first.observe({ 'hwip-a': { path: transcript('new'), kind: 'claude' } });
+            first.observe({ 'hwip-a': { path: transcript('new'), kind: 'claude', runId: RUN } });
             await advance(first, 1000);
         }
 
@@ -516,14 +518,14 @@ describe('a file that ends badly, and copies without a time', () => {
         const history = prompt('one') + result;
         writeFileSync(transcript('old'), history);
         const first = makeRecorder(rig);
-        first.observe({ 'hwip-a': { path: transcript('old'), kind: 'claude' } });
+        first.observe({ 'hwip-a': { path: transcript('old'), kind: 'claude', runId: RUN } });
         await advance(first, 1000);
         const sent = eventsOf(rig).length;
         expect(kinds(eventsOf(rig))).toEqual(['prompt', 'tool_result']);
 
         writeFileSync(transcript('new'), history + prompt('later'));
         const second = makeRecorder(rig);
-        second.observe({ 'hwip-a': { path: transcript('new'), kind: 'claude' } });
+        second.observe({ 'hwip-a': { path: transcript('new'), kind: 'claude', runId: RUN } });
         await advance(second, 3000);
 
         expect(eventsOf(rig).slice(sent).map((e) => (e as { text?: string }).text)).toEqual(['later']);
@@ -548,7 +550,7 @@ describe('what the server says about a chunk', () => {
         rig.latest = 900_000_000_000;
         writeFileSync(transcript('a'), prompt('one'));
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(recorder, 1000);
         appendFileSync(transcript('a'), prompt('two'));
         await advance(recorder, 1000);
@@ -562,7 +564,7 @@ describe('what the server says about a chunk', () => {
         rig.latest = null;
         writeFileSync(transcript('a'), prompt('one'));
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(recorder, 1000);
         const startedAt = Math.floor(clock / 1000) * 100;
         appendFileSync(transcript('a'), prompt('two'));
@@ -581,9 +583,9 @@ describe('what the server says about a chunk', () => {
         };
         writeFileSync(transcript('a'), prompt('one'));
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         for (let i = 0; i < 6; i++) {
-            recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+            recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
             await advance(recorder, 300_000, 50_000);
         }
         expect(rig.uploads).toEqual([]);
@@ -591,7 +593,7 @@ describe('what the server says about a chunk', () => {
         expect(logs.some((l) => l.includes('dropped chunk') && l.includes('5 times'))).toBe(true);
 
         appendFileSync(transcript('a'), prompt('two'));
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(recorder, 1000);
         expect(eventsOf(rig).map((e) => (e as { text?: string }).text)).toEqual(['two']);
     });
@@ -608,7 +610,7 @@ describe('what the server says about a chunk', () => {
         writeFileSync(transcript('a'), prompt('one'));
         const recorder = makeRecorder(rig);
         for (let i = 0; i < 8; i++) {
-            recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+            recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
             await advance(recorder, 60_000, 30_000);
         }
         expect(kinds(eventsOf(rig))).toEqual(['prompt']);
@@ -626,7 +628,7 @@ describe('what the server says about a chunk', () => {
         writeFileSync(transcript('a'), prompt('one'));
         const recorder = makeRecorder(rig);
         for (let i = 0; i < 10; i++) {
-            recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+            recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
             await advance(recorder, 60_000, 30_000);
         }
         expect(kinds(eventsOf(rig))).toEqual(['prompt']);
@@ -638,7 +640,7 @@ describe('what the server says about a chunk', () => {
         rig.latest = 5;
         writeFileSync(transcript('a'), prompt('one'));
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(recorder, 1000);
         appendFileSync(transcript('a'), prompt('two'));
         await advance(recorder, 1000);
@@ -650,7 +652,7 @@ describe('what the server says about a chunk', () => {
         clock = Date.UTC(2026, 9, 3);
         writeFileSync(transcript('old'), prompt('one'));
         const first = makeRecorder(rig);
-        first.observe({ 'hwip-a': { path: transcript('old'), kind: 'claude' } });
+        first.observe({ 'hwip-a': { path: transcript('old'), kind: 'claude', runId: RUN } });
         await advance(first, 1000);
         // A line with no time of its own: its chunk is stamped with the clock, which is later than the file's lines.
         appendFileSync(transcript('old'), `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'untimed' } })}\n`);
@@ -658,7 +660,7 @@ describe('what the server says about a chunk', () => {
 
         writeFileSync(transcript('new'), prompt('after'));
         const second = makeRecorder(rig);
-        second.observe({ 'hwip-a': { path: transcript('new'), kind: 'claude' } });
+        second.observe({ 'hwip-a': { path: transcript('new'), kind: 'claude', runId: RUN } });
         await advance(second, 3000);
         expect(eventsOf(rig).map((e) => (e as { text?: string }).text)).toEqual(['one', 'untimed', 'after']);
     });
@@ -667,9 +669,9 @@ describe('what the server says about a chunk', () => {
         const rig = newRig();
         writeFileSync(transcript('a'), prompt('p0'));
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         for (let i = 1; i <= 100; i++) {
-            recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+            recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
             await advance(recorder, 1000);
             appendFileSync(transcript('a'), prompt(`p${i}`));
         }
@@ -686,7 +688,7 @@ describe('upload failures', () => {
         rig.outcome = () => (down ? { kind: 'retry', why: 'HTTP 503' } : { kind: 'ok' });
         writeFileSync(transcript('a'), prompt('one'));
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(recorder, 1000);
         appendFileSync(transcript('a'), prompt('two'));
         await advance(recorder, 1000);
@@ -713,8 +715,8 @@ describe('upload failures', () => {
         writeFileSync(transcript('b'), prompt('other'));
         const recorder = makeRecorder(rig);
         recorder.observe({
-            'hwip-a': { path: transcript('a'), kind: 'claude' },
-            'hwip-b': { path: transcript('b'), kind: 'claude' },
+            'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN },
+            'hwip-b': { path: transcript('b'), kind: 'claude', runId: RUN },
         });
         await advance(recorder, 2000);
 
@@ -732,7 +734,7 @@ describe('upload failures', () => {
         rig.outcome = () => ({ kind: 'retry', why: 'offline', afterMs: 60 * 60_000 });
         writeFileSync(transcript('a'), prompt('p0'));
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(recorder, 1000);
         for (let i = 1; i < RECORDER_OUTBOX_MAX + 5; i++) {
             appendFileSync(transcript('a'), prompt(`p${i}`));
@@ -753,7 +755,7 @@ describe('upload failures', () => {
         rig.sealFails = true;
         writeFileSync(transcript('a'), prompt('one'));
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(recorder, 3000);
         expect(rig.uploads).toEqual([]);
         expect(readSessionState(stateDir, `${DEVICE}:hwip-a`)).toBeNull();
@@ -772,7 +774,7 @@ describe('what the recorder does when something is wrong', () => {
         rig.outcome = () => (++calls === 1 ? { kind: 'drop', why: 'HTTP 400 VALIDATION_ERROR' } : { kind: 'ok' });
         writeFileSync(transcript('a'), prompt('bad'));
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(recorder, 1000);
         appendFileSync(transcript('a'), prompt('good'));
         await advance(recorder, 1000);
@@ -789,7 +791,7 @@ describe('what the recorder does when something is wrong', () => {
         rig.dir = join(blocker, 'state');
         writeFileSync(transcript('a'), prompt('one'));
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(recorder, 3000);
         expect(rig.uploads).toEqual([]);
         expect(logs.some((l) => l.includes('could not write state'))).toBe(true);
@@ -815,7 +817,7 @@ describe('what the recorder does when something is wrong', () => {
             now: () => clock,
         });
         writeFileSync(transcript('a'), prompt('one'));
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         const slow = recorder.tick();
         await recorder.tick();
         await recorder.tick();
@@ -838,7 +840,7 @@ describe('what the recorder does when something is wrong', () => {
             now: () => clock,
         });
         writeFileSync(transcript('a'), prompt('one'));
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
 
         // Rounds that ask while the lookup is out wait for it (up to its own timeout): they are not awaited here.
         void recorder.tick();
@@ -869,7 +871,7 @@ describe('what the recorder does when something is wrong', () => {
         });
         writeFileSync(transcript('a'), prompt('a0'));
         writeFileSync(transcript('b'), answer('b0'));
-        const observe = () => recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' }, 'hwip-b': { path: transcript('b'), kind: 'claude' } });
+        const observe = () => recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN }, 'hwip-b': { path: transcript('b'), kind: 'claude', runId: RUN } });
         observe();
         void recorder.tick(); // a's upload hangs here
         await new Promise((resolve) => setTimeout(resolve, 5));
@@ -900,7 +902,7 @@ describe('what the recorder does when something is wrong', () => {
                 now: () => clock,
             });
             writeFileSync(transcript('a'), prompt('one'));
-            recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+            recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
 
             const round = recorder.tick();
             await vi.advanceTimersByTimeAsync(RECORDER_RECIPIENTS_TIMEOUT_MS);
@@ -928,7 +930,7 @@ describe('what the recorder does when something is wrong', () => {
         rig.ready = false;
         writeFileSync(transcript('a'), prompt('one'));
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(recorder, 5000);
         expect(rig.uploads).toEqual([]);
         expect(logs.filter((l) => l.includes('key is not registered'))).toHaveLength(1);
@@ -947,7 +949,7 @@ describe('what the recorder does when something is wrong', () => {
         }) as typeof projectTranscriptEntries;
         writeFileSync(transcript('a'), prompt('unreadable'));
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(recorder, 1000);
         appendFileSync(transcript('a'), prompt('fine'));
         await advance(recorder, 1000);
@@ -965,7 +967,7 @@ describe('what the recorder does when something is wrong', () => {
         }) as typeof projectTranscriptEntries;
         writeFileSync(transcript('a'), prompt('start'));
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(recorder, 1000);
         rig.uploads.length = 0;
 
@@ -981,7 +983,7 @@ describe('what the recorder does when something is wrong', () => {
         rig.sealFails = false;
         // The sweep names the session again every few seconds, as it does in the listener.
         for (let i = 0; i < 300; i++) {
-            recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+            recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
             await advance(recorder, 5000, 5000);
         }
         const texts = eventsOf(rig).map((e) => (e as { text?: string }).text ?? '');
@@ -997,7 +999,7 @@ describe('who can read it', () => {
         rig.recipients = [];
         writeFileSync(transcript('a'), prompt('one'));
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(recorder, 5000);
         expect(rig.uploads).toEqual([]);
         expect(readdirSync(dir).includes('state')).toBe(false);
@@ -1039,7 +1041,7 @@ describe('the transcript changes name', () => {
         const history = prompt('old one') + answer('old two');
         writeFileSync(transcript('old'), history);
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('old'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('old'), kind: 'claude', runId: RUN } });
         await advance(recorder, 1000);
         const lastWords = answer('last words');
         appendFileSync(transcript('old'), lastWords);
@@ -1048,7 +1050,7 @@ describe('the transcript changes name', () => {
         // /clear or a compaction: the session now writes a new file that starts with a copy
         // (the same entries, the same stamps).
         writeFileSync(transcript('new'), history + lastWords + prompt('fresh start'));
-        recorder.observe({ 'hwip-a': { path: transcript('new'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('new'), kind: 'claude', runId: RUN } });
         await advance(recorder, 3000);
 
         expect(eventsOf(rig).map((e) => (e as { text?: string }).text)).toEqual(['old one', 'old two', 'last words', 'fresh start']);
@@ -1062,7 +1064,7 @@ describe('sessions that come and go', () => {
         const rig = newRig();
         writeFileSync(transcript('a'), prompt('one'));
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(recorder, 1000);
         recorder.observe({});
         appendFileSync(transcript('a'), prompt('goodbye'));
@@ -1079,8 +1081,8 @@ describe('sessions that come and go', () => {
         writeFileSync(transcript('b'), prompt('in b'));
         const recorder = makeRecorder(rig);
         recorder.observe({
-            'hwip-a': { path: transcript('a'), kind: 'claude' },
-            'hwip-b': { path: transcript('b'), kind: 'claude' },
+            'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN },
+            'hwip-b': { path: transcript('b'), kind: 'claude', runId: RUN },
         });
         await advance(recorder, 1000);
         expect(rig.uploads.map((u) => u.sessionKey).sort()).toEqual([`${DEVICE}:hwip-a`, `${DEVICE}:hwip-b`]);
@@ -1121,7 +1123,7 @@ describe('the to-do list', () => {
         const rig = newRig();
         writeFileSync(transcript('a'), prompt('plan it') + created('1', 'write the probe') + created('2', 'ship it'));
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(recorder, 5000);
 
         appendFileSync(transcript('a'), moved('1', 'completed'));
@@ -1138,7 +1140,7 @@ describe('the to-do list', () => {
         const rig = newRig();
         writeFileSync(transcript('a'), prompt('plan it') + created('1', 'unmistakable-task-words'));
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(recorder, 5000);
 
         expect(todos(rig)).toHaveLength(1);
@@ -1149,11 +1151,11 @@ describe('the to-do list', () => {
         const rig = newRig();
         writeFileSync(transcript('a'), prompt('plan it') + created('1', 'old task'));
         const recorder = makeRecorder(rig);
-        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
         await advance(recorder, 5000);
 
         writeFileSync(transcript('b'), prompt('fresh') + created('7', 'new task'));
-        recorder.observe({ 'hwip-a': { path: transcript('b'), kind: 'claude' } });
+        recorder.observe({ 'hwip-a': { path: transcript('b'), kind: 'claude', runId: RUN } });
         await advance(recorder, 5000);
 
         expect(todos(rig).at(-1)?.items.map((item) => item.text)).toEqual(['new task']);
@@ -1218,13 +1220,30 @@ describe('separate runs of one name (hwip docs/session-runs.md)', () => {
         expect(rig.uploads.map((u) => u.chunk.runId)).toEqual(['1790000000']);
     });
 
-    it('sends no run for a session the sweep gave none', async () => {
+    it('records nothing for a session the sweep gave no run, which the server would refuse', async () => {
         const rig = newRig();
         writeFileSync(transcript('a'), prompt('hello'));
         const recorder = makeRecorder(rig);
         recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
-        await advance(recorder, 1000);
+        await advance(recorder, 5000);
 
-        expect(rig.uploads[0]!.chunk).not.toHaveProperty('runId');
+        expect(rig.uploads).toEqual([]);
+        expect(logs.filter((l) => l.includes('no run to tag'))).toHaveLength(1);
+    });
+
+    it('drops a stored chunk of no run instead of sending it to be refused', async () => {
+        const rig = newRig();
+        writeFileSync(transcript('a'), prompt('hello'));
+        const recorder = makeRecorder(rig);
+        recorder.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: RUN } });
+        await advance(recorder, 1000);
+        recorder.stop();
+        const [file] = readdirSync(stateDir);
+        const path = join(stateDir, file!);
+        const state = JSON.parse(readFileSync(path, 'utf-8')) as { outbox: Array<Record<string, unknown>> };
+        state.outbox = [{ seq: 1, firstAt: ts(), lastAt: ts(), sealed: { body: 'b', senderPublicKey: 'k', deviceKeyMap: { d: 'x' } } }];
+        writeFileSync(path, JSON.stringify(state));
+
+        expect(readSessionState(stateDir, `${DEVICE}:hwip-a`)?.outbox).toEqual([]);
     });
 });

@@ -67,7 +67,7 @@ const texts = (rig: Rig): string[] =>
 const advance = async (r: ReturnType<typeof make>, ms: number, observe?: () => void) => {
     for (let s = 0; s < ms; s += 1000) { clock += 1000; observe?.(); await r.tick(); }
 };
-const watching = (r: ReturnType<typeof make>, path = PATH) => () => r.observe({ 'hwip-oc': { path, kind: 'opencode' } });
+const watching = (r: ReturnType<typeof make>, path = PATH) => () => r.observe({ 'hwip-oc': { path, kind: 'opencode', runId: '1789999999' } });
 
 beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'turn-recorder-reader-'));

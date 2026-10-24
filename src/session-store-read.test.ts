@@ -199,7 +199,7 @@ describe('opencode store, read for real', () => {
         const run = async (r: ReturnType<typeof make>) => {
             for (let i = 0; i < 4; i++) {
                 clock += 1_000;
-                r.observe({ 'hwip-oc': { path: `${db}#ses_rec1`, kind: 'opencode' } });
+                r.observe({ 'hwip-oc': { path: `${db}#ses_rec1`, kind: 'opencode', runId: '1789999999' } });
                 await r.tick();
             }
         };

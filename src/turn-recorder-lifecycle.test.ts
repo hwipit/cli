@@ -70,7 +70,7 @@ describe('chunks and state files across a restart', () => {
         const rig: Rig = { uploads: [], outcome: { kind: 'retry', why: 'offline' } };
         writeFileSync(transcript('a'), prompt('last words') + answer('bye'));
         const r1 = make(rig);
-        const obsA = () => r1.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        const obsA = () => r1.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: '1789999999' } });
         await advance(r1, 3000, obsA);
         expect(readSessionState(stateDir, `${DEVICE}:hwip-a`)?.outbox.length).toBe(1);
         r1.stop();
@@ -81,7 +81,7 @@ describe('chunks and state files across a restart', () => {
         const r2 = make(rig);
         r2.start(); // sweeps the state directory and takes up sessions that still have chunks waiting
         r2.stop();
-        await advance(r2, 30 * 60_000, () => r2.observe({ 'hwip-b': { path: transcript('b'), kind: 'claude' } }));
+        await advance(r2, 30 * 60_000, () => r2.observe({ 'hwip-b': { path: transcript('b'), kind: 'claude', runId: '1789999999' } }));
         expect(texts(rig, `${DEVICE}:hwip-b`)).toEqual(['other']);
         expect(texts(rig, `${DEVICE}:hwip-a`)).toEqual(['last words', 'bye']);
     });
@@ -90,7 +90,7 @@ describe('chunks and state files across a restart', () => {
         const rig: Rig = { uploads: [], outcome: { kind: 'retry', why: 'offline' } };
         writeFileSync(transcript('a'), prompt('last words'));
         const r1 = make(rig);
-        await advance(r1, 3000, () => r1.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } }));
+        await advance(r1, 3000, () => r1.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: '1789999999' } }));
         r1.stop();
         // The agent said more before the machine went down, after the last chunk was written.
         appendFileSync(transcript('a'), answer('written while the listener was down'));
@@ -110,14 +110,14 @@ describe('chunks and state files across a restart', () => {
         const rig: Rig = { uploads: [], outcome: { kind: 'ok' } };
         writeFileSync(transcript('old'), prompt('one'));
         const r1 = make(rig);
-        await advance(r1, 3000, () => r1.observe({ 'hwip-a': { path: transcript('old'), kind: 'claude' } }));
+        await advance(r1, 3000, () => r1.observe({ 'hwip-a': { path: transcript('old'), kind: 'claude', runId: '1789999999' } }));
         r1.stop();
         appendFileSync(transcript('old'), answer('said just before the switch'));
         writeFileSync(transcript('new'), '');
 
         // The same tmux name now runs another agent: its kind has no projector here.
         const r2 = make(rig);
-        await advance(r2, 10_000, () => r2.observe({ 'hwip-a': { path: transcript('new'), kind: 'codex' } }));
+        await advance(r2, 10_000, () => r2.observe({ 'hwip-a': { path: transcript('new'), kind: 'codex', runId: '1789999999' } }));
 
         expect(texts(rig, `${DEVICE}:hwip-a`)).toEqual(['one', 'said just before the switch']);
     });
@@ -126,7 +126,7 @@ describe('chunks and state files across a restart', () => {
         const rig: Rig = { uploads: [], outcome: { kind: 'ok' } };
         writeFileSync(transcript('a'), prompt('one'));
         const r1 = make(rig);
-        await advance(r1, 3000, () => r1.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } }));
+        await advance(r1, 3000, () => r1.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: '1789999999' } }));
         r1.stop();
         expect(readSessionState(stateDir, `${DEVICE}:hwip-a`)?.outbox).toEqual([]);
         const sent = rig.uploads.length;
@@ -146,7 +146,7 @@ describe('chunks and state files across a restart', () => {
         const rig: Rig = { uploads: [], outcome: { kind: 'ok' } };
         writeFileSync(transcript('a'), prompt('one'));
         const r1 = make(rig);
-        await advance(r1, 3000, () => r1.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } }));
+        await advance(r1, 3000, () => r1.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: '1789999999' } }));
         r1.stop();
         expect(readSessionState(stateDir, `${DEVICE}:hwip-a`)?.outbox).toEqual([]);
         // The agent said more before the machine went down, after the last chunk was written.
@@ -165,7 +165,7 @@ describe('chunks and state files across a restart', () => {
         const rig: Rig = { uploads: [], outcome: { kind: 'ok' } };
         writeFileSync(transcript('a'), prompt('one'));
         const r1 = make(rig);
-        await advance(r1, 3000, () => r1.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } }));
+        await advance(r1, 3000, () => r1.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: '1789999999' } }));
         r1.stop();
         rmSync(transcript('a'));
         const sent = rig.uploads.length;
@@ -186,7 +186,7 @@ describe('chunks and state files across a restart', () => {
         const rig: Rig = { uploads: [], outcome: { kind: 'retry', why: 'offline' } };
         writeFileSync(transcript('a'), prompt('one'));
         const other = make(rig, 'dev_listener_other');
-        await advance(other, 3000, () => other.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } }));
+        await advance(other, 3000, () => other.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: '1789999999' } }));
         other.stop();
         expect(readSessionState(stateDir, 'dev_listener_other:hwip-a')?.outbox).toHaveLength(1);
 
@@ -201,7 +201,7 @@ describe('chunks and state files across a restart', () => {
         const rig: Rig = { uploads: [], outcome: { kind: 'ok' } };
         writeFileSync(transcript('a'), prompt('one') + answer('two'));
         const r1 = make(rig);
-        const obs = (r: ReturnType<typeof make>) => () => r.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude' } });
+        const obs = (r: ReturnType<typeof make>) => () => r.observe({ 'hwip-a': { path: transcript('a'), kind: 'claude', runId: '1789999999' } });
         await advance(r1, 3000, obs(r1));
         expect(texts(rig, `${DEVICE}:hwip-a`)).toEqual(['one', 'two']);
         r1.stop();

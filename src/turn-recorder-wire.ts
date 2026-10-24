@@ -124,7 +124,7 @@ export const createChunkUploader = (opts: {
         try {
             res = await apiFetch(fetchFn, apiUrl(opts.baseUrl, `/sessions/${encodeURIComponent(sessionKey)}/turns`), opts.apiKey, UPLOAD_TIMEOUT_MS, {
                 method: 'POST',
-                body: JSON.stringify({ seq: chunk.seq, firstAt: chunk.firstAt, lastAt: chunk.lastAt, ...(chunk.runId ? { runId: chunk.runId } : {}), sealed: chunk.sealed }),
+                body: JSON.stringify({ seq: chunk.seq, firstAt: chunk.firstAt, lastAt: chunk.lastAt, runId: chunk.runId, sealed: chunk.sealed }),
             });
         } catch (err) {
             const why = err instanceof Error ? err.message : String(err);

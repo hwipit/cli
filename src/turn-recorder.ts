@@ -116,8 +116,8 @@ export interface OutboxChunk {
     seq: number;
     firstAt: string;
     lastAt: string;
-    /** The run the events were recorded in. Absent from chunks made before runs were recorded. */
-    runId?: string;
+    /** The run the events were recorded in: the server takes no chunk without one. */
+    runId: string;
     sealed: SealedChunk;
 }
 
@@ -213,6 +213,8 @@ interface Live {
     nextAttemptAt: number;
     pausedUntil: number;
     sealWarned: boolean;
+    /** Said once that it has no run to tag chunks with. */
+    noRunWarned?: boolean;
     /**
      * The agent's to-do list as of the last read, whole — the projector folds the next read onto it.
      * Memory only: the state file holds ciphertext and numbers, and the list is the agent's words.
@@ -230,7 +232,7 @@ const isOutboxChunk = (c: unknown): c is OutboxChunk => {
     const s = o.sealed as Record<string, unknown> | undefined;
     return (
         Number.isSafeInteger(o.seq) && typeof o.firstAt === 'string' && typeof o.lastAt === 'string' &&
-        !!s && typeof s.body === 'string' && typeof s.senderPublicKey === 'string' &&
+        typeof o.runId === 'string' && !!o.runId && !!s && typeof s.body === 'string' && typeof s.senderPublicKey === 'string' &&
         !!s.deviceKeyMap && typeof s.deviceKeyMap === 'object'
     );
 };
@@ -411,13 +413,20 @@ export const createTurnRecorder = (deps: TurnRecorderDeps) => {
         const chunks: OutboxChunk[] = [];
         const runId = runOf(live, live.tailPath);
         let seq = base.seq;
+        // No run to name (a session name that ended, its file still written to): the server takes no such chunk,
+        // so what was read is passed over rather than sealed and sent to be refused.
+        if (!runId && !live.noRunWarned) {
+            live.noRunWarned = true;
+            deps.log(`⧉ turn-recorder ${live.name}: no run to tag its chunks with — what it writes is not recorded`);
+        }
         try {
             for (const page of pages) {
+                if (!runId) break;
                 seq += 1;
                 const firstAt = eventAt(page, 'first', fallbackAt);
                 const lastAt = eventAt(page, 'last', fallbackAt);
                 const sealed = await deps.seal(JSON.stringify({ sessionKey: live.sessionKey, seq, events: page }), recipients);
-                chunks.push({ seq, firstAt, lastAt, ...(runId ? { runId } : {}), sealed });
+                chunks.push({ seq, firstAt, lastAt, runId, sealed });
             }
         } catch (err) {
             if (!live.sealWarned) {

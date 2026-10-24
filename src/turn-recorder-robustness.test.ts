@@ -124,7 +124,7 @@ afterEach(() => {
 
 
 const texts = (rig: Rig): (string | undefined)[] => eventsOf(rig).map((e) => (e as { text?: string }).text);
-const watch = (r: ReturnType<typeof makeRecorder>, name: string) => r.observe({ 'hwip-a': { path: transcript(name), kind: 'claude' } });
+const watch = (r: ReturnType<typeof makeRecorder>, name: string) => r.observe({ 'hwip-a': { path: transcript(name), kind: 'claude', runId: '1789999999' } });
 
 describe('the recorder reads a transcript that is torn, replaced or cut short', () => {
     it('an abandoned file that ends in a torn multi-byte character still lets the session move on', async () => {

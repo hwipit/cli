@@ -685,7 +685,9 @@ A tmux name is used again when an agent starts in the same folder, so each
 chunk also names its **run** — the tmux session it was recorded in (`runId`,
 tmux's `session_created` in epoch seconds). The app uses it to keep one run's
 conversation apart from the one before it under the same name; a chunk read
-after a restart keeps the run it was recorded in. The listener's record of past
+after a restart keeps the run it was recorded in. What a session writes with no
+run to name (a name whose tmux session has ended while its file is still written
+to) is not recorded: the server takes no chunk without a run. The listener's record of past
 sessions keeps runs apart the same way: closing `hwip cc` and starting it again
 in the same folder leaves the first run as a past session of its own (the
 newest ten runs of a name are kept, 100 in all, and up to 50 are reported to

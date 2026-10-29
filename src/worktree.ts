@@ -338,12 +338,21 @@ export const worktreeStatuses = async (paneCwds: string[], run: GitRun = gitRun)
 const NO_TMUX_SERVER = /^(no server running on |error connecting to .+ \(No such file or directory\)$)/;
 
 /**
- * The cwd of every live tmux pane, `[]` when there is no tmux server, null when
- * tmux could not be asked. The difference matters: an unreadable list read as
- * empty would make every worktree in use look abandoned.
+ * Where every live tmux pane started and where it is now, `[]` when there is no
+ * tmux server, null when tmux could not be asked. The difference matters: an
+ * unreadable list read as empty would make every worktree in use look abandoned.
+ *
+ * The start path (`new -c`) is read as well as the current one because the
+ * current one is not yet the pane's right after it starts: measured on tmux 3.6
+ * (ubuntu-26.04 runner), a pane read within ~10 ms of `new-session -c <dir>`
+ * reports the tmux server's cwd. The start path is the `-c` text unresolved,
+ * unlike the current one, so it is resolved like the worktree paths.
  */
 export const readPaneCwds = async (tmux: GitRun = tmuxRun): Promise<string[] | null> => {
-    const out = await tmux(['list-panes', '-a', '-F', '#{pane_current_path}']);
-    if (out.ok) return out.stdout.split('\n').filter(Boolean);
-    return NO_TMUX_SERVER.test(out.error) ? [] : null;
+    const out = await tmux(['list-panes', '-a', '-F', '#{pane_start_path}\t#{pane_current_path}']);
+    if (!out.ok) return NO_TMUX_SERVER.test(out.error) ? [] : null;
+    return out.stdout.split('\n').filter(Boolean).flatMap((line) => {
+        const [start = '', current = ''] = line.split('\t');
+        return [start && realOrSelf(start), current].filter(Boolean);
+    });
 };

@@ -20,7 +20,10 @@ permissions:
 jobs:
   release:
     if: github.repository_owner == 'hwipit'
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to 26.04 (tmux 3.6) on 2026-10-29 and the real-tmux
+    # worktree test reads the runner's cwd as the pane path there. Unpin once that is
+    # understood (tmux 3.6 #{pane_current_path}).
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:

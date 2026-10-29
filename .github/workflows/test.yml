@@ -19,7 +19,10 @@ concurrency:
 
 jobs:
   vitest:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to 26.04 (tmux 3.6) on 2026-10-29 and the real-tmux
+    # worktree test reads the runner's cwd as the pane path there. Unpin once that is
+    # understood (tmux 3.6 #{pane_current_path}).
+    runs-on: ubuntu-24.04
     # The lowest of each supported line the test tooling can run on (src/node-support.ts
     # is the supported range): vite 8 needs 20.19 / 22.12, so 20.17 itself is
     # claimed by the dependencies' engines but not exercised here. A floor that

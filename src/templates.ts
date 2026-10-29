@@ -20,7 +20,8 @@
 // hook note (a phone message) or by a `hwip_ask` answer. Only Gemini, Codex
 // and Pi have that hook (remoteHookCmd below). Every other agent's only door is the
 // ask itself — so for them the NORMAL branch must still send one after real
-// work, or the phone loop can never begin. That is REMOTE_ENTRY_NO_HOOK.
+// work, or the phone loop can never begin. That is REMOTE_ENTRY_NO_HOOK
+// (OpenCode excepted — OPENCODE_RULE says why).
 //
 // The same axis decides how much of the core the static rule file carries.
 // That file is read on every turn, and a session is NORMAL nearly all of the
@@ -138,7 +139,7 @@ operations (file reads, simple searches). Set priority "high" for
 errors/blockers.`;
 
 // REMOTE-entry preamble — agents with NO prompt-submit hook (Cursor, Windsurf,
-// Copilot, Cline, Aider, OpenCode). The shared core scopes Rules 1/2/8/9 to REMOTE
+// Copilot, Cline, Aider; OpenCode opts out, see OPENCODE_RULE). The shared core scopes Rules 1/2/8/9 to REMOTE
 // and tells a NORMAL session it owes no `hwip_ask`. That is right where a
 // hook can announce the phone message that starts REMOTE; here nothing can,
 // and the only remaining entry is a `hwip_ask` answer reporting REMOTE.
@@ -294,10 +295,18 @@ export const PI_RULE = buildRule({
   core: PROMPT_HOOK_CORE,
 });
 
-/** OpenCode — managed block in ~/.config/opencode/AGENTS.md. Stop hook via plugin, no prompt hook (v1). */
+/**
+ * OpenCode — managed block in ~/.config/opencode/AGENTS.md. Stop hook via plugin, no prompt hook.
+ *
+ * No REMOTE_ENTRY_NO_HOOK, unlike the other hook-less agents: its after-work
+ * ask landed on the phone while the user sat at the terminal (2026-10-29,
+ * OpenCode 2.1.3), and the 2.x plugin API (event stream only) has no per-turn
+ * hook to tell the two apart. So a NORMAL session owes no ask, and REMOTE
+ * starts only from an ask the agent chose to send. Full core, because no hook
+ * delivers the REMOTE sections on entry.
+ */
 export const OPENCODE_RULE = buildRule({
   notify: HOOK_DRIVEN_NOTIFY,
-  remoteEntry: REMOTE_ENTRY_NO_HOOK,
   core: HWIP_CORE_HOOK_DRIVEN,
 });
 

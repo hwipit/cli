@@ -239,13 +239,16 @@ back when it writes again.
 Detection is exact-match: a terminal keystroke racing a phone message
 can never false-flag. Muted projects are never flagged.
 
-Agents without that hook (Cursor, Windsurf, Copilot, Cline, Aider, OpenCode) have one
+Agents without that hook (Cursor, Windsurf, Copilot, Cline, Aider) have one
 other way in: a `hwip_ask` answer reporting `hwipState: "REMOTE"`. Their rule
 files therefore keep the after-real-work `hwip_ask` — the "Entering REMOTE
 without a prompt hook" preamble in `src/templates.ts` — so the phone always
 has a button to tap that starts the loop. The one exception is an answer sent
 with the phone's "send and exit": that turn carries out the instruction and
-ends without an ask. Agents with the hook drop that
+ends without an ask. OpenCode has no prompt hook either but leaves the
+preamble out: its after-work ask reached the phone on turns typed at the
+terminal, so it owes no ask in NORMAL, and a phone message to an OpenCode
+session gets the completion push rather than buttons. Agents with the hook drop that
 obligation while at the terminal — and their rule file carries only the
 NORMAL branch of the core (about a quarter of it), since it is read on every
 turn; the hook injects the REMOTE sections in full on the turn a phone

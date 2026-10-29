@@ -411,7 +411,18 @@ describe('readPaneCwds', () => {
     const says = (error: string): GitRun => async () => ({ ok: false, error });
 
     it('is the cwd of every pane', async () => {
-        expect(await readPaneCwds(async () => ({ ok: true, stdout: '/a\n/b\n' }))).toEqual(['/a', '/b']);
+        expect(await readPaneCwds(async () => ({ ok: true, stdout: '\t/a\n\t/b\n' }))).toEqual(['/a', '/b']);
+    });
+
+    // The tmux 3.6 case `readPaneCwds` documents: the current path is still the server's cwd.
+    it('counts a pane by where it started while its current path is not yet its own', async () => {
+        const dir = mkdtempSync(join(tmpdir(), 'hwip-pane-'));
+        try {
+            const tmux: GitRun = async () => ({ ok: true, stdout: `${dir}\t/home/runner/work/cli/cli\n` });
+            expect(await readPaneCwds(tmux)).toEqual([realpathSync(dir), '/home/runner/work/cli/cli']);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
     });
 
     // tmux 3.5a's own words, measured: a server that is not there has no panes.

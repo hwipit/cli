@@ -43,7 +43,8 @@ describe('rules-sync: generated core is wired into the templates', () => {
 // hwip_ask. That is safe exactly where a prompt-submit hook can announce the
 // phone message that starts REMOTE. Only Gemini, Codex and Pi have that hook;
 // for every other agent a hwip_ask answer is the sole way in, so their rule
-// file must keep asking after real work or the phone loop can never begin.
+// file must keep asking after real work or the phone loop can never begin —
+// except OpenCode, which drops that door (see its test below).
 describe('rules-sync: REMOTE entry for agents without a prompt-submit hook', () => {
     const ENTRY = 'Entering REMOTE without a prompt hook';
 
@@ -55,7 +56,6 @@ describe('rules-sync: REMOTE entry for agents without a prompt-submit hook', () 
             tmpl.COPILOT_RULE,
             tmpl.CLINE_RULE,
             tmpl.AIDER_RULE,
-            tmpl.OPENCODE_RULE,
         ]) {
             expect(rule).toContain(ENTRY);
             expect(rule).toContain('overrides the "In NORMAL, end with nothing" clause');
@@ -71,6 +71,18 @@ describe('rules-sync: REMOTE entry for agents without a prompt-submit hook', () 
         expect(tmpl.GEMINI_RULE).not.toContain(ENTRY);
         expect(tmpl.CODEX_RULE).not.toContain(ENTRY);
         expect(tmpl.PI_RULE).not.toContain(ENTRY);
+    });
+
+    // OpenCode has no prompt hook either, but the preamble made it end NORMAL
+    // turns typed at the terminal with a hwip_ask that buzzed the phone
+    // (2026-10-29, OpenCode 2.1.3). Its 2.x plugin API has no per-turn hook to
+    // add one, so OpenCode gives up the ask-to-enter door instead: NORMAL
+    // owes nothing, and REMOTE still starts from an ask the agent chose to send.
+    it('OpenCode does not order a hwip_ask after NORMAL work', async () => {
+        const tmpl = await import('./templates.js');
+        expect(tmpl.OPENCODE_RULE).not.toContain(ENTRY);
+        expect(tmpl.OPENCODE_RULE).not.toContain('overrides the "In NORMAL, end with nothing" clause');
+        expect(tmpl.OPENCODE_RULE).toContain('In NORMAL, end with nothing');
     });
 
     it('the preamble sits before the core so the override reads first', async () => {
@@ -118,7 +130,7 @@ describe('rules-sync: prompt-hook agents carry the NORMAL branch only', () => {
     // the exception the preamble would re-open the loop the user just left.
     it('agents without the hook exempt send-and-exit from the preamble ask', async () => {
         const tmpl = await import('./templates.js');
-        for (const rule of [tmpl.CURSOR_RULE, tmpl.WINDSURF_RULE, tmpl.COPILOT_RULE, tmpl.CLINE_RULE, tmpl.AIDER_RULE, tmpl.OPENCODE_RULE]) {
+        for (const rule of [tmpl.CURSOR_RULE, tmpl.WINDSURF_RULE, tmpl.COPILOT_RULE, tmpl.CLINE_RULE, tmpl.AIDER_RULE]) {
             // The preamble is hard-wrapped, so match on collapsed whitespace.
             expect(rule.replace(/\s+/g, ' ')).toContain('end without `hwip_ask`, however substantial the work');
         }

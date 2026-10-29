@@ -910,6 +910,10 @@ describe('templates.ts: the pi extension runs subagent panes view-only-by-push',
 describe('templates.ts: rules agree with the remote-hook registry', () => {
     const RULES = Object.entries(templates).filter(([name]) => name.endsWith('_RULE')) as [string, string][];
     const NO_HOOK_MARKER = 'Entering REMOTE without a prompt hook';
+    // Hook-less agents that leave the preamble out on purpose: their NORMAL
+    // ask reached the phone while the user sat at the terminal (templates.ts
+    // OPENCODE_RULE says why).
+    const PREAMBLE_OPT_OUT = ['opencode'];
 
     it('collects every rule', () => {
         expect(RULES.length).toBeGreaterThanOrEqual(9);
@@ -917,9 +921,9 @@ describe('templates.ts: rules agree with the remote-hook registry', () => {
 
     for (const [name, rule] of RULES) {
         const id = name.replace(/_RULE$/, '').toLowerCase();
-        const hasPromptHook = (REMOTE_HOOK_AGENTS as readonly string[]).includes(id);
-        it(`${name} ${hasPromptHook ? 'omits' : 'carries'} the no-hook REMOTE entry preamble`, () => {
-            if (hasPromptHook) expect(rule).not.toContain(NO_HOOK_MARKER);
+        const omits = (REMOTE_HOOK_AGENTS as readonly string[]).includes(id) || PREAMBLE_OPT_OUT.includes(id);
+        it(`${name} ${omits ? 'omits' : 'carries'} the no-hook REMOTE entry preamble`, () => {
+            if (omits) expect(rule).not.toContain(NO_HOOK_MARKER);
             else expect(rule).toContain(NO_HOOK_MARKER);
         });
     }

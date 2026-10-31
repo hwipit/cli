@@ -39,8 +39,8 @@ describe('hwip agent send', () => {
         expect(commandUsage('send')).toContain("Old name of 'hwip agent send'");
     });
 
-    it('names the two flags agent list and agent read read', () => {
-        expect(COMMAND_FLAGS.agent).toEqual(['json', 'turns']);
+    it('names the three flags agent list and agent read read', () => {
+        expect(COMMAND_FLAGS.agent).toEqual(['json', 'turns', 'all']);
     });
 
     it('shows agent list and agent read under hwip agent --help, after agent send', () => {
@@ -48,7 +48,7 @@ describe('hwip agent send', () => {
 
         expect(lines(usage).slice(0, 3)).toEqual([
             'Usage: hwip agent send <target> <message…>',
-            '       hwip agent list [--json]',
+            '       hwip agent list [--all] [--json]',
             '       hwip agent read <session> [--turns <n>] [--json]',
         ]);
         expect(usage).toContain('List the agent sessions running on THIS machine');

@@ -202,10 +202,28 @@ describe('readLocalAgent: which session', () => {
         }
     });
 
+    // The name Claude Code shows for the session, which the shown name leaves out when it is only cwd-derived.
+    it('resolves the session handle through the inventory', () => {
+        const rows = [row('hwip-ko-qmd', { providerSessionHandle: 'ko-qmd-70' }), row('hwip-b')];
+        const f = fake({ rows, events: [prompt('hi')] });
+
+        expect(readLocalAgent(f.deps, 'ko-qmd-70', 3)).toMatchObject({ ok: true, key: 'dev_mac:hwip-ko-qmd' });
+    });
+
     it('reads its own session too', () => {
         const f = fake({ events: [prompt('hi')] });
 
         expect(readLocalAgent(f.deps, 'hwip-a', 3).ok).toBe(true);
+    });
+
+    // Two same-named sessions are told apart by what each is doing.
+    it('lists each ambiguous candidate with its state', () => {
+        const f = fake({ rows: [row('hwip-a', { label: 'dup', state: 'working' }), row('hwip-b', { label: 'dup', state: 'idle' })], live: ['hwip-a', 'hwip-b'] });
+
+        const r = readLocalAgent(f.deps, 'dup', 3);
+
+        expect(r).toMatchObject({ ok: false, code: 'AMBIGUOUS_TARGET' });
+        expect(r.ok ? '' : r.message).toContain('dev_mac:hwip-a (dup on dev_mac, working)');
     });
 
     it('is AMBIGUOUS_TARGET when two sessions answer to the word, listing their keys', () => {

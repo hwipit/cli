@@ -15,6 +15,6 @@ describe('handleAgentList: usage', () => {
         const err = vi.spyOn(console, 'error').mockImplementation(() => {});
 
         expect(await handleAgentList(args)).toBe(2);
-        expect(err).toHaveBeenCalledWith('Usage: hwip agent list [--json]');
+        expect(err).toHaveBeenCalledWith('Usage: hwip agent list [--all] [--json]');
     });
 });

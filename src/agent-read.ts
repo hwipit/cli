@@ -217,7 +217,7 @@ export const readLocalAgent = (deps: AgentReadDeps, target: string, turnsWanted:
         if (rows.length === 0 && deps.liveNames() === null) return fail('NO_TMUX', NO_TMUX_MESSAGE);
         try {
             const resolved = resolveAgentTarget(
-                [{ deviceId: device, agentSessions: rows.map((r) => ({ name: r.name, label: r.label, providerSessionName: r.providerSessionName, parentName: r.parentName, agentKind: r.agentKind })) }],
+                [{ deviceId: device, agentSessions: rows.map((r) => ({ name: r.name, label: r.label, providerSessionName: r.providerSessionName, providerSessionHandle: r.providerSessionHandle, state: r.state, parentName: r.parentName, agentKind: r.agentKind })) }],
                 target,
             );
             name = resolved.name;
@@ -338,6 +338,11 @@ export const handleAgentRead = async (args: Record<string, string | boolean>): P
     // A leading `-` would read as a flag to anything that passes the word on.
     if (!session || session.startsWith('-')) {
         console.error(USAGE);
+        return 2;
+    }
+    // `--all` is `agent list`'s: the `agent` flag table is shared, and another machine's conversation stays there.
+    if (flagOn(args, 'all')) {
+        console.error(`hwip agent read: --all is for agent list; agent read reads this machine only\n${USAGE}`);
         return 2;
     }
     const wanted = args.turns === undefined ? String(DEFAULT_TURNS) : args.turns;

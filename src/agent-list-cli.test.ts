@@ -63,7 +63,18 @@ describe('hwip agent list', () => {
         const result = runCli('agent', 'list', 'extra');
 
         expect(result.status).toBe(2);
-        expect(result.stderr).toContain('Usage: hwip agent list [--json]');
+        expect(result.stderr).toContain('Usage: hwip agent list [--all] [--json]');
+    });
+    // Every machine is the server's device list, so --all is the one form that needs the key.
+    it('lists every machine only with an API key: exit 3 without', () => {
+        expect(runCli('agent', 'list', '--all', '--json').status).toBe(3);
+    });
+
+    it('answers LIST_FAILED for every machine when the server cannot be reached, as one JSON object, exit 1', () => {
+        const result = runCli('--key', 'hwip_test_key', 'agent', 'list', '--all', '--json');
+
+        expect(result.status).toBe(1);
+        expect(JSON.parse(result.stdout.trim())).toEqual({ v: 1, error: 'LIST_FAILED', message: expect.stringContaining('device list') });
     });
 });
 
@@ -75,6 +86,28 @@ describe('hwip agent read', () => {
             expect(result.stderr).toContain('Usage: hwip agent read <session>');
         }
         expect(runCli('agent', 'read', '--', '-x').status).toBe(2);
+    });
+
+    // `--all` belongs to `agent list`: the flag table is shared, so read refuses it rather than ignore it.
+    it('refuses --all as a usage error, exit 2', () => {
+        const result = runCli('agent', 'read', 'hwip-x', '--all');
+
+        expect(result.status).toBe(2);
+        expect(result.stderr).toContain('--all');
+    });
+
+    it('refuses --all on agent send too, before any key is needed, exit 2', () => {
+        const result = runCli('agent', '--all=true', 'send', 'hwip-x', 'hi');
+
+        expect(result.status).toBe(2);
+        expect(result.stderr).toContain('--all');
+    });
+
+    it('refuses --turns on agent send, exit 2', () => {
+        const result = runCli('agent', '--turns', '3', 'send', 'hwip-x', 'hi');
+
+        expect(result.status).toBe(2);
+        expect(result.stderr).toContain('--turns');
     });
 
     it('takes --turns as a whole number from 1 to 20 only, exit 2', () => {

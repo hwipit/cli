@@ -189,7 +189,7 @@ export const COMMAND_FLAGS: Readonly<Record<string, readonly string[]>> = {
   ask: ['title', 'body', 'actions', 'timeout', 'hook', 'accepts-exit', 'api-key'],
   'ask-context': ['global'],
   'file-view': ['global'],
-  agent: ['json', 'turns'],
+  agent: ['json', 'turns', 'all'],
   send: [],
   list: ['limit', 'type'],
   dismiss: ['all'],

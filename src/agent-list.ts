@@ -93,9 +93,12 @@ export const listLocalAgents = (deps: LocalAgentDeps): AgentListResult => {
     return { ok: true, v: 1, device, sessions };
 };
 
-/** The agent names its session itself (`/rename`), so the text may hold escape sequences a terminal would act on. */
+/**
+ * The agent names its session itself (`/rename`), so the text may hold escape sequences a terminal would act on, or bidi
+ * overrides and zero-width characters that make one name read as another — the set the server's `oneLine` strips.
+ */
 // eslint-disable-next-line no-control-regex -- stripping them is the point
-const printable = (text: string): string => text.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ');
+const printable = (text: string): string => text.replace(/[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁦-⁩﻿]/g, ' ');
 
 const renderList = (sessions: AgentListEntry[]): string => {
     if (sessions.length === 0) return 'no agent sessions on this machine';

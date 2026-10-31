@@ -254,6 +254,17 @@ describe('runAgentListAll — every machine', () => {
         expect(out[0]).not.toMatch(/[\u0000-\u0009\u000b-\u001f]/);
     });
 
+    // A right-to-left override or a zero-width character would make one machine's key read as another's.
+    it('prints every machine with no bidi override, isolate or zero-width character in a cell', async () => {
+        const { deps, out } = allDeps(async () => [
+            { deviceId: 'dev_win', nickname: 'ta‮kui', agentSessions: [{ name: 'hwip-​a', project: 'p', agentKind: 'claude', label: 'x⁦y﻿' }] },
+        ]);
+
+        await runAgentListAll({ json: false }, deps);
+
+        expect(out[0]).not.toMatch(/[​-‏‪-‮⁦-⁩﻿]/);
+    });
+
     it('fails with exit 1 when every machine cannot be listed, as JSON too', async () => {
         const text = allDeps(async () => {
             throw new Error('401 Unauthorized');

@@ -186,4 +186,10 @@ describe('sessionsFingerprint', () => {
         expect(sessionsFingerprint([session({ providerSessionNameSource: 'auto' })]))
             .not.toBe(sessionsFingerprint([session({ providerSessionNameSource: 'user' })]));
     });
+
+    // A `/rename` moves the handle while the shown name may stay: the report must still go out.
+    it('changes when only the session handle changes', () => {
+        expect(sessionsFingerprint([session({ providerSessionHandle: 'ko-qmd-70' })]))
+            .not.toBe(sessionsFingerprint([session({ providerSessionHandle: 'Fix login' })]));
+    });
 });

@@ -191,6 +191,19 @@ describe('collectSessionsVerbose — what the sweep does today', () => {
             expect(recallSession('hwip-conv')?.agentSessionId).toBe('conv-exact');
         });
 
+        // Another agent sends to a session by the name Claude Code shows for it (`ko-qmd-70`),
+        // which the provider name withholds when it is only the cwd-derived one.
+        it('reports the agent session handle beside a withheld provider name', () => {
+            const claude = REMOTE_AGENTS.find((a) => a.kind === 'claude')!;
+            vi.spyOn(claude, 'resolveSessionName').mockReturnValue(null);
+            vi.spyOn(claude, 'resolveSessionHandle').mockReturnValue('ko-qmd-70');
+            listPanes = answer(paneRow({ session: 'hwip-ko-qmd' }));
+
+            const row = listener.collectSessionsVerbose().sessions.find((s) => s.name === 'hwip-ko-qmd');
+
+            expect(row).toMatchObject({ providerSessionHandle: 'ko-qmd-70', providerSessionName: null });
+        });
+
         // The registry is where an ended run's title comes from (hwip docs/session-runs.md Q39):
         // a sweep that reads the agent's name must write it down, or the run ends nameless.
         it('run title: records the name the agent gave the session, and who gave it', () => {

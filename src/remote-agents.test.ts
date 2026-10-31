@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readTranscriptDelta } from './transcript-tail.js';
-import { detectClaudeProviderName, detectClaudeSessionIdByPid, findAgentBySubcommand, matchAgentByPaneCommand, REMOTE_AGENTS } from './remote-agents.js';
+import { detectClaudeProviderName, detectClaudeSessionHandle, detectClaudeSessionIdByPid, findAgentBySubcommand, matchAgentByPaneCommand, REMOTE_AGENTS } from './remote-agents.js';
+import type { PidSessionRecord } from './remote-agents.js';
 
 // Top-level CLI commands the registry's subcommands must never collide
 // with — dispatch checks the registry BEFORE the switch, so a collision
@@ -545,6 +546,34 @@ describe('detectClaudeProviderName — record match', () => {
         expect(detectClaudeProviderName(90, '/proj', {
             records: blank, transcriptOf: noTranscript, descendants: new Set([90, 100]),
         })).toBeNull();
+    });
+});
+
+describe('detectClaudeSessionHandle — the session handle another agent sends to', () => {
+    // Claude Code's own name for the session, whoever chose it: the cwd-derived
+    // `<basename>-<hex2>` the user sees in Claude Code, a `/rename`, or a name
+    // from a CC too old to say. detectClaudeProviderName withholds the derived
+    // one from display; the handle never does.
+    const deps = (record: Partial<PidSessionRecord>) => ({
+        records: [{ pid: 100, sessionId: 's', cwd: '/proj', ...record }],
+        transcriptOf: () => null,
+        descendants: new Set([90, 100]),
+    });
+
+    it('is the derived name the provider name leaves out', () => {
+        const d = deps({ name: 'ko-qmd-70', nameSource: 'derived' });
+        expect(detectClaudeSessionHandle(90, '/proj', d)).toBe('ko-qmd-70');
+        expect(detectClaudeProviderName(90, '/proj', d)).toBeNull();
+    });
+
+    it.each([['user'], [undefined]])('is the record name when its source is %s', (nameSource) => {
+        expect(detectClaudeSessionHandle(90, '/proj', deps({ name: 'Fix login', nameSource }))).toBe('Fix login');
+    });
+
+    it('is null for a blank name, a nameless record, or no record in the pane tree', () => {
+        expect(detectClaudeSessionHandle(90, '/proj', deps({ name: '  ' }))).toBeNull();
+        expect(detectClaudeSessionHandle(90, '/proj', deps({}))).toBeNull();
+        expect(detectClaudeSessionHandle(90, '/proj', { ...deps({ name: 'x' }), descendants: new Set([90]) })).toBeNull();
     });
 });
 

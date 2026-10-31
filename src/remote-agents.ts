@@ -87,6 +87,15 @@ export interface RemoteAgent {
      */
     resolveSessionName?: (paneCwd: string, panePid?: number) => ProviderName | null;
     /**
+     * Resolve the name the agent itself addresses this session by, whoever
+     * chose it — Claude Code's session name, cwd-derived (`ko-qmd-70`) or
+     * renamed. Never shown: `resolveSessionName` withholds a derived name as
+     * saying no more than the tmux name, but it is the name the user knows the
+     * session by in the agent, so another agent may be told to send to it
+     * (`providerSessionHandle` on the wire, matched by `resolveAgentTarget`).
+     */
+    resolveSessionHandle?: (paneCwd: string, panePid?: number) => string | null;
+    /**
      * Resolve the file this agent is writing its session transcript to, for the
      * live chat timeline (`turn-watch`).
      *
@@ -566,6 +575,16 @@ export const detectClaudeProviderName = (
     const transcript = (deps.transcriptOf ?? claudeConversationFile)(record.cwd, record.sessionId);
     const title = transcript ? claudeTitles.read(transcript) : undefined;
     return title ? { name: title, source: 'auto' } : null;
+};
+
+/** Claude Code's own name for the session in this pane, whoever chose it — see `RemoteAgent.resolveSessionHandle`. */
+export const detectClaudeSessionHandle = (
+    panePid: number,
+    paneCwd: string | null,
+    deps: PidResolveDeps = {},
+): string | null => {
+    const record = detectClaudeSessionByPid(panePid, paneCwd, deps);
+    return record ? nonBlank(record.name) : null;
 };
 
 /**
@@ -1445,6 +1464,8 @@ const REMOTE_AGENT_TABLE = [
             ?? detectClaudeSessionId(paneCwd),
         resolveSessionName: (paneCwd, panePid) =>
             panePid !== undefined ? detectClaudeProviderName(panePid, paneCwd) : null,
+        resolveSessionHandle: (paneCwd, panePid) =>
+            panePid !== undefined ? detectClaudeSessionHandle(panePid, paneCwd) : null,
         resolveTranscript: (paneCwd, panePid) => claudeTranscriptPath(paneCwd, panePid),
         projectTranscript: projectTranscriptEntries,
         // The pid match alone: the mtime fallback above can name another

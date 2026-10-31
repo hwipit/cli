@@ -332,6 +332,13 @@ interface AgentSession {
      * account setting that hides agent-made names hides `'auto'` only.
      */
     providerSessionNameSource?: ProviderNameSource;
+    /**
+     * The name the agent itself addresses this session by, whoever chose it
+     * (`RemoteAgent.resolveSessionHandle`) — Claude Code's `ko-qmd-70` even
+     * when `providerSessionName` withholds it. Never shown; another agent
+     * sends to the session by it. Null where the agent has none.
+     */
+    providerSessionHandle?: string | null;
     createdAt?: string;
     /**
      * Which run of the name this is (hwip docs/session-runs.md): tmux
@@ -496,7 +503,7 @@ export const sessionsFingerprint = (sessions: AgentSession[]): string =>
     sessions
         .map((s) => JSON.stringify([
             s.name, s.attached, s.agentKind, s.agentSessionId ?? null,
-            s.project, s.label ?? null, s.providerSessionName ?? null, s.providerSessionNameSource ?? null, s.createdAt ?? null, s.runId ?? null, s.firstSeq ?? null,
+            s.project, s.label ?? null, s.providerSessionName ?? null, s.providerSessionNameSource ?? null, s.providerSessionHandle ?? null, s.createdAt ?? null, s.runId ?? null, s.firstSeq ?? null,
             s.lastActivityAt ?? null, s.state ?? null,
             s.stateChangedAt ?? null, s.stateRuleId ?? null,
             s.blockedPrompt?.id ?? null, s.blockedPrompt?.at ?? null,
@@ -4569,6 +4576,9 @@ export const collectSessionsVerbose = (): CollectResult => {
         const providerName = info.currentPath
             ? (main.agent.resolveSessionName?.(info.currentPath, info.panePid ?? undefined) ?? null)
             : null;
+        const handle = info.currentPath
+            ? (main.agent.resolveSessionHandle?.(info.currentPath, info.panePid ?? undefined) ?? null)
+            : null;
         if (info.currentPath) paneCwdOf.set(name, info.currentPath);
         const resumeId = info.currentPath
             ? main.agent.resolveResumeId?.(info.currentPath, info.panePid ?? undefined)
@@ -4584,6 +4594,7 @@ export const collectSessionsVerbose = (): CollectResult => {
             label: parsed.label,
             providerSessionName: providerName?.name ?? null,
             ...(providerName?.source ? { providerSessionNameSource: providerName.source } : {}),
+            providerSessionHandle: handle,
             createdAt: epochToIso(group.created),
             runId: runIdOfEpoch(group.created),
             lastActivityAt: epochToIso(group.activity),

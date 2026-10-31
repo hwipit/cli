@@ -103,6 +103,13 @@ describe('hwip agent read', () => {
         expect(result.stderr).toContain('--all');
     });
 
+    it('refuses --turns on agent send, exit 2', () => {
+        const result = runCli('agent', '--turns', '3', 'send', 'hwip-x', 'hi');
+
+        expect(result.status).toBe(2);
+        expect(result.stderr).toContain('--turns');
+    });
+
     it('takes --turns as a whole number from 1 to 20 only, exit 2', () => {
         for (const turns of ['0', '21', 'abc', '2.5', '-1']) {
             const result = runCli('agent', 'read', 'hwip-x', '--turns', turns);

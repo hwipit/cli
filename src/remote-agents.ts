@@ -89,7 +89,7 @@ export interface RemoteAgent {
     /**
      * Resolve the name the agent itself addresses this session by, whoever
      * chose it — Claude Code's session name, cwd-derived (`ko-qmd-70`) or
-     * renamed. Never shown: `resolveSessionName` withholds a derived name as
+     * renamed. Not shown in the app: `resolveSessionName` withholds a derived name as
      * saying no more than the tmux name, but it is the name the user knows the
      * session by in the agent, so another agent may be told to send to it
      * (`providerSessionHandle` on the wire, matched by `resolveAgentTarget`).

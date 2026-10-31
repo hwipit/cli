@@ -335,7 +335,7 @@ interface AgentSession {
     /**
      * The name the agent itself addresses this session by, whoever chose it
      * (`RemoteAgent.resolveSessionHandle`) — Claude Code's `ko-qmd-70` even
-     * when `providerSessionName` withholds it. Never shown; another agent
+     * when `providerSessionName` withholds it. Not shown in the app; another agent
      * sends to the session by it. Null where the agent has none.
      */
     providerSessionHandle?: string | null;

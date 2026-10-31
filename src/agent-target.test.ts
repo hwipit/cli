@@ -105,6 +105,47 @@ describe('resolveAgentTarget', () => {
         expect(resolveAgentTarget(devices, 'brain-95').key).toBe('dev_linux:hwip-brain');
     });
 
+    // Claude Code names a session from its folder (`ko-qmd-70`): the name the user
+    // knows it by, so another agent is told to send to it.
+    describe('the session handle', () => {
+        const withHandles = (selfHandle = 'brain-1e') => [
+            ...devices,
+            {
+                deviceId: 'dev_win',
+                nickname: 'takui',
+                agentSessions: [
+                    { name: 'hwip-ko-qmd', project: 'ko-qmd', providerSessionHandle: 'ko-qmd-70', state: 'idle' as const },
+                    { name: 'hwip-bench', project: 'bench', providerSessionHandle: 'bench-f0', state: 'working' as const },
+                    { name: 'hwip-bench-2', project: 'bench', providerSessionHandle: 'bench-f0', state: 'idle' as const },
+                    { name: 'hwip-self', project: 'brain', providerSessionHandle: selfHandle },
+                ],
+            },
+            { deviceId: 'dev_mac2', agentSessions: [{ name: 'hwip-other', project: 'brain', providerSessionHandle: 'brain-1e' }] },
+        ];
+
+        it('resolves the session handle of a session on another machine', () => {
+            expect(resolveAgentTarget(withHandles(), 'ko-qmd-70').key).toBe('dev_win:hwip-ko-qmd');
+        });
+
+        it('refuses a session handle two sessions share, listing each with its handle and state', () => {
+            let err: unknown;
+            try {
+                resolveAgentTarget(withHandles(), 'bench-f0');
+            } catch (e) {
+                err = e;
+            }
+            expect(err).toBeInstanceOf(AgentTargetError);
+            const { code, message } = err as AgentTargetError;
+            expect(code).toBe('AMBIGUOUS_TARGET');
+            expect(message).toContain('dev_win:hwip-bench (hwip-bench on takui, handle bench-f0, working)');
+            expect(message).toContain('dev_win:hwip-bench-2 (hwip-bench-2 on takui, handle bench-f0, idle)');
+        });
+
+        it('leaves the sender out of handle matching', () => {
+            expect(resolveAgentTarget(withHandles(), 'brain-1e', 'dev_win:hwip-self').key).toBe('dev_mac2:hwip-other');
+        });
+    });
+
     it('leaves the sender out of name matching, so a shared name means the other machine', () => {
         expect(resolveAgentTarget(devices, 'hwip-brain', 'dev_mac:hwip-brain').key).toBe('dev_linux:hwip-brain');
     });

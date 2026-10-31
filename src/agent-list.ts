@@ -26,6 +26,7 @@ export interface ListedSession {
     project: string;
     label?: string | null;
     providerSessionName?: string | null;
+    providerSessionHandle?: string | null;
     state?: AgentState;
     lastActivityAt?: string;
 }

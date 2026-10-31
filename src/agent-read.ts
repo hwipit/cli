@@ -217,7 +217,7 @@ export const readLocalAgent = (deps: AgentReadDeps, target: string, turnsWanted:
         if (rows.length === 0 && deps.liveNames() === null) return fail('NO_TMUX', NO_TMUX_MESSAGE);
         try {
             const resolved = resolveAgentTarget(
-                [{ deviceId: device, agentSessions: rows.map((r) => ({ name: r.name, label: r.label, providerSessionName: r.providerSessionName, parentName: r.parentName, agentKind: r.agentKind })) }],
+                [{ deviceId: device, agentSessions: rows.map((r) => ({ name: r.name, label: r.label, providerSessionName: r.providerSessionName, providerSessionHandle: r.providerSessionHandle, state: r.state, parentName: r.parentName, agentKind: r.agentKind })) }],
                 target,
             );
             name = resolved.name;

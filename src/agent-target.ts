@@ -8,6 +8,10 @@ export interface AgentTargetDevice {
     project?: string;
     label?: string | null;
     providerSessionName?: string | null;
+    /** The agent's own name for the session, shown or not (hwip `AgentSession.providerSessionHandle`). */
+    providerSessionHandle?: string | null;
+    /** The agent state the listener last reported (`working`, `idle`, …). */
+    state?: string;
     parentName?: string;
     /** What runs in the session: an agent kind, or `shell` for a `hwip sh` session. */
     agentKind?: string;
@@ -42,6 +46,10 @@ interface Candidate extends AgentTarget {
   label?: string | null;
   /** The name the agent calls itself — what the app shows for the session. */
   providerSessionName?: string | null;
+  /** The agent's own name for the session, shown or not (`ko-qmd-70`): what a user calls it in the agent. */
+  providerSessionHandle?: string | null;
+  /** What the listener last saw the agent doing, to tell same-named sessions apart. */
+  state?: string;
   host: string;
   /** The device says it is offline. Unknown (no `isOnline`) counts as online. */
   offline: boolean;
@@ -66,20 +74,28 @@ const candidatesOf = (devices: AgentTargetDevice[]): Candidate[] =>
         alias: d.agentSessionAliases?.[s.name],
         label: s.label,
         providerSessionName: s.providerSessionName,
+        providerSessionHandle: s.providerSessionHandle,
+        state: s.state,
         host: d.nickname ?? d.deviceId,
         offline: d.isOnline === false,
       })),
   );
 
-const listCandidates = (list: Candidate[]): string =>
-  list.map((c) => `${c.key} (${c.alias ?? c.providerSessionName ?? c.label ?? c.name} on ${c.host})`).join(', ') || 'none';
+const describeCandidate = (c: Candidate): string => {
+  const shown = c.alias ?? c.providerSessionName ?? c.label ?? c.name;
+  const handle = c.providerSessionHandle && c.providerSessionHandle !== shown ? `, handle ${c.providerSessionHandle}` : '';
+  const state = c.state ? `, ${c.state}` : '';
+  return `${c.key} (${shown} on ${c.host}${handle}${state})`;
+};
+
+const listCandidates = (list: Candidate[]): string => list.map(describeCandidate).join(', ') || 'none';
 
 /**
  * Resolve `target` to one live agent session.
  *
  * The key `<deviceId>:<tmuxName>` is exact. Anything else is matched against
- * the tmux name, the user's alias, the agent's own session name and the
- * listener's label, and must match exactly one session: the same tmux name on
+ * the tmux name, the user's alias, the agent's own session name (shown, or
+ * its handle — Claude Code's `ko-qmd-70`) and the listener's label, and must match exactly one session: the same tmux name on
  * two PCs is the routing bug a guess would reintroduce, so two matches are an
  * error that lists both keys. The sender's own session (`selfKey`) is left out
  * of name matching, so the same project on two PCs resolves to the other one;
@@ -105,7 +121,7 @@ export const resolveAgentTarget = (devices: AgentTargetDevice[], target: string,
   if (exact) return toTarget(exact);
 
   const named = (c: Candidate): boolean =>
-    [c.name, c.alias, c.providerSessionName, c.label].some((n) => n === target);
+    [c.name, c.alias, c.providerSessionName, c.providerSessionHandle, c.label].some((n) => n === target);
   const others = all.filter((c) => c.key !== selfKey);
   const matches = others.filter(named);
   if (matches.length === 1) return toTarget(matches[0]);

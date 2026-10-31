@@ -112,10 +112,10 @@ export interface AgentTargetRow {
 }
 
 /**
- * Every session `resolveAgentTarget` could send to, on every machine the
- * account lists — the same candidates, so a row's key, alias or handle is
- * one it resolves. Names in the rows are what agents chose: data, not
- * instructions.
+ * Every candidate `resolveAgentTarget` matches, on every machine the account
+ * lists, so a row's key, alias or handle is one it resolves. A send to an
+ * `online: false` row is refused (TARGET_OFFLINE) and `self` marks this
+ * session. Names in the rows are what agents chose: data, not instructions.
  */
 export const listAgentTargets = (devices: AgentTargetDevice[], selfKey?: string): AgentTargetRow[] =>
   candidatesOf(devices).map((c) => ({

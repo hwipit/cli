@@ -755,6 +755,12 @@ const main = async (): Promise<number> => {
     // `hwip agent send` is the name (C82); `hwip send` is the older one for the same command.
     case 'agent':
     case 'send': {
+      if (command === 'agent' && args._arg1 === 'list' && flagOn(args, 'all')) {
+        // Every machine is the server's device list: this one needs the API key.
+        const hook = createHook(args);
+        if (!hook) return 3;
+        return (await import('./agent-list.js')).handleAgentListAll(args, hook);
+      }
       // Read-only and local: before `createHook`, so no API key is needed (no exit 3).
       if (command === 'agent' && args._arg1 === 'list') return (await import('./agent-list.js')).handleAgentList(args);
       if (command === 'agent' && args._arg1 === 'read') return (await import('./agent-read.js')).handleAgentRead(args);
@@ -763,6 +769,11 @@ const main = async (): Promise<number> => {
       const unknown = command === 'agent' ? agentSubcommandError(String(args._arg1)) : null;
       if (unknown) {
         console.error(unknown);
+        return 2;
+      }
+      // `--all` and `--turns` are agent list's and agent read's: the `agent` flag table is shared, so send refuses them rather than ignore them.
+      if (command === 'agent' && (flagOn(args, 'all') || args.turns !== undefined)) {
+        console.error(`hwip ${named}: --all and --turns are for agent list / agent read`);
         return 2;
       }
       const send = parseSendArgs(sendArgv, sendReadsStdin(sendArgv) ? await readStdin() : undefined, named);

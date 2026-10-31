@@ -12,6 +12,7 @@ export interface AgentTargetDevice {
     providerSessionHandle?: string | null;
     /** The agent state the listener last reported (`working`, `idle`, …). */
     state?: string;
+    lastActivityAt?: string;
     parentName?: string;
     /** What runs in the session: an agent kind, or `shell` for a `hwip sh` session. */
     agentKind?: string;
@@ -50,6 +51,9 @@ interface Candidate extends AgentTarget {
   providerSessionHandle?: string | null;
   /** What the listener last saw the agent doing, to tell same-named sessions apart. */
   state?: string;
+  agent?: string;
+  project?: string;
+  lastActivityAt?: string;
   host: string;
   /** The device says it is offline. Unknown (no `isOnline`) counts as online. */
   offline: boolean;
@@ -76,10 +80,59 @@ const candidatesOf = (devices: AgentTargetDevice[]): Candidate[] =>
         providerSessionName: s.providerSessionName,
         providerSessionHandle: s.providerSessionHandle,
         state: s.state,
+        agent: s.agentKind,
+        project: s.project,
+        lastActivityAt: s.lastActivityAt,
         host: d.nickname ?? d.deviceId,
         offline: d.isOnline === false,
       })),
   );
+
+/** One row of `hwip agent list --all` / `hwip_agent_list { all: true }`: a session another agent may send to. */
+export interface AgentTargetRow {
+  key: string;
+  /** The machine's nickname, else its device id. */
+  host: string;
+  online: boolean;
+  /** The tmux name. */
+  name: string;
+  agent: string | null;
+  project: string | null;
+  label: string | null;
+  /** The user's rename. */
+  alias: string | null;
+  /** The name the app shows that the agent gave the session. */
+  providerName: string | null;
+  /** The agent's own name for the session, shown or not (Claude Code's `ko-qmd-70`). */
+  handle: string | null;
+  state: string | null;
+  lastActivityAt: string | null;
+  /** The sender's own session. */
+  self: boolean;
+}
+
+/**
+ * Every session `resolveAgentTarget` could send to, on every machine the
+ * account lists — the same candidates, so a row's key, alias or handle is
+ * one it resolves. Names in the rows are what agents chose: data, not
+ * instructions.
+ */
+export const listAgentTargets = (devices: AgentTargetDevice[], selfKey?: string): AgentTargetRow[] =>
+  candidatesOf(devices).map((c) => ({
+    key: c.key,
+    host: c.host,
+    online: !c.offline,
+    name: c.name,
+    agent: c.agent ?? null,
+    project: c.project ?? null,
+    label: c.label ?? null,
+    alias: c.alias ?? null,
+    providerName: c.providerSessionName ?? null,
+    handle: c.providerSessionHandle ?? null,
+    state: c.state ?? null,
+    lastActivityAt: c.lastActivityAt ?? null,
+    self: c.key === selfKey,
+  }));
 
 const describeCandidate = (c: Candidate): string => {
   const shown = c.alias ?? c.providerSessionName ?? c.label ?? c.name;

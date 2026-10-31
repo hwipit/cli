@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { AgentTargetError, resolveAgentTarget } from './agent-target.js';
+import { AgentTargetError, listAgentTargets, resolveAgentTarget } from './agent-target.js';
 import type { AgentTargetDevice } from './agent-target.js';
 
 // `hwip-brain` runs on both machines — the case a bare name must not guess at.
@@ -165,5 +165,32 @@ describe('resolveAgentTarget', () => {
         expect(err).toBeInstanceOf(AgentTargetError);
         expect(String(err)).toContain('dev_linux:hwip-brain (');
         expect(String(err)).not.toContain('dev_mac:hwip-proj ');
+    });
+});
+
+describe('listAgentTargets — every machine', () => {
+    const fleet = [
+        {
+            deviceId: 'dev_win',
+            nickname: 'takui',
+            agentSessions: [
+                { name: 'hwip-ko-qmd', project: 'ko-qmd', agentKind: 'claude', label: null, providerSessionName: null, providerSessionHandle: 'ko-qmd-70', state: 'idle', lastActivityAt: '2026-10-31T08:00:00.000Z' },
+                { name: 'hwip-ko-qmd.2', project: 'ko-qmd', agentKind: 'claude', parentName: 'hwip-ko-qmd' },
+                { name: 'hwip-sh', project: 'ko-qmd', agentKind: 'shell' },
+            ],
+            agentSessionAliases: { 'hwip-ko-qmd': 'qmd' },
+        },
+        { deviceId: 'dev_off', isOnline: false, agentSessions: [{ name: 'hwip-x', project: 'x', agentKind: 'pi' }] },
+    ];
+
+    it('lists the agent sessions of every machine with host, online, handle and state', () => {
+        expect(listAgentTargets(fleet)).toEqual([
+            { key: 'dev_win:hwip-ko-qmd', host: 'takui', online: true, name: 'hwip-ko-qmd', agent: 'claude', project: 'ko-qmd', label: null, alias: 'qmd', providerName: null, handle: 'ko-qmd-70', state: 'idle', lastActivityAt: '2026-10-31T08:00:00.000Z', self: false },
+            { key: 'dev_off:hwip-x', host: 'dev_off', online: false, name: 'hwip-x', agent: 'pi', project: 'x', label: null, alias: null, providerName: null, handle: null, state: null, lastActivityAt: null, self: false },
+        ]);
+    });
+
+    it('marks the sender on every machine list', () => {
+        expect(listAgentTargets(fleet, 'dev_off:hwip-x').map((r) => r.self)).toEqual([false, true]);
     });
 });

@@ -75,7 +75,7 @@ Commands:
                   Exit 0 = the server stored it; whether the session
                   typed it is not confirmed. 2 usage, 1 failed (3 no
                   API key)
-  agent list [--json]
+  agent list [--all] [--json]
                   List the agent sessions running on THIS machine: key
                   (<deviceId>:<session> — what 'agent send' and 'agent
                   read' take), agent, state (working|blocked|idle|unknown,
@@ -84,6 +84,14 @@ Commands:
                   and the screens here only: no server, no API key; it
                   writes nothing.
                   Exit 0 listed, 1 no tmux server answered
+                  --all lists the sessions 'agent send' can reach on EVERY
+                  machine of the account, from the server's device list:
+                  key, host, agent, state and name, with the agent's own
+                  session name in [ ] (Claude Code's, e.g. ko-qmd-70 —
+                  'agent send' takes it). Offline machines are marked.
+                  --json prints {"v":1,"all":true,"sessions":[…]}. Needs
+                  the API key (exit 3 without). Exit 0 listed, 1 the list
+                  could not be read
   agent read <session> [--turns <n>] [--json]
                   Print what a session on THIS machine did last, oldest
                   first: its last <n> turns (1-20, default 3) — the

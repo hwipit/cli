@@ -340,6 +340,11 @@ export const handleAgentRead = async (args: Record<string, string | boolean>): P
         console.error(USAGE);
         return 2;
     }
+    // `--all` is `agent list`'s: the `agent` flag table is shared, and another machine's conversation stays there.
+    if (flagOn(args, 'all')) {
+        console.error(`hwip agent read: --all is for agent list; agent read reads this machine only\n${USAGE}`);
+        return 2;
+    }
     const wanted = args.turns === undefined ? String(DEFAULT_TURNS) : args.turns;
     const turns = typeof wanted === 'string' && /^\d{1,3}$/.test(wanted) ? Number(wanted) : NaN;
     if (!(turns >= 1 && turns <= MAX_TURNS)) {

@@ -18,7 +18,7 @@
  *   still be working underneath, so it must not change the state.
  *
  * Every agent here carries the same rules the server manifest publishes
- * (hwip server/src/agent-rules/manifest.json, version 2026.11.01.1 — the hwip mirror merges and deploys before this cli ships),
+ * (hwip server/src/agent-rules/manifest.json, version 2026.11.01.2 — the hwip mirror of this rule merges and deploys before this cli ships),
  * so a listener that never reaches the endpoint classifies them too. A fetched
  * manifest replaces this bundle whole for state reports; schedules read only
  * this bundle. An agent without rules here
@@ -29,7 +29,7 @@ import { ENGINE_VERSION, type DetectionManifest } from './agent-state.js';
 
 export const DEFAULT_MANIFEST: DetectionManifest = {
     engineVersion: ENGINE_VERSION,
-    version: '2026.11.01.1',
+    version: '2026.11.01.2',
     agents: {
         claude: [
             {
@@ -56,6 +56,20 @@ export const DEFAULT_MANIFEST: DetectionManifest = {
                     { contains: ['enter to select'] },
                     { contains: ['enter to confirm'] },
                     { contains: ['to navigate'] },
+                ],
+                not: [{ contains: ['esc to interrupt'] }],
+            },
+            {
+                // Plan approval (ExitPlanMode) and the review of several AskUserQuestion answers: their option lists
+                // carry no "esc to cancel" / "enter to select" line, so the dialog rule above misses them and the
+                // `❯ 1.` row reads as an idle prompt. Anchored to the dialogs' own question lines, near the bottom.
+                id: 'claude-blocked-plan-or-review',
+                state: 'blocked',
+                priority: 900,
+                tailLines: 14,
+                any: [
+                    { regex: ['^\\s*Claude has written up a plan and is ready to execute'] },
+                    { regex: ['^\\s*Ready to submit your answers\\?\\s*$'] },
                 ],
                 not: [{ contains: ['esc to interrupt'] }],
             },

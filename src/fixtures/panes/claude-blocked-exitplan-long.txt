@@ -1,0 +1,50 @@
+
+  ⎿  /plan to preview
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+
+  ────────────────────────────────────────────────────────────────────────────────────────────────
+   Ready to code?
+
+   Here is Claude's plan:
+  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+   1. List all files in /private/tmp/cdc-w2 to get the rename candidates.
+   2. Write the current file names to a scratch inventory (in memory, not on disk).
+   3. Pick the naming convention: lowercase kebab-case with the extension kept.
+   4. Mark files that already follow the convention as skip.
+   5. Mark hidden files (dotfiles) as skip.
+   6. Mark directories as skip unless they are explicitly in scope.
+   7. For each candidate, lowercase the base name.
+   8. Replace spaces in the base name with hyphens.
+   9. Replace underscores in the base name with hyphens.
+   10. Collapse repeated hyphens into one hyphen.
+   11. Strip leading and trailing hyphens from the base name.
+   12. Remove characters outside [a-z0-9.-] from the base name.
+   13. Lowercase the file extension.
+   14. Normalize .jpeg to .jpg.
+   15. Normalize .htm to .html.
+   16. Normalize .yml to .yaml only if the repo has no tool that needs .yml.
+   17. Keep multi-part extensions (.tar.gz, .d.ts) intact.
+   18. Build an old-to-new name mapping table.
+   19. Drop mapping rows where the old name equals the new name.
+   20. Check the mapping for two old names that map to the same new name.
+   21. On a collision, add a numeric suffix (-2, -3) to the later file.
+   22. Check every new name against existing files that are not being renamed.
+   23. On a clash with an existing file, add a numeric suffix as well.
+   24. Check that no new name is longer than 255 bytes.
+   25. Check that no new name is empty after sanitizing.
+   26. Give empty-result names a fallback (file-<n>).
+   27. Check for case-only renames (Foo.txt to foo.txt).
+   28. Route case-only renames through a temporary name (macOS is case-insensitive).
+   29. Pick a temporary suffix such as .renametmp that no current file uses.
+   30. Search text files for references to each old name (grep -rn).
+   31. Record every file:line that refers to an old name.
+   32. Mark references inside binary files as manual follow-up.                                   ↓
+  ────────────────────────────────────────────────────────────────────────────────────────────────
+   Claude has written up a plan and is ready to execute. Would you like to proceed?
+
+   ❯ 1. Yes, and use auto mode
+     2. Yes, manually approve edits
+     3. Tell Claude what to change
+        shift+tab to approve with this feedback
+
+   ctrl+g to edit in Nvim · ~/.claude/plans/make-a-plan-with-dreamy-eich.md

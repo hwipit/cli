@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readTranscriptDelta } from './transcript-tail.js';
-import { detectClaudeProviderName, detectClaudeSessionHandle, detectClaudeSessionIdByPid, findAgentBySubcommand, matchAgentByPaneCommand, REMOTE_AGENTS } from './remote-agents.js';
+import { hermesTranscriptPath, detectClaudeProviderName, detectClaudeSessionHandle, detectClaudeSessionIdByPid, findAgentBySubcommand, matchAgentByPaneCommand, REMOTE_AGENTS } from './remote-agents.js';
 import type { PidSessionRecord } from './remote-agents.js';
 
 // Top-level CLI commands the registry's subcommands must never collide
@@ -40,16 +40,16 @@ describe('remote-agents.ts: table invariants', () => {
         }
     });
 
-    // Cursor and Hermes stay unmeasured (Cursor: no TUI transcript seen;
-    // Hermes: SQLite, no reply rows seen), so a projector for either would be a
-    // guess. opencode carries the pair since its 2.x store was read (C137).
-    it('gemini and opencode carry the transcript pair; cursor and hermes still carry none', () => {
-        for (const kind of ['gemini', 'opencode']) {
+    // Cursor stays unmeasured (no TUI transcript seen), so a projector for it
+    // would be a guess. opencode carries the pair since its 2.x store was read
+    // (C137), hermes since its `messages` table was (hermes-transcript.ts).
+    it('gemini, opencode and hermes carry the transcript pair; cursor still carries none', () => {
+        for (const kind of ['gemini', 'opencode', 'hermes']) {
             const row = REMOTE_AGENTS.find((a) => a.kind === kind);
             expect(typeof row?.resolveTranscript, kind).toBe('function');
             expect(typeof row?.projectTranscript, kind).toBe('function');
         }
-        for (const kind of ['cursor', 'hermes']) {
+        for (const kind of ['cursor']) {
             const row = REMOTE_AGENTS.find((a) => a.kind === kind);
             expect(row?.resolveTranscript, kind).toBeUndefined();
             expect(row?.projectTranscript, kind).toBeUndefined();
@@ -57,12 +57,12 @@ describe('remote-agents.ts: table invariants', () => {
     });
 
     // A reader with no path to read is dead code, and the file tailer is the
-    // reader for every row whose transcript is a file — only opencode's is not.
-    it('only a row that resolves a transcript carries its own reader, and only opencode does', () => {
+    // reader for every row whose transcript is a file — only the SQLite ones are not.
+    it('only a row that resolves a transcript carries its own reader, and only opencode and hermes do', () => {
         for (const a of REMOTE_AGENTS) {
             if (a.readTranscript) expect(a.resolveTranscript, a.kind).toBeDefined();
         }
-        expect(REMOTE_AGENTS.filter((a) => a.readTranscript).map((a) => a.kind)).toEqual(['opencode']);
+        expect(REMOTE_AGENTS.filter((a) => a.readTranscript).map((a) => a.kind)).toEqual(['hermes', 'opencode']);
     });
 
     it('no subcommand collides with a built-in CLI command', () => {
@@ -1089,5 +1089,26 @@ describe('remote-agents.ts: bounded reader spawns', () => {
         } finally {
             errors.mockRestore();
         }
+    });
+});
+
+describe('remote-agents.ts: hermes transcript', () => {
+    const NOW = 1_800_000_000_000;
+    const deps = (rows: unknown[]) => ({ rows, startTimes: new Map([[50, NOW - 60_000]]), descendants: new Set([50]) });
+
+    it('resolves the pane session to a <db>#<id> path, and nothing without one', () => {
+        const live = { id: '20261101_100000_abcdef', cwd: '/work', active: (NOW - 1_000) / 1_000 };
+        const path = hermesTranscriptPath('/work', 99, deps([live]));
+        expect(path).toMatch(/\.hermes\/state\.db#20261101_100000_abcdef$/);
+        expect(hermesTranscriptPath('/elsewhere', 99, deps([live]))).toBeNull();
+        expect(hermesTranscriptPath(null, 99, deps([live]))).toBeNull();
+        expect(hermesTranscriptPath('/work', undefined, deps([live]))).toBeNull();
+    });
+
+    it('wires the projector and its own reader on the hermes row', () => {
+        const row = REMOTE_AGENTS.find((a) => a.kind === 'hermes');
+        expect(typeof row?.resolveTranscript).toBe('function');
+        expect(typeof row?.projectTranscript).toBe('function');
+        expect(typeof row?.readTranscript).toBe('function');
     });
 });

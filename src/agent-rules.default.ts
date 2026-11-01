@@ -153,8 +153,8 @@ export const DEFAULT_MANIFEST: DetectionManifest = {
                 contains: ['trust this folder', 'enter continue'],
             },
             {
-                // Tool approval (codex-cli 0.166.0, shell command or file edit): the question, the numbered
-                // answers with `›` on one, and the confirm footer. Both must be in view, so a transcript that
+                // Tool approval (codex-cli 0.166.0, shell command or file edit): the question and the
+                // confirm footer. Both must be in view, so a transcript that
                 // only quotes one of them does not read blocked. The composer is hidden while it is drawn.
                 id: 'codex-blocked-tool-approval',
                 state: 'blocked',

@@ -127,3 +127,15 @@ describe('persistent marking', () => {
     expect(read('claude-blocked-ask-single.txt')!.options.some((o) => o.persistent)).toBe(false);
   });
 });
+
+describe('persistent marking beside the Codex reader', () => {
+  it('still marks the Codex "don\'t ask again" choices as persistent, and not the plain ones', () => {
+    for (const name of ['codex-blocked-tool-exec.txt', 'codex-blocked-tool-exec-wrapped.txt', 'codex-blocked-tool-edit.txt']) {
+      const p = parseBlockedDialog(pane(name), 'codex')!;
+      const lasting = p.options.filter((o) => /don.?t ask again/i.test(o.label));
+      expect(lasting.length, name).toBeGreaterThan(0);
+      expect(lasting.every((o) => o.persistent === true), name).toBe(true);
+      expect(p.options.filter((o) => !/don.?t ask again/i.test(o.label)).every((o) => !o.persistent), name).toBe(true);
+    }
+  });
+});

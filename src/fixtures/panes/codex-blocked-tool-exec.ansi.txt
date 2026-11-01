@@ -1,0 +1,39 @@
+
+  [38;2;99;168;248m>_ [1m[39mOpenAI Codex[0;2m (v0.166.0)[0m
+     [2m/private/tmp/f27cap
+[0m
+[48;5;8m
+[1;2m› [0m[48;5;8mCreate a file named probe.txt containing the word ok, using a shell command (echo ok >
+  probe.txt). Do not explain.
+
+[49m
+[1m[38;2;128;128;128m•[0m [1mRunning[0m [38;2;137;180;250mecho[38;2;205;214;244m ok [38;2;148;226;213m>[38;2;205;214;244m probe.txt[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  [1mWould you like to run the following command?[0m
+
+  Environment: [1mlocal[0m
+
+  Reason: [3mAllow creating probe.txt in the workspace with the requested shell command?[0m
+
+  $ [38;2;137;180;250mecho[38;2;205;214;244m ok [38;2;148;226;213m>[38;2;205;214;244m probe.txt[39m
+
+
+[1;7m› 1. Yes, proceed (y)
+[0m  2. Yes, and don't ask again for commands that start with `echo ok > probe.txt` ([1mp[0m)
+  3. No, and tell Codex what to do differently ([1mesc[0m)
+
+  [2mPress [0;1menter[0;2m to confirm or [0;1mesc[0;2m to cancel

@@ -18,7 +18,7 @@
  *   still be working underneath, so it must not change the state.
  *
  * Every agent here carries the same rules the server manifest publishes
- * (hwip server/src/agent-rules/manifest.json, version 2026.10.21.1 — hwip#616, merged and deployed before this cli ships),
+ * (hwip server/src/agent-rules/manifest.json, version 2026.11.01.1 — the hwip mirror merges and deploys before this cli ships),
  * so a listener that never reaches the endpoint classifies them too. A fetched
  * manifest replaces this bundle whole for state reports; schedules read only
  * this bundle. An agent without rules here
@@ -29,7 +29,7 @@ import { ENGINE_VERSION, type DetectionManifest } from './agent-state.js';
 
 export const DEFAULT_MANIFEST: DetectionManifest = {
     engineVersion: ENGINE_VERSION,
-    version: '2026.10.21.1',
+    version: '2026.11.01.1',
     agents: {
         claude: [
             {
@@ -123,15 +123,11 @@ export const DEFAULT_MANIFEST: DetectionManifest = {
             // while a turn runs both stay drawn under a `• Working (… • esc to
             // interrupt)` line, so working must outrank idle.
             //
-            // KNOWN GAP — no tool ever ran (the workspace was out of credits),
-            // so the tool-approval dialog was never drawn and has no rule. The
-            // idle rule refuses a tail holding the markers those dialogs and
-            // older Codex approval prompts draw — a `› 1.` option list, a
-            // `(y)`/`(n)` key hint, a `· esc …` footer, `enter to confirm` or
-            // `esc to cancel` — so an approval dialog that kept the footer
-            // reads `unknown` as long as it draws one of them. One that draws
-            // none would read `idle`; capture it before trusting this rule
-            // further.
+            // The tool-approval dialog (captured on 0.166.0) has its own blocked
+            // rule. The idle rule still refuses a tail holding the markers
+            // approval prompts draw — a `› 1.` option list, a `(y)`/`(n)` key
+            // hint, a `· esc …` footer, `enter to confirm` or `esc to cancel` —
+            // so a variant the blocked rule misses reads `unknown`, not `idle`.
             {
                 id: 'codex-blocked-hooks-review',
                 state: 'blocked',
@@ -155,6 +151,20 @@ export const DEFAULT_MANIFEST: DetectionManifest = {
                 state: 'blocked',
                 priority: 900,
                 contains: ['trust this folder', 'enter continue'],
+            },
+            {
+                // Tool approval (codex-cli 0.166.0, shell command or file edit): the question and the
+                // confirm footer. Both must be in view, so a transcript that
+                // only quotes one of them does not read blocked. The composer is hidden while it is drawn.
+                id: 'codex-blocked-tool-approval',
+                state: 'blocked',
+                priority: 900,
+                tailLines: 30,
+                regex: ['^\\s*Press enter to confirm or esc to cancel\\s*$'],
+                any: [
+                    { regex: ['^\\s*Would you like to run the following command\\?\\s*$'] },
+                    { regex: ['^\\s*Would you like to make the following edits\\?\\s*$'] },
+                ],
             },
             {
                 id: 'codex-working-interrupt-hint',

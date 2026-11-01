@@ -46,6 +46,10 @@
  * row of buttons whose chosen one is told apart by background colour only (`parseOpencodePermission`). Its question
  * tool (v2.1.2) draws a `Questions` panel whose highlighted answer differs by the colour of its number
  * (`parseOpencodeQuestion`).
+ *
+ * Codex (codex-cli 0.166.0, `blocked-prompt-codex.test.ts`): a question, the reason or the destination and the
+ * `$ command`, numbered answers with `›` on the highlighted one and a `Press enter to confirm` footer
+ * (`parseCodexDialog`). Answered with up/down and enter like the rest: that lands on "No" the way esc does.
  */
 import { createHash } from 'node:crypto';
 import type { AgentKind } from './remote-agents.js';
@@ -171,6 +175,63 @@ const parseClaudeDialog = (pane: string): ParsedPrompt | undefined => {
         detail: detailLines,
         note: after.join(' '),
         question: region[q]!.trim(),
+        options,
+    });
+};
+
+const CODEX_FOOTER = /^\s*Press enter to confirm or esc to cancel$/;
+const CODEX_QUESTION = /^\s*(Would you like to (?:run the following command|make the following edits)\?)$/;
+const CODEX_OPTION = /^\s*(›)?\s*(\d{1,2})\.\s+(\S.*)$/;
+const CODEX_META = /^\s*(Environment|Reason|Description|Destination):\s*(.*)$/;
+
+/**
+ * Codex's tool approval (codex-cli 0.166.0): the question, `Reason:`/`Description:`/`Destination:` lines and the
+ * `$ command`, numbered answers with `›` on the highlighted one, then `Press enter to confirm or esc to cancel`. The
+ * dialog replaces the composer; the turn's history stays above it. Only the two questions captured are read.
+ */
+const parseCodexDialog = (pane: string): ParsedPrompt | undefined => {
+    const lines = pane.split('\n').map((l) => l.trimEnd());
+    let footer = lines.length - 1;
+    while (footer >= 0 && lines[footer]!.trim() === '') footer--;
+    if (footer < 0 || !CODEX_FOOTER.test(lines[footer]!)) return undefined;
+    let first = -1;
+    for (let i = footer - 1; i >= 0; i--) {
+        const m = CODEX_OPTION.exec(lines[i]!);
+        if (m && m[2] === '1') { first = i; break; }
+    }
+    if (first < 0) return undefined;
+    const options: { n: number; label: string; selected: boolean }[] = [];
+    for (const line of lines.slice(first, footer)) {
+        if (line.trim() === '') continue;
+        const m = CODEX_OPTION.exec(line);
+        if (m) {
+            options.push({ n: Number(m[2]), label: m[3]!.trim(), selected: m[1] === '›' });
+        } else if (/^\s{4,}\S/.test(line)) {
+            options[options.length - 1]!.label += ` ${line.trim()}`;
+        } else {
+            return undefined;
+        }
+    }
+    let q = -1;
+    for (let i = first - 1; i >= Math.max(0, first - MAX_DETAIL_LINES - 6); i--) {
+        if (CODEX_QUESTION.test(lines[i]!)) { q = i; break; }
+    }
+    if (q < 0) return undefined;
+    const question = CODEX_QUESTION.exec(lines[q]!)![1]!;
+    const detail: string[] = [];
+    let note = '';
+    for (const line of lines.slice(q + 1, first)) {
+        const meta = CODEX_META.exec(line);
+        if (meta?.[1] === 'Reason') note = meta[2]!.trim();
+        else if (meta?.[1] === 'Environment') continue;
+        else if (line.trim() !== '') detail.push(line.trim());
+    }
+    return assemble({
+        region: lines.slice(q, footer + 1),
+        title: question.includes('command') ? 'Run command' : 'Edit files',
+        detail,
+        note,
+        question,
         options,
     });
 };
@@ -625,6 +686,7 @@ const READERS: Partial<Record<AgentKind, (pane: string) => ParsedPrompt | undefi
         const plain = stripEscapes(pane);
         return parsePiSelect(plain) ?? parsePiQuestion(plain);
     },
+    codex: (pane) => parseCodexDialog(stripEscapes(pane)),
     opencode: (pane) => {
         const rows = pane.split('\n').map(withColours);
         return parseOpencodePermission(rows) ?? parseOpencodeQuestion(rows);

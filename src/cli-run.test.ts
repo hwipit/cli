@@ -158,6 +158,22 @@ describe('hwip channel list', () => {
     });
 });
 
+describe('hwip notify --auto', () => {
+    // A Codex Stop hook's stdout is parsed as JSON: "Push sent: …" failed the hook.
+    it('prints nothing on stdout when the push goes out', async () => {
+        const result = await runCli('notify', '--auto', '--pushmode-default', 'loud', '--title', 'Task done');
+
+        expect(result.status).toBe(0);
+        expect(result.stdout).toBe('');
+    });
+
+    it('still prints the JSON when --json asks for it', async () => {
+        const result = await runCli('notify', '--auto', '--pushmode-default', 'loud', '--title', 'Task done', '--json');
+
+        expect(JSON.parse(result.stdout)).toEqual({ pushId: 'sent', status: 'ok' });
+    });
+});
+
 describe('hwip notify --channel', () => {
     it('sends to the channel a name resolves to, in the clear, and says so', async () => {
         sentBodies.length = 0;

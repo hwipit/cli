@@ -4,7 +4,8 @@
  * do, so a phone that reads those reads these too; only the title tells them apart.
  *
  * Rows that need typed text (`Type something`, `Chat about this`, `Tell Claude what to change`) are not options: an
- * option has to be one answer a single press ends. A dialog whose highlight sits on such a row is not read at all, as
+ * option has to be one answer a single press gives (in a multi-select a press toggles a box, and the screen it
+ * draws next is a new prompt). A dialog whose highlight sits on such a row is not read at all, as
  * is one the user is typing into: the keys of the other options would land in the text.
  */
 import { assemble, type ParsedPrompt } from './blocked-prompt.js';
@@ -131,7 +132,8 @@ export const parseClaudeQuestion = (pane: string): ParsedPrompt | undefined => {
     if (rows.some((r) => OTHER_LABEL.test(r.label) || CHAT_LABEL.test(r.label))) return undefined;
 
     const multi = rows.length > 0 && rows.every((r) => MULTI_LABEL.test(r.label));
-    if (submit && !multi) return undefined;
+    // Submit sits after the free-text row, which the key positions count: no such row, no known layout.
+    if (submit && (!multi || ruleAt < 0)) return undefined;
     const options = rows.map((r) => ({ n: r.n, label: withNote(r), selected: r.selected }));
     if (submit) options.push({ n: rows.length + 1, label: 'Submit', selected: submit.selected });
 

@@ -190,7 +190,8 @@ says it has no live timeline.
 | Codex CLI | `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*.jsonl` (`CODEX_HOME`) | `src/codex-transcript.ts` |
 | Gemini CLI | `~/.gemini/tmp/<project>/chats/session-*.jsonl` (`GEMINI_CLI_HOME`) | `src/gemini-transcript.ts` |
 | OpenCode 2.x | no file — the `session_message` table of `~/.local/share/opencode/opencode.db` (`OPENCODE_DB`, `XDG_DATA_HOME`), asked again when the store changes, at most once a second per session. The pane's session is the newest one in its directory written to since the pane started | `src/opencode-transcript.ts` |
-| Cursor, Hermes, Kimi, Grok, Antigravity, Qwen, Auggie, Kilo, Copilot, Kiro, Droid | — none yet | — |
+| Hermes | no file — the `messages` table of `~/.hermes/state.db`, asked again when the store changes, at most once a second per session. The pane's session is the newest one in its directory with a message since the pane started | `src/hermes-transcript.ts` |
+| Cursor, Kimi, Grok, Antigravity, Qwen, Auggie, Kilo, Copilot, Kiro, Droid | — none yet | — |
 
 Adding an agent means a projector file of its own, not another branch in an
 existing one: the formats share no vocabulary. Each projector is pinned to the

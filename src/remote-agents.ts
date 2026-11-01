@@ -22,6 +22,7 @@ import { projectPiEntries } from './pi-transcript.js';
 import { createTailWatch, latestClaudeAiTitle, piNamesStep, type ProviderName } from './session-title.js';
 import { projectCodexEntries } from './codex-transcript.js';
 import { projectGeminiEntries } from './gemini-transcript.js';
+import { hermesSourcePath, projectHermesEntries, readHermesTranscript } from './hermes-transcript.js';
 import { opencodeDbPath, opencodeSourcePath, OPENCODE_SESSION_ID, projectOpencodeEntries, readOpencodeTranscript } from './opencode-transcript.js';
 
 export interface RemoteAgent {
@@ -991,6 +992,20 @@ export const detectHermesResumeId = (
     return best?.id ?? null;
 };
 
+/** `sqliteJson` with its own warning: a failed transcript read costs the timeline, not the session list. */
+const queryHermesTranscript = (db: string, sql: string): unknown[] | null => {
+    const rows = sqliteJson(db, sql);
+    if (rows === null) warnReaderOnce('hermes transcript', `sqlite3 ${basename(db)}`, 'hermes panes show no live timeline');
+    return rows;
+};
+
+/** The store and the pane's session in one string, as opencode's. Null until the session has a message. */
+export const hermesTranscriptPath = (paneCwd: string | null, panePid?: number, deps: StoreResolveDeps = {}): string | null => {
+    if (!paneCwd) return null;
+    const id = detectHermesResumeId(paneCwd, panePid, deps);
+    return id ? hermesSourcePath(HERMES_STATE_DB, id) : null;
+};
+
 // ── Codex ────────────────────────────────────────────────────────
 
 const CODEX_DIR = join(homedir(), '.codex');
@@ -1531,6 +1546,10 @@ const REMOTE_AGENT_TABLE = [
         // `<timestamp>_<hash>` string, and nothing on the wire consumes it yet.
         resolveSessionName: detectHermesSessionName,
         resolveResumeId: detectHermesResumeId,
+        // No file: the conversation is rows of `messages` in the state store.
+        resolveTranscript: (paneCwd, panePid) => hermesTranscriptPath(paneCwd, panePid),
+        projectTranscript: projectHermesEntries,
+        readTranscript: (path, prev) => readHermesTranscript(path, prev, { query: queryHermesTranscript }),
         // Measured: `--resume <id>` carries the conversation on, and an id the
         // store lost starts a new session rather than exit — so, like opencode,
         // not checked against the store.

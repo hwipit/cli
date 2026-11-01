@@ -709,8 +709,13 @@ the screen with its colours, since only a colour marks the chosen button), pi
 approval extensions that ask through `ctx.ui.select` and Codex (a shell command or a file edit; the app answers with
 the arrow keys and Enter). It is sealed the same
 way as a chunk, for the same pinned devices, and turned off by the same
-`--no-turn-history`; the server stores ciphertext only. Other dialogs (a plan, a
-question, a trust prompt) send nothing beyond the state. An answer the app sends is
+`--no-turn-history`; the server stores ciphertext only. For Claude Code that
+includes a question it asks (one question, a multi-select with its Submit row,
+the review of several answers) and the plan it asks you to approve; a plan longer
+than the screen shows is cut where the screen cuts it, with the plan file's path
+as the note. Rows that need typed text (`Type something`, `Chat about this`,
+`Tell Claude what to change`) are not offered, and a dialog you are typing into is
+not read. Other dialogs (a trust prompt) send nothing beyond the state. An answer the app sends is
 typed only while that same prompt is still on screen: if you have moved the
 highlight or answered at the keyboard, the command is refused (`prompt_changed`)
 instead of landing on whatever is there now.

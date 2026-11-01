@@ -61,7 +61,6 @@ describe('parseBlockedDialog — captured dialogs', () => {
     });
 
     it('yields nothing for the dialogs it has no layout for', () => {
-        expect(parseBlockedDialog(pane('claude-blocked-askuserquestion.txt'), 'claude')).toBeUndefined();
         expect(parseBlockedDialog(pane('claude-blocked-trust-dialog.txt'), 'claude')).toBeUndefined();
         expect(parseBlockedDialog(pane('claude-idle.txt'), 'claude')).toBeUndefined();
         expect(parseBlockedDialog(pane('claude-working.txt'), 'claude')).toBeUndefined();

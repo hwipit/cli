@@ -85,6 +85,11 @@ interface BenchCase {
 const CASES: readonly BenchCase[] = [
     { agent: 'claude', expected: 'working', fixture: 'claude-working.txt', screen: 'spinner with elapsed time + token counter' },
     { agent: 'claude', expected: 'blocked', fixture: 'claude-blocked-askuserquestion.txt', screen: 'AskUserQuestion picker' },
+    { agent: 'claude', expected: 'blocked', fixture: 'claude-blocked-ask-single.txt', screen: 'AskUserQuestion with a free-text row' },
+    { agent: 'claude', expected: 'blocked', fixture: 'claude-blocked-ask-multiselect.txt', screen: 'AskUserQuestion multi-select with Submit row' },
+    { agent: 'claude', expected: 'blocked', fixture: 'claude-blocked-ask-review.txt', screen: 'AskUserQuestion review of several answers' },
+    { agent: 'claude', expected: 'blocked', fixture: 'claude-blocked-exitplan-short.txt', screen: 'ExitPlanMode plan approval' },
+    { agent: 'claude', expected: 'blocked', fixture: 'claude-blocked-exitplan-long.txt', screen: 'ExitPlanMode with a plan cut at the viewport' },
     { agent: 'claude', expected: 'blocked', fixture: 'claude-blocked-trust-dialog.txt', screen: 'folder trust dialog' },
     { agent: 'claude', expected: 'idle', fixture: 'claude-idle.txt', screen: 'prompt at rest' },
     { agent: 'codex', expected: 'blocked', fixture: 'codex-blocked-hooks-review.txt', screen: 'hooks review dialog at startup' },
@@ -196,7 +201,7 @@ describe('harness bench — bundled rules vs real panes', () => {
  * the cli. A floor that lags the merged version is harmless — it only ever
  * blocks a bundle bump, never a fetch.
  */
-const PUBLISHED_FLOOR = '2026.11.01.1';
+const PUBLISHED_FLOOR = '2026.11.01.2';
 
 describe('bundled manifest vs published manifest', () => {
     it('does not outrank what the endpoint serves', () => {

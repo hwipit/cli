@@ -486,7 +486,8 @@ const handleNotify = async (args: Record<string, string | boolean>): Promise<num
   // dial now works for every hook-driven agent. Gated-out → silent success.
   // With no dial the mode falls back to --pushmode-default, then to quiet.
   // Quiet still pushes when the user has left the terminal (presence.ts).
-  if (flagOn(args, 'auto')) {
+  const isAuto = flagOn(args, 'auto');
+  if (isAuto) {
     const marker = normalizeMarker(typeof args.marker === 'string' ? args.marker : undefined);
     const pushMode = autoPushMode(projectDir, args[PUSHMODE_DEFAULT_FLAG]);
     const verdict = decidePush({
@@ -503,7 +504,7 @@ const handleNotify = async (args: Record<string, string | boolean>): Promise<num
 
   // Past the gates, this IS a push attempt — its outcome is recorded for
   // `hwip verify` and the plugin (notify-failure.ts), since hooks discard stderr.
-  const hook = createHook(args, flagOn(args, 'auto') ? HOOK_REQUEST_TIMEOUT_MS : undefined);
+  const hook = createHook(args, isAuto ? HOOK_REQUEST_TIMEOUT_MS : undefined);
   if (!hook) {
     recordNotifyFailure({ kind: 'no-key', status: null, code: null });
     return 3;
@@ -533,9 +534,10 @@ const handleNotify = async (args: Record<string, string | boolean>): Promise<num
       sessionId,
     }));
 
+    // Hook mode: stdout is the hook's response (Codex parses it as JSON), so stay silent.
     if (isJson) {
       printJson({ pushId: result.pushId, status: 'ok' });
-    } else {
+    } else if (!isAuto) {
       console.log(`Push sent: ${result.pushId}`);
     }
     return 0;

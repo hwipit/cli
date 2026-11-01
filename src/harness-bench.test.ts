@@ -91,6 +91,9 @@ const CASES: readonly BenchCase[] = [
     { agent: 'codex', expected: 'blocked', fixture: 'codex-blocked-usage-limit.txt', screen: 'usage limit dialog' },
     { agent: 'codex', expected: 'blocked', fixture: 'codex-blocked-update.txt', screen: 'update dialog at startup' },
     { agent: 'codex', expected: 'blocked', fixture: 'codex-blocked-trust-dialog.txt', screen: 'folder trust dialog' },
+    { agent: 'codex', expected: 'blocked', fixture: 'codex-blocked-tool-exec.txt', screen: 'shell command approval' },
+    { agent: 'codex', expected: 'blocked', fixture: 'codex-blocked-tool-edit.txt', screen: 'file edit approval' },
+    { agent: 'codex', expected: 'blocked', fixture: 'codex-blocked-tool-exec-wrapped.txt', screen: 'shell command approval, answer wrapped' },
     { agent: 'codex', expected: 'working', fixture: 'codex-working.txt', screen: 'Working line with interrupt hint, composer and footer still drawn' },
     { agent: 'codex', expected: 'idle', fixture: 'codex-idle.txt', screen: 'fresh session at rest' },
     { agent: 'codex', expected: 'idle', fixture: 'codex-idle-after-failed-turn.txt', screen: 'at rest after a refused turn' },
@@ -193,7 +196,7 @@ describe('harness bench — bundled rules vs real panes', () => {
  * the cli. A floor that lags the merged version is harmless — it only ever
  * blocks a bundle bump, never a fetch.
  */
-const PUBLISHED_FLOOR = '2026.10.21.1';
+const PUBLISHED_FLOOR = '2026.11.01.1';
 
 describe('bundled manifest vs published manifest', () => {
     it('does not outrank what the endpoint serves', () => {

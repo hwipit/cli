@@ -1,5 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
+import { DEFAULT_MANIFEST } from './agent-rules.default.js';
+import { clearRegexCache, evaluateState } from './agent-state.js';
 import { parseBlockedDialog } from './blocked-prompt.js';
 import { promptStillShown } from './blocked-prompt-seal.js';
 
@@ -87,5 +89,37 @@ describe('parseBlockedDialog — codex tool approval (captured, codex-cli 0.166.
 
     it('reads nothing once the dialog has scrolled off: the history above it is not a prompt', () => {
         expect(parseBlockedDialog(WRAPPED.split('Would you like')[0]!, 'codex')).toBeUndefined();
+    });
+});
+
+describe('codex rules — tool approval reads blocked', () => {
+    const classify = (text: string) => {
+        clearRegexCache();
+        return evaluateState(text, 'codex', DEFAULT_MANIFEST);
+    };
+
+    it.each([['exec', EXEC], ['edit', EDIT], ['wrapped', WRAPPED]])('%s approval is blocked, not idle', (_, text) => {
+        expect(classify(text)).toMatchObject({ state: 'blocked', ruleId: 'codex-blocked-tool-approval' });
+    });
+
+    it('is not idle even without the blocked rule: the idle guards refuse the screen on their own', () => {
+        const without = {
+            ...DEFAULT_MANIFEST,
+            agents: { codex: DEFAULT_MANIFEST.agents.codex!.filter((r) => r.id !== 'codex-blocked-tool-approval') },
+        };
+        clearRegexCache();
+        for (const text of [EXEC, EDIT, WRAPPED]) expect(evaluateState(text, 'codex', without).state).not.toBe('idle');
+    });
+
+    it.each([['idle', 'codex-idle.txt', 'idle'], ['working', 'codex-working.txt', 'working'], ['failed turn', 'codex-idle-after-failed-turn.txt', 'idle']])(
+        'leaves the %s screen as it was',
+        (_, name, state) => {
+            expect(classify(pane(name)).state).toBe(state);
+        },
+    );
+
+    it('does not fire on a transcript that only quotes the question', () => {
+        const quoted = `${pane('codex-idle.txt')}\n  Would you like to run the following command?\n`;
+        expect(classify(quoted).ruleId).not.toBe('codex-blocked-tool-approval');
     });
 });

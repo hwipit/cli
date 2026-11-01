@@ -705,9 +705,8 @@ When a session waits for your approval, the listener also sends what it is waiti
 for — the tool, the command or the diff, and the answers — so the app can show it
 and answer. That covers Claude Code (a Bash command, a file edit or a new file),
 Gemini CLI (its tool approvals), OpenCode (its permission request; the listener reads
-the screen with its colours, since only a colour marks the chosen button) and pi
-approval extensions that ask through `ctx.ui.select`. Codex's approval dialog is not
-read yet. It is sealed the same
+the screen with its colours, since only a colour marks the chosen button), pi
+approval extensions that ask through `ctx.ui.select` and Codex (a shell command or a file edit; the app answers with the arrow keys and Enter, and "No" is the last answer). It is sealed the same
 way as a chunk, for the same pinned devices, and turned off by the same
 `--no-turn-history`; the server stores ciphertext only. Other dialogs (a plan, a
 question, a trust prompt) send nothing beyond the state. An answer the app sends is

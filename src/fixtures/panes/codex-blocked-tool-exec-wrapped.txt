@@ -1,0 +1,39 @@
+› Create a file named probe.txt containing the word ok, using a shell command (echo ok > probe.tx…
+  └ hook returned invalid stop hook JSON output
+
+  Worked for 34s • 10:24 AM
+
+
+› Edit README.md with your file edit tool (apply_patch): change the line "hi" to "hello". Do not
+  use a shell command. Do not explain.
+
+
+• Edited README.md (+1 -1)
+    1 -hi
+    1 +hello
+    + Show details
+
+■ Conversation interrupted - use /feedback if something went wrong
+
+
+› Fetch https://example.com with curl and print the HTTP status code only.
+
+
+• Running curl -s -o /dev/null -w '%{http_code}' https://example.com
+
+
+  Would you like to run the following command?
+
+  Environment: local
+
+  Reason: Allow fetching example.com to print its HTTP status code?
+
+  $ curl -s -o /dev/null -w '%{http_code}' https://example.com
+
+
+› 1. Yes, proceed (y)
+  2. Yes, and don't ask again for commands that start with `curl -s -o /dev/null -w '%{http_code}'
+     https://example.com` (p)
+  3. No, and tell Codex what to do differently (esc)
+
+  Press enter to confirm or esc to cancel

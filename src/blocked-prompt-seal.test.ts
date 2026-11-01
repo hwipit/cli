@@ -116,7 +116,6 @@ describe('createPromptSealer', () => {
 
     it('leaves out a dialog it has no layout for, and seals nothing', async () => {
         const h = harness();
-        expect(h.sealer.observe('hwip-a', 'claude', 'blocked', fixture('claude-blocked-askuserquestion.txt'))).toBeUndefined();
         expect(h.sealer.observe('hwip-a', 'claude', 'blocked', fixture('claude-blocked-trust-dialog.txt'))).toBeUndefined();
         expect(h.sealer.observe('hwip-a', 'claude', 'blocked', null)).toBeUndefined();
         await h.settle();

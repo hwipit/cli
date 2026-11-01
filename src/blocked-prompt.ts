@@ -52,6 +52,7 @@
  * (`parseCodexDialog`). Answered with up/down and enter like the rest: that lands on "No" the way esc does.
  */
 import { createHash } from 'node:crypto';
+import { parseClaudePlan, parseClaudeQuestion } from './blocked-prompt-claude-dialogs.js';
 import type { AgentKind } from './remote-agents.js';
 
 /** Dialog titles whose layout was captured and is read. */
@@ -96,7 +97,7 @@ const OPTION = /^\s*([❯>])?\s*(\d{1,2})\.\s+(\S.*)$/;
 const FOOTER = /^\s*(esc to cancel|enter to select)/i;
 // A choice that grants more than this one request: "don't ask again", "always allow", "allow all edits during this
 // session", "… for this session". Wider on purpose — a miss lets the app skip its extra confirmation.
-const PERSISTENT = /don.?t ask again|never ask|always|allow all|this session|from now on/i;
+const PERSISTENT = /don.?t ask again|never ask|always|allow all|this session|from now on|auto mode/i;
 
 /** The character the highlight is drawn with. A pane without it is not a dialog this module can answer. */
 const HIGHLIGHT = '❯';
@@ -639,7 +640,7 @@ const parseOpencodeQuestion = (rows: readonly ColouredRow[]): ParsedPrompt | und
 };
 
 /** The checks and caps every reader shares: numbering 1..n, one highlight, label and detail limits. */
-const assemble = (d: {
+export const assemble = (d: {
     region: readonly string[];
     title: string;
     subtitle?: string;
@@ -680,7 +681,10 @@ const assemble = (d: {
 
 /** One reader per agent kind whose approval dialog was captured. Each takes the pane as captured, escapes and all. */
 const READERS: Partial<Record<AgentKind, (pane: string) => ParsedPrompt | undefined>> = {
-    claude: (pane) => parseClaudeDialog(stripEscapes(pane)),
+    claude: (pane) => {
+        const plain = stripEscapes(pane);
+        return parseClaudeDialog(plain) ?? parseClaudeQuestion(plain) ?? parseClaudePlan(plain);
+    },
     gemini: (pane) => parseGeminiDialog(stripEscapes(pane)),
     pi: (pane) => {
         const plain = stripEscapes(pane);

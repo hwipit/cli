@@ -1,0 +1,50 @@
+     ✨ 30 Day Free Trial — memory runs off-plan. Get up to 100% more usage from your plan
+     https://cmem.ai/pro?from=welcome-hint
+     How it works: `/how-it-works`
+
+     This message disappears once the first observation lands.
+
+     View Observations Live @ http://localhost:37777
+     ✨ 30 Day Free Trial — memory runs off-plan. Get up to 100% more usage from your plan
+     https://cmem.ai/pro?from=session-start
+
+❯ Call the AskUserQuestion tool right now with two questions. Q1 header Color, question "Pick a
+  color", options Red, Green, Blue (single select). Q2 header Tags, question "Pick tags", options
+  A, B, C with multiSelect true. Do not use any other tool.
+
+⏺ User answered Claude's questions:
+  ⎿  · Pick a color → Red
+     · Pick tags → A
+
+⏺ You picked Red for color and A for tags.
+
+✻ Worked for 7s · done 10:39 AM
+
+❯ Call AskUserQuestion now with ONE question header Env, question "Which environment should I
+  deploy to?", options Staging (description: safe test target), Production (description: live
+  users). Nothing else.
+
+⏺ User answered Claude's questions:
+  ⎿  · Which environment should I deploy to? → Staging
+
+⏺ You picked Staging. I didn't deploy anything because you only asked for the question.
+
+✻ Baked for 6s · done 10:39 AM
+
+❯ Call AskUserQuestion now with ONE question header Env, question "Which environment should I
+  deploy to?", options Staging (description: safe test target), Production (description: live
+  users). Nothing else.
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Env
+
+Which environment should I deploy to?
+
+  1. Staging
+     safe test target
+  2. Production
+     live users
+❯ 3. use canary
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+-- INSERT -- · Enter to select · ↑/↓ to navigate · ctrl+g to edit in Nvim

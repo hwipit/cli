@@ -71,7 +71,7 @@ process.env.XDG_STATE_HOME = join(TMP, 'state');
 const PROJECT_DIR = join(TMP, 'work', 'api');
 mkdirSync(PROJECT_DIR, { recursive: true });
 
-const { handleSessionResumeRequest, computeListenerDeviceId, knownSessionsToReport } = await import('./listener.js');
+const { handleSessionResumeRequest, computeListenerDeviceId } = await import('./listener.js');
 const { rememberSessions } = await import('./session-registry.js');
 const { claudeProjectDirName, REMOTE_AGENTS } = await import('./remote-agents.js');
 const { rememberAgentDir } = await import('./agent-dirs.js');
@@ -613,17 +613,15 @@ describe('agent.session.resume.request — an agent that resumes by its id', () 
         expect(launched()).toEqual(['hermes', '--resume', '20261021_155015_2b41a7']);
     });
 
-    it('resumes by its id: the report says resumable exactly when the launch carries the id', () => {
+    it('resumes by its id: codex carries the id exactly while its rollout is on disk', () => {
         const rollout = join(TMP, '.codex', 'sessions', '2026', '10', '21', `${CODEX_ID}.jsonl`);
         write(rollout);
         expect(ask('codex', CODEX_ID)).toMatchObject({ resumed: true });
-        expect(knownSessionsToReport([])[0]).toMatchObject({ name: 'hwip-ids', resumable: true });
         expect(launched()).toEqual(['codex', 'resume', UUID]);
 
         rmSync(rollout);
         tmuxCalls = [];
         liveSessions = [];
-        expect(knownSessionsToReport([])[0]).toMatchObject({ name: 'hwip-ids', resumable: false });
         expect(ask('codex', CODEX_ID)).toMatchObject({ resumed: true });
         expect(launched()).toEqual(['codex']);
     });

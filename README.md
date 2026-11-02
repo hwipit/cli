@@ -573,6 +573,17 @@ again picks up that run's conversation, not the newest one. If the name
 is live again by then, that run starts beside it under the next free name
 of the family (`<name>-2`, `<name>-3`, …) instead of being refused.
 
+The phone can also start a **new** session in a project this machine has
+run before: the same request with `fresh: true` starts the agent recorded
+for that session in its directory, with no conversation picked up, under
+the session's name or — when that runs — the next free name of its family.
+The directory and the agent still come only from this machine's record, so
+the phone cannot name either. The listener advertises `session-start-v1`
+so the apps offer it only to a build that knows it. Ending a session from
+the phone is `agent.session.exit.request`: `C-c`, the agent's own quit
+command, then `C-d` — never a forced kill, so an agent that will not quit is
+reported as still running.
+
 Two details worth knowing:
 
 - It fires at **user login**, not at boot. Without automatic login, the

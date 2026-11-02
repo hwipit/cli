@@ -550,6 +550,12 @@ const RATE_LIMIT_TOKENS = 120;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 /** What one command submit costs, keeping its ceiling at the old 30/min. */
 const SUBMIT_COST = 4;
+/**
+ * What a fresh start costs on its family's own bucket (`start:<family base>`): three new agents a minute. Each one is a
+ * process left running, and every name of the family leads to the same bucket, so a session budget of 30 a minute
+ * cannot fill the family's 20 names in one burst.
+ */
+const FRESH_START_COST = RATE_LIMIT_TOKENS / 3;
 
 // Shells are refused: a shell prompt + send-keys = arbitrary command exec.
 const SHELL_COMMANDS = new Set(['bash', 'zsh', 'fish', 'sh', 'dash', 'ksh', 'tcsh', 'csh', 'pwsh']);
@@ -1842,6 +1848,12 @@ export interface SessionResumeRequest {
      * it reads as a run id.
      */
     runId?: string;
+    /**
+     * A new session in that session's project, not the session again (hwip docs/session-runs.md Q47): the recorded
+     * directory and agent, no conversation picked up, and beside the name when it runs. Read only when it is `true`.
+     * Advertised as `SESSION_START_CAPABILITY` (`device-presence.ts`) — an older listener would resume the recorded conversation instead.
+     */
+    fresh?: boolean;
     requestId?: string;
 }
 
@@ -1963,13 +1975,16 @@ export const handleSessionResumeRequest = (
     // the family `hwip cc` would pick (Q41), counted from the family base so a
     // busy `<base>-2` leads to `<base>-3`. A request without a run id is an
     // older app that only knows the name, and still gets the refusal it renders.
+    // A fresh start asks for a new session, so a live name is no refusal either, and no conversation is picked up —
+    // the live one holding the recorded conversation included.
+    const fresh = req.fresh === true;
     const live = new Set(liveSessionNames() ?? []);
     const target = !live.has(sessionName)
         ? sessionName
-        : runId !== undefined
+        : runId !== undefined || fresh
             ? familyNames(familyBase(sessionName)).find((name) => !live.has(name))
             : undefined;
-    if (!target || conversationRunning(known, live)) return reply({ error: 'already_running' });
+    if (!target || (!fresh && conversationRunning(known, live))) return reply({ error: 'already_running' });
     if (!sessionDirectoryExists(known)) {
         log(`✗ resume ${sessionName}: ${known.cwd} is gone`);
         return reply({ error: 'missing_directory' });
@@ -1978,6 +1993,11 @@ export const handleSessionResumeRequest = (
     if (!agent) {
         log(`✗ resume ${sessionName}: no binary for agent kind ${known.agentKind}`);
         return reply({ error: 'unknown_agent' });
+    }
+    // A fresh start leaves one more process running each time, so the family pays on a bucket of its own as well —
+    // charged only here, where it starts one: a refusal above says why, not that the budget ran out.
+    if (fresh && !checkRateLimit(`start:${familyBase(sessionName)}`, undefined, FRESH_START_COST)) {
+        return reply({ error: 'rate_limited' });
     }
 
     // argv, never a shell string: the binary comes from the agent table and the
@@ -1989,7 +2009,7 @@ export const handleSessionResumeRequest = (
     const sidecar = known.label && known.project
         ? [';', 'set-option', SESSION_PROJECT_OPTION, known.project, ';', 'set-option', SESSION_LABEL_OPTION, known.label]
         : [];
-    const conversation = resumableConversation(agent, known);
+    const conversation = fresh ? null : resumableConversation(agent, known);
     // tmux gives the new pane this client's PATH. A login service's PATH has none
     // of the agent directories, so they go on as schedule launches add them —
     // otherwise the agent is not found and the session ends as it starts.
@@ -2004,7 +2024,7 @@ export const handleSessionResumeRequest = (
     }
     const resumedFrom = conversation ? ` (conversation ${conversation.id.slice(0, 8)})` : '';
     const beside = target === sessionName ? '' : ` as ${target}`;
-    log(`⟲ resume ${sessionName}${beside}: ${agent.binary}${resumedFrom} in ${known.cwd}`);
+    log(`${fresh ? '＋ start' : '⟲ resume'} ${sessionName}${beside}: ${agent.binary}${resumedFrom} in ${known.cwd}`);
     return reply({ resumed: true, sessionName: target });
 };
 

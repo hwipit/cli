@@ -633,3 +633,115 @@ describe('agent.session.resume.request — an agent that resumes by its id', () 
         expect(launched()).toEqual(['gemini']);
     });
 });
+
+/**
+ * A new session in a project, from the phone (`fresh: true`, hwip docs/session-runs.md Q47). The request still names a
+ * session this machine recorded — that record is where the directory and the agent come from — but nothing of its
+ * conversation is picked up, and a name that runs already is no reason to refuse: the session starts beside it.
+ */
+describe('agent.session.resume.request — fresh start', () => {
+    const device = computeListenerDeviceId();
+    const CONVERSATION = '1b5f3c8e-1d2a-4c6b-9e7f-123456789abc';
+    let sent: Array<Record<string, unknown>>;
+    const send = (data: Record<string, unknown>) => { sent.push(data); };
+    const ask = (fields: Record<string, unknown> = {}) => {
+        handleSessionResumeRequest(
+            { subtype: 'agent.session.resume.request', targetDeviceId: device,
+              sessionName: 'hwip-fresh', agentKind: 'claude', requestId: 'r1', fresh: true, ...fields },
+            send,
+        );
+        return sent.at(-1);
+    };
+    const newSessions = () => tmuxCalls.filter((c) => c[0] === 'new-session');
+    const launched = () => {
+        const call = newSessions()[0] ?? [];
+        return call.slice(call.indexOf('-c') + 2);
+    };
+    const startedAs = () => {
+        const call = newSessions()[0] ?? [];
+        return call[call.indexOf('-s') + 1];
+    };
+
+    // The family budget lives for the process: each case starts minutes after the last, so it begins full.
+    let clock = Date.now();
+
+    beforeEach(() => {
+        clock += 10 * 60_000;
+        vi.spyOn(Date, 'now').mockImplementation(() => clock);
+        vi.spyOn(console, 'log').mockImplementation(() => {});
+        tmuxCalls = [];
+        sent = [];
+        liveSessions = [];
+        newSessionFails = false;
+        rmSync(join(TMP, 'state'), { recursive: true, force: true });
+        rmSync(join(TMP, '.claude'), { recursive: true, force: true });
+        // The conversation is on disk, so a resume would pick it up: a fresh start must not.
+        const dir = join(TMP, '.claude', 'projects', claudeProjectDirName(PROJECT_DIR));
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, `${CONVERSATION}.jsonl`), '{}\n');
+        rememberSessions([{ name: 'hwip-fresh', cwd: PROJECT_DIR, agentKind: 'claude', runId: '1785542400', agentSessionId: CONVERSATION }]);
+    });
+    afterEach(() => vi.restoreAllMocks());
+
+    it('fresh start: starts the recorded agent in the recorded directory with no conversation flag', () => {
+        expect(ask()).toMatchObject({ resumed: true, sessionName: 'hwip-fresh' });
+        expect(launched()).toEqual(['claude']);
+        const call = newSessions()[0];
+        expect(call[call.indexOf('-c') + 1]).toBe(PROJECT_DIR);
+    });
+
+    it('fresh start: a name that runs starts beside it under the next free name, with no run id', () => {
+        liveSessions = ['hwip-fresh'];
+        expect(ask()).toMatchObject({ resumed: true, sessionName: 'hwip-fresh-2' });
+        expect(startedAs()).toBe('hwip-fresh-2');
+        expect(launched()).toEqual(['claude']);
+    });
+
+    it('fresh start: a live session on the recorded conversation is no reason to refuse', () => {
+        // The live session holds the very conversation the record names: a resume refuses here, a new session does not.
+        rememberSessions([{ name: 'hwip-fresh', cwd: PROJECT_DIR, agentKind: 'claude', runId: '1785546000', agentSessionId: CONVERSATION }]);
+        liveSessions = ['hwip-fresh'];
+        expect(ask()).toMatchObject({ resumed: true, sessionName: 'hwip-fresh-2' });
+    });
+
+    it('fresh start: a family whose every name runs is refused, not grown without end', () => {
+        liveSessions = ['hwip-fresh', ...Array.from({ length: 19 }, (_, i) => `hwip-fresh-${i + 2}`)];
+        expect(ask()).toMatchObject({ error: 'already_running', sessionName: 'hwip-fresh' });
+        expect(newSessions()).toEqual([]);
+    });
+
+    it('fresh start: an agent the name has no record of is refused, not swapped for the recorded one', () => {
+        expect(ask({ agentKind: 'codex' })).toMatchObject({ error: 'unknown_session' });
+        expect(newSessions()).toEqual([]);
+    });
+
+    it('fresh start: a request without fresh still resumes, and a live name without a run id is still refused', () => {
+        expect(ask({ fresh: undefined })).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['claude', '--resume', CONVERSATION]);
+        tmuxCalls = [];
+        expect(ask({ fresh: undefined })).toMatchObject({ error: 'already_running' });
+    });
+
+    it('fresh start: a family takes three new sessions a minute, whichever of its names the request carries', () => {
+        expect(ask()).toMatchObject({ resumed: true, sessionName: 'hwip-fresh' });
+        expect(ask()).toMatchObject({ resumed: true, sessionName: 'hwip-fresh-2' });
+        rememberSessions([{ name: 'hwip-fresh-2', cwd: PROJECT_DIR, agentKind: 'claude', runId: '1785549000' }]);
+        expect(ask({ sessionName: 'hwip-fresh-2' })).toMatchObject({ resumed: true, sessionName: 'hwip-fresh-3' });
+        expect(ask()).toMatchObject({ error: 'rate_limited' });
+        expect(newSessions()).toHaveLength(3);
+        clock += 60_000;
+        expect(ask()).toMatchObject({ resumed: true, sessionName: 'hwip-fresh-4' });
+    });
+
+    it('fresh start: a refused start does not spend the family budget', () => {
+        // A name of the same family whose folder is gone: four refusals, each saying so.
+        rememberSessions([{ name: 'hwip-fresh-9', cwd: join(TMP, 'work', 'deleted'), agentKind: 'claude', runId: '1785549000' }]);
+        for (let i = 0; i < 4; i++) expect(ask({ sessionName: 'hwip-fresh-9' })).toMatchObject({ error: 'missing_directory' });
+        expect(ask()).toMatchObject({ resumed: true, sessionName: 'hwip-fresh' });
+    });
+
+    it('fresh start: fresh that is not true is read as absent', () => {
+        expect(ask({ fresh: 'yes' })).toMatchObject({ resumed: true });
+        expect(launched()).toEqual(['claude', '--resume', CONVERSATION]);
+    });
+});

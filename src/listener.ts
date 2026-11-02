@@ -63,7 +63,6 @@ import {
     knownSessions,
     liveSessionOfRun,
     recallRun,
-    runKey,
     recallSession,
     rememberSessions,
     runOfTmuxSession,
@@ -90,6 +89,7 @@ import {
 } from './listener-service.js';
 import { advanceState, evaluateState, findPatternMatch, patternError, type AgentState, type EvaluationResult, type StateTracker } from './agent-state.js';
 import { startInventoryOffload, type InventoryOffload } from './inventory-offload.js';
+import { recentProjectsToReport } from './recent-projects.js';
 import { planSessionsReport, sendSessionsReport, SESSIONS_ACK_TIMEOUT_MS, SESSIONS_REPORT_MAX_BYTES } from './sessions-report.js';
 import { getActiveManifest, loadManifestFromCache, refreshManifest, RULES_REFRESH_INTERVAL_MS } from './agent-rules-fetch.js';
 import { decryptPushBodyForDevice, deriveLanSharedSecret, getDevicePublicKey, initDeviceCrypto, isSealedV2, keyFingerprint, openV2, samePublicKey, sealV2, unwrapDeviceKey, type SealedFileMeta, type SealedV2 } from './crypto.js';
@@ -436,68 +436,12 @@ export const staleConnectionAction = (message: unknown, drops: number): StaleCon
     return drops < MAX_STALE_CONNECTION_DROPS ? 'drop' : 'exhausted';
 };
 
-export const KNOWN_SESSIONS_REPORTED = 50;
-
-export interface ReportedKnownSession {
-    name: string;
-    agentKind: string;
-    project?: string;
-    label?: string;
-    /** The run's id and start (hwip docs/session-runs.md); absent for entries recorded before runs. */
-    runId?: string;
-    startedAt?: string;
-    /** The seq block the run's chunks took (Q24): the server reads its conversation from that key range alone. */
-    firstSeq?: number;
-    lastSeq?: number;
-    /** The later tmux sessions the run went on in (Q35): the server ends another run's push window at their start. */
-    tmuxRunIds?: string[];
-    /** The last name the agent gave the run, and who gave it (hwip docs/session-runs.md Q39): what the phone calls it once ended. */
-    providerSessionName?: string;
-    providerSessionNameSource?: ProviderNameSource;
-    /** Whether starting the run again picks its conversation back up (Q43) — never the conversation id itself. */
-    resumable: boolean;
-    lastSeenAt: string;
-}
-
 /** Each live run's first seq, for the report (Q24). A run that has recorded nothing yet has none. */
 export const withRunSeqs = (sessions: AgentSession[], seqs: Map<string, RunSeqs> = runSeqsByRun()): AgentSession[] =>
     sessions.map((s) => {
         const block = s.runId ? seqs.get(runSeqsKey(s.name, s.runId)) : undefined;
         return block ? { ...s, firstSeq: block.firstSeq } : s;
     });
-
-export const knownSessionsToReport = (
-    live: readonly AgentSession[],
-    now: number = Date.now(),
-    seqs: Map<string, RunSeqs> = runSeqsByRun(),
-): ReportedKnownSession[] => {
-    // By name, kind AND run: a slot that is live under claude may still hold an
-    // ended pi run — or an ended claude run before this one — and that run is a
-    // past session. Excluding the whole name would drop it from the report
-    // exactly the way the registry used to drop it from disk. The live run
-    // itself stays out for the reason below.
-    const running = new Set(live.map((s) => runKey(s.name, s.agentKind, s.runId)));
-    return knownSessions(now)
-        .filter((e) => !running.has(runKey(e.name, e.agentKind, e.runId)))
-        .slice(0, KNOWN_SESSIONS_REPORTED)
-        .map((e) => ({
-            name: e.name,
-            agentKind: e.agentKind,
-            ...(e.project ? { project: e.project } : {}),
-            ...(e.label ? { label: e.label } : {}),
-            ...(e.runId ? { runId: e.runId } : {}),
-            ...(e.startedAt ? { startedAt: e.startedAt } : {}),
-            ...(e.runId ? seqs.get(runSeqsKey(e.name, e.runId)) : undefined),
-            ...(e.tmuxRunIds?.length ? { tmuxRunIds: e.tmuxRunIds } : {}),
-            ...(e.providerSessionName ? { providerSessionName: e.providerSessionName } : {}),
-            ...(e.providerSessionName && e.providerSessionNameSource ? { providerSessionNameSource: e.providerSessionNameSource } : {}),
-            resumable: isResumable(e),
-            lastSeenAt: e.lastSeenAt,
-        }));
-};
-
-export const knownSessionsFingerprint = (known: ReportedKnownSession[]): string =>
-    known.map((k) => `${k.name} ${k.agentKind} ${k.runId ?? ''} ${k.lastSeenAt} ${k.firstSeq ?? ''} ${k.lastSeq ?? ''} ${k.tmuxRunIds?.join(',') ?? ''} ${k.providerSessionNameSource ?? ''} ${k.providerSessionName ?? ''} ${k.resumable}`).sort().join('|');
 
 export const sessionsFingerprint = (sessions: AgentSession[]): string =>
     sessions
@@ -1909,12 +1853,6 @@ const conversationRunning = (known: KnownSession, live: ReadonlySet<string>): bo
     });
 };
 
-/** What the report says about a run: the same answer a resume of it would act on. */
-const isResumable = (known: KnownSession): boolean => {
-    const agent = REMOTE_AGENTS.find((a) => a.kind === known.agentKind);
-    return agent !== undefined && resumableConversation(agent, known) !== null;
-};
-
 /**
  * Start a remembered session again, detached, and tell the phone what happened.
  * Returns true when the message was ours to answer.
@@ -2197,7 +2135,7 @@ export interface SessionForgetResult {
  * running, so only actually running that name again restores it.
  *
  * The refusals: unknown name is nothing to delete rather than something to
- * guess at. Still running means it is not a past session at all — the phone is
+ * guess at. Still running means it is not an ended run at all — the phone is
  * looking at a live one, and ending it is a different request that this must
  * not quietly stand in for.
  */
@@ -6386,15 +6324,13 @@ export const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             // Unchanged inventory + heartbeat not due → skip the send.
             // The 5 s local poll above still ran, so a change is never
             // delayed; only the no-op reports (idle listener) are culled.
-            // Past sessions ride the report that already exists rather than a
-            // request of their own: the phone is already reading this device
-            // record, and a second round trip would need its own timeout, its
-            // own failure wording and its own staleness question.
-            const seqs = runSeqsByRun();
-            const reported = withRunSeqs(sessions, seqs);
-            const known = knownSessionsToReport(sessions, Date.now(), seqs);
+            // The projects a new session can start in ride the report that
+            // already exists rather than a request of their own: the phone is
+            // already reading this device record (recent-projects.ts).
+            const reported = withRunSeqs(sessions);
+            const recent = recentProjectsToReport();
             const fingerprint =
-                `${sessionsFingerprint(reported)}␞${knownSessionsFingerprint(known)}`;
+                `${sessionsFingerprint(reported)}␞${recent ? JSON.stringify(recent) : '-'}`;
             if (!sessionsReportDue(fingerprint, lastSentFingerprint, lastSentAtMs, Date.now())) {
                 return;
             }
@@ -6403,7 +6339,7 @@ export const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             // One message when it fits; past 24 KB, parts (sessions-report.ts): API Gateway closes a
             // socket on a frame over 32 KB, so an uncut report from a machine with ~100 sessions would
             // drop the connection on every send.
-            const plan = planSessionsReport(reported, known);
+            const plan = planSessionsReport(reported, recent);
             if (plan.messages.length > 1) {
                 log(`⧉ inventory of ${plan.sessionCount} session(s), ${Math.round(plan.wholeBytes / 1024)} KB, is over the ${SESSIONS_REPORT_MAX_BYTES / 1024} KB message limit — sent in ${plan.messages.length - 1} parts + names`);
                 for (const name of plan.oversized) log(`! session ${name}: its own report entry is over the ${SESSIONS_REPORT_MAX_BYTES / 1024} KB part limit — sent alone`);

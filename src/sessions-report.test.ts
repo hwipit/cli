@@ -6,7 +6,7 @@ const session = (i: number, extra: Record<string, unknown> = {}) => ({
     providerSessionName: null, createdAt: '2026-10-04T03:09:19.000Z', lastActivityAt: '2026-10-04T03:09:19.000Z',
     state: 'idle', stateChangedAt: '2026-10-04T03:09:19.000Z', stateRuleId: 'claude-idle-prompt', ...extra,
 });
-const known = Array.from({ length: 30 }, (_, i) => ({ name: `old${i}`, agentKind: 'claude', project: `p${i}`, lastSeenAt: '2026-10-03T00:00:00.000Z' }));
+const recent = Array.from({ length: 12 }, (_, i) => ({ name: `hwip-p${i}`, agentKind: 'claude', project: `p${i}` }));
 const many = (n: number) => Array.from({ length: n }, (_, i) => session(i));
 const byteLength = (s: string) => Buffer.byteLength(s, 'utf-8');
 const parse = (message: string) => JSON.parse(message) as { type: string; data: Record<string, unknown> & { sessions: { name: string }[] } };
@@ -15,16 +15,16 @@ describe('planSessionsReport', () => {
     it('sends a report that fits as the one message it always was', () => {
         const sessions = many(10);
 
-        const plan = planSessionsReport(sessions, known);
+        const plan = planSessionsReport(sessions, recent);
 
-        expect(plan.messages).toEqual([JSON.stringify({ type: 'listener.sessions', data: { sessions, knownSessions: known } })]);
+        expect(plan.messages).toEqual([JSON.stringify({ type: 'listener.sessions', data: { sessions, recentProjects: recent } })]);
         expect(plan.oversized).toEqual([]);
     });
 
     it('cuts a larger report into partial parts that each fit, then a names message', () => {
         const sessions = many(300); // ≈ 87 KB whole
 
-        const plan = planSessionsReport(sessions, known, SESSIONS_REPORT_MAX_BYTES, () => 'r1');
+        const plan = planSessionsReport(sessions, recent, SESSIONS_REPORT_MAX_BYTES, () => 'r1');
 
         expect(plan.wholeBytes).toBeGreaterThan(SESSIONS_REPORT_MAX_BYTES * 3);
         for (const message of plan.messages) expect(byteLength(message)).toBeLessThanOrEqual(SESSIONS_REPORT_MAX_BYTES);
@@ -41,25 +41,25 @@ describe('planSessionsReport', () => {
         expect(plan.namesOversized).toBe(false);
     });
 
-    it('puts knownSessions in the first part, once', () => {
-        const plan = planSessionsReport(many(300), known);
+    it('puts recentProjects in the first part, once', () => {
+        const plan = planSessionsReport(many(300), recent);
 
         const messages = plan.messages.map(parse);
-        expect(messages[0]!.data.knownSessions).toEqual(known);
-        expect(messages.slice(1).some((m) => 'knownSessions' in m.data)).toBe(false);
+        expect(messages[0]!.data.recentProjects).toEqual(recent);
+        expect(messages.slice(1).some((m) => 'recentProjects' in m.data)).toBe(false);
     });
 
     it('loses and repeats no session across the parts, in order', () => {
         const sessions = many(250);
 
-        const plan = planSessionsReport(sessions, known);
+        const plan = planSessionsReport(sessions, recent);
 
         const parts = plan.messages.map(parse).filter((m) => m.type === 'listener.sessions');
         expect(parts.flatMap((m) => m.data.sessions)).toEqual(sessions);
     });
 
     it('keeps every message under a small limit too', () => {
-        const plan = planSessionsReport(many(40), known, 8 * 1024);
+        const plan = planSessionsReport(many(40), recent, 8 * 1024);
 
         expect(plan.messages.length).toBeGreaterThan(2);
         for (const message of plan.messages) expect(byteLength(message)).toBeLessThanOrEqual(8 * 1024);
@@ -83,10 +83,10 @@ describe('planSessionsReport', () => {
     it('holds at the size where one message used to break the connection', () => {
         // ≈ 290 B a session: 120 sessions is over API Gateway's 32 KB frame as one message.
         const sessions = many(120);
-        const whole = byteLength(JSON.stringify({ type: 'listener.sessions', data: { sessions, knownSessions: known } }));
+        const whole = byteLength(JSON.stringify({ type: 'listener.sessions', data: { sessions, recentProjects: recent } }));
         expect(whole).toBeGreaterThan(32 * 1024);
 
-        const plan = planSessionsReport(sessions, known);
+        const plan = planSessionsReport(sessions, recent);
 
         for (const message of plan.messages) expect(byteLength(message)).toBeLessThan(32 * 1024);
     });

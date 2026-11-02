@@ -558,20 +558,22 @@ Linux a systemd user unit (`app.hwip.listener.service`, see
 `--service-status` shows what the installed one points at; `hwip install`
 offers it during setup and `hwip uninstall` takes it away again.
 
-What you get back after a reboot is your **past sessions**, ready to
-resume from the phone — not live agents. tmux does not survive a reboot
+What you get back after a reboot is your **recent projects**, ready for a
+new session from the phone — not live agents. tmux does not survive a reboot
 either, and this doesn't try to bring those sessions back to life.
-A resume starts the agent in the directory it last ran in; for Claude Code,
+A new session starts the agent in the directory the project last ran in, with
+a fresh conversation. An older app can still ask to resume a session; that
+starts it in the same directory, and for Claude Code,
 OpenCode, Codex, Pi and Hermes it also picks up the conversation that session
 last had (`claude --resume <id>`, `opencode --session <id>`,
 `codex resume <thread>`, `pi --session <file>`, `hermes --resume <id>` — the
 id this machine read off the live pane's own process; an id two panes both
 answered to is not kept). Claude Code, Codex and Pi start fresh when that
 conversation is no longer on disk, and the other agents always start a new one.
-Each ended run of a name is its own row on the phone, and starting one
-again picks up that run's conversation, not the newest one. If the name
-is live again by then, that run starts beside it under the next free name
-of the family (`<name>-2`, `<name>-3`, …) instead of being refused.
+An older app that names a run picks up that run's conversation, not the
+newest one. If the name is live again by then, that run starts beside it
+under the next free name of the family (`<name>-2`, `<name>-3`, …) instead
+of being refused.
 
 The phone can also start a **new** session in a project this machine has
 run before: the same request with `fresh: true` starts the agent recorded
@@ -651,8 +653,8 @@ So on macOS the listener runs `caffeinate -s -w <its pid>` for as long as
 it lives. `-s` is honoured **on AC power only** — on battery macOS ignores
 it, so a laptop still sleeps and nothing drains. The display still turns
 off; a closed lid still sleeps. Activity Monitor shows the daemon under
-"Preventing Sleep". It holds even when no agent session is open: resuming a
-past session from the phone needs this Mac awake to answer. Opt out with `--no-keep-awake` or `"keepAwake": false`
+"Preventing Sleep". It holds even when no agent session is open: starting a
+session from the phone needs this Mac awake to answer. Opt out with `--no-keep-awake` or `"keepAwake": false`
 in `~/.hwip/config.json`; the log's `keep-awake:` line says which way it
 went.
 
@@ -702,16 +704,17 @@ tmux's `session_created` in epoch seconds). The app uses it to keep one run's
 conversation apart from the one before it under the same name; a chunk read
 after a restart keeps the run it was recorded in. What a session writes with no
 run to name (a name whose tmux session has ended while its file is still written
-to) is not recorded: the server takes no chunk without a run. The listener's record of past
-sessions keeps runs apart the same way: closing `hwip cc` and starting it again
-in the same folder leaves the first run as a past session of its own (the
-newest ten runs of a name are kept, 100 in all, and up to 50 are reported to
-the phone). Each run is reported with the block of chunk numbers it took — the
-first and, once it has ended, the last — kept in `run-seqs.json` next to the
-registry, so the server reads one run's conversation from that range instead of
-every chunk the name ever had. Deleting a past run from the phone forgets that
-run on this machine too, even while a later run of the same name is going; the
-run that is going is refused (`still_running`).
+to) is not recorded: the server takes no chunk without a run. The listener's record of
+runs keeps them apart the same way: closing `hwip cc` and starting it again
+in the same folder leaves the first run as a run of its own (the newest ten
+runs of a name are kept, 100 in all). The phone is told only the projects this
+machine ran lately — up to 12, each agent of a project once with the newest
+session it ran there — which is the list a new session is started from. A
+running run is reported with the first chunk number it took, kept in
+`run-seqs.json` next to the registry, so the server reads that run's
+conversation from there instead of every chunk the name ever had. An older app
+that deletes an ended run also asks this machine to forget it; the run that is
+going is refused (`still_running`).
 
 When a session waits for your approval, the listener also sends what it is waiting
 for — the tool, the command or the diff, and the answers — so the app can show it

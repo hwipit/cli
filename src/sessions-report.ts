@@ -14,7 +14,7 @@
  *   - parts of at most `SESSIONS_REPORT_MAX_BYTES`, each `listener.sessions`
  *     with `partial: true` and some of the sessions — the server upserts what
  *     it is given, by name, and acks each part. The first part also carries
- *     `knownSessions` (once is enough);
+ *     `recentProjects` (once is enough);
  *   - then `listener.sessions.names` with every session name in the report, so
  *     the server can drop the sessions that are no longer there — what a
  *     whole-list report does by replacing the list.
@@ -51,31 +51,36 @@ export interface SessionsReportPlan {
 
 const bytes = (text: string): number => Buffer.byteLength(text, 'utf-8');
 
+/**
+ * `recentProjects` undefined leaves the field out, so the server keeps what it holds (an unreadable
+ * registry must not clear the phone's project list).
+ */
 export const planSessionsReport = (
     sessions: readonly { name: string }[],
-    knownSessions: readonly unknown[],
+    recentProjects: readonly unknown[] | undefined,
     maxBytes: number = SESSIONS_REPORT_MAX_BYTES,
     reportId: () => string = randomUUID,
 ): SessionsReportPlan => {
-    const whole = JSON.stringify({ type: 'listener.sessions', data: { sessions, knownSessions } });
+    const extras = recentProjects ? { recentProjects } : {};
+    const whole = JSON.stringify({ type: 'listener.sessions', data: { sessions, ...extras } });
     const wholeBytes = bytes(whole);
     if (wholeBytes <= maxBytes) {
         return { messages: [whole], sessionCount: sessions.length, wholeBytes, oversized: [], namesOversized: false };
     }
 
     const id = reportId();
-    const knownBytes = bytes(JSON.stringify({ knownSessions }));
+    const extrasBytes = bytes(JSON.stringify(extras));
     const envelopeBytes = bytes(JSON.stringify({
         type: 'listener.sessions',
         data: { sessions: [], partial: true, reportId: id, part: 999, parts: 999 },
     }));
 
     // Greedy: a session goes in the current part while it fits. The first part gives up room for
-    // `knownSessions`; no part gives up less than one session.
+    // `recentProjects`; no part gives up less than one session.
     const groups: (typeof sessions[number])[][] = [];
     const oversized: string[] = [];
     let current: (typeof sessions[number])[] = [];
-    let budget = Math.max(maxBytes - envelopeBytes - knownBytes, 0);
+    let budget = Math.max(maxBytes - envelopeBytes - extrasBytes, 0);
     let used = 0;
     for (const session of sessions) {
         // +1 for the comma between sessions in the array.
@@ -95,7 +100,7 @@ export const planSessionsReport = (
     const parts = groups.length;
     const messages = groups.map((group, index) => JSON.stringify({
         type: 'listener.sessions',
-        data: { sessions: group, partial: true, reportId: id, part: index + 1, parts, ...(index === 0 ? { knownSessions } : {}) },
+        data: { sessions: group, partial: true, reportId: id, part: index + 1, parts, ...(index === 0 ? extras : {}) },
     }));
     const names = JSON.stringify({ type: 'listener.sessions.names', data: { names: sessions.map((s) => s.name), reportId: id } });
     messages.push(names);

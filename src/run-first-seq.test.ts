@@ -43,7 +43,7 @@ const PROJECT_DIR = join(TMP, 'work', 'api');
 mkdirSync(PROJECT_DIR, { recursive: true });
 
 const { noteRunSeqs, runSeqsByRun, runSeqsKey } = await import('./run-seqs.js');
-const { handleSessionForgetRequest, computeListenerDeviceId, knownSessionsToReport, withRunSeqs } = await import('./listener.js');
+const { handleSessionForgetRequest, computeListenerDeviceId, withRunSeqs } = await import('./listener.js');
 const { rememberSessions, knownSessions, MAX_RUNS_PER_NAME } = await import('./session-registry.js');
 const { createTurnRecorder } = await import('./turn-recorder.js');
 const { projectTranscriptEntries } = await import('./transcript-tail.js');
@@ -124,22 +124,18 @@ describe('a run\'s seq block', () => {
 describe('the report', () => {
     const live = { name: NAME, attached: true, agentKind: 'claude', project: 'api', createdAt: iso(B), runId: B };
 
-    it('names the running run\'s first seq, and an ended run\'s whole block', () => {
+    it('names the running run\'s first seq', () => {
         rememberSessions([{ name: NAME, cwd: PROJECT_DIR, agentKind: 'claude', runId: A, startedAt: iso(A) }]);
         noteRunSeqs(NAME, A, 1, 9);
         noteRunSeqs(NAME, B, 5, 7);
 
         expect(withRunSeqs([live as never])[0]).toMatchObject({ runId: B, firstSeq: 5 });
         expect(withRunSeqs([live as never])[0]).not.toHaveProperty('lastSeq');
-        expect(knownSessionsToReport([live as never])).toEqual([
-            expect.objectContaining({ name: NAME, runId: A, firstSeq: 1, lastSeq: 9 }),
-        ]);
     });
 
     it('names no block for a run that has recorded nothing', () => {
         rememberSessions([{ name: NAME, cwd: PROJECT_DIR, agentKind: 'claude', runId: A, startedAt: iso(A) }]);
         expect(withRunSeqs([live as never])[0]).not.toHaveProperty('firstSeq');
-        expect(knownSessionsToReport([live as never])[0]).not.toHaveProperty('firstSeq');
     });
 });
 

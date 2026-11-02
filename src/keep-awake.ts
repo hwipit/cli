@@ -62,10 +62,10 @@ export const startKeepAwake = (opts: KeepAwakeOptions): KeepAwake => {
     // lifetime is the socket loop's, and `-w` ties caffeinate to it anyway.
     child.unref();
 
-    // Held with no agent session open too: the phone resumes a past session
-    // or starts one only while this Mac is awake to answer (C25 — say so
+    // Held with no agent session open too: the phone starts a session
+    // only while this Mac is awake to answer (C25 — say so
     // rather than let the Mac's sleeplessness go unexplained).
-    opts.log(`keep-awake: caffeinate -s -w ${pid} — blocks idle sleep on AC power only, even with no agent session open, so the phone can resume one (--no-keep-awake to disable)`);
+    opts.log(`keep-awake: caffeinate -s -w ${pid} — blocks idle sleep on AC power only, even with no agent session open, so the phone can start one (--no-keep-awake to disable)`);
     return {
         stop: () => {
             if (stopped) return;

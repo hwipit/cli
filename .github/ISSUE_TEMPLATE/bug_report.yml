@@ -1,0 +1,78 @@
+name: Bug report
+description: Something in the hwip CLI, the HwipHook SDK or the listener does not work as expected.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Security problems: do not open an issue, follow [SECURITY.md](https://github.com/hwipit/cli/blob/main/SECURITY.md).
+        Please remove private content (questions, answers, project names, API keys, email addresses) from anything you paste.
+  - type: input
+    id: version
+    attributes:
+      label: "@hwip/cli version"
+      description: Output of `hwip --version`.
+      placeholder: "0.1.2"
+    validations:
+      required: true
+  - type: dropdown
+    id: agent
+    attributes:
+      label: Agent
+      description: The agent involved. Pick "None / not agent-specific" for the SDK or CLI alone.
+      options:
+        - Claude Code
+        - Cursor
+        - Windsurf
+        - Gemini CLI
+        - Codex CLI
+        - Copilot CLI
+        - Cline
+        - Aider
+        - Pi
+        - OpenCode
+        - Hermes
+        - Other
+        - None / not agent-specific
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "macOS 15.1 / Ubuntu 24.04 / Windows 11 (WSL2)"
+    validations:
+      required: true
+  - type: input
+    id: node
+    attributes:
+      label: Node.js version
+      description: Output of `node --version`.
+      placeholder: "v22.13.0"
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you ran, what you expected and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. hwip install
+        2. ...
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Output or logs
+      description: Paste terminal output. It is rendered as code.
+      render: shell
+    validations:
+      required: false

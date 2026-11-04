@@ -1,0 +1,55 @@
+name: Feature request
+description: Suggest a change or an addition to the hwip CLI, the SDK or the listener.
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem do you want solved?
+      description: Describe the situation you are in, not the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What you would like to happen. Alternatives you considered are welcome too.
+    validations:
+      required: false
+  - type: dropdown
+    id: agent
+    attributes:
+      label: Agent
+      description: The agent this is about, if any.
+      options:
+        - Claude Code
+        - Cursor
+        - Windsurf
+        - Gemini CLI
+        - Codex CLI
+        - Copilot CLI
+        - Cline
+        - Aider
+        - Pi
+        - OpenCode
+        - Hermes
+        - Other
+        - None / not agent-specific
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: "@hwip/cli version"
+      description: Output of `hwip --version`.
+      placeholder: "0.1.2"
+    validations:
+      required: false
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "macOS 15.1 / Ubuntu 24.04 / Windows 11 (WSL2)"
+    validations:
+      required: false

@@ -167,6 +167,10 @@ export const closingLine = (failed: number): string => {
   return `Done, but ${steps} you: see the lines marked "-" above. Then restart your agents.`;
 };
 
+/** Where the install's last screen sends a new user for the phone app. `ct`/`utm_source` name this surface. */
+export const APP_STORE_URL = 'https://apps.apple.com/app/id6818053606?ct=cli-install';
+export const PLAY_STORE_URL = 'https://play.google.com/store/apps/details?id=app.hwip&referrer=utm_source%3Dcli-install';
+
 /** An edit that would lose a comment of the user's names the file, like every other refusal. */
 const namingFile = <T>(filePath: string, edit: () => T): T => {
   try {
@@ -880,6 +884,9 @@ export const handleInstall = async (args: Record<string, string | boolean>): Pro
   await testConnection(apiKey, baseUrl);
 
   console.log(`\n  ${closingLine(failedSteps)}\n`);
+
+  console.log(`  Get the app: ${APP_STORE_URL}`);
+  console.log(`  Android:     ${PLAY_STORE_URL}\n`);
 
   // The single most-reported surprise: pushes are not scoped to `hwip cc`.
   // Hooks fire for every session of every configured agent, so say it here —

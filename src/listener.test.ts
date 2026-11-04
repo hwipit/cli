@@ -1661,6 +1661,22 @@ describe('sessions report gate (idle-cost throttle)', () => {
         expect(idle).not.toBe(working);
     });
 
+    // Activity time moves on every terminal output. Fingerprinting it sent a
+    // report every 5 s cycle, and the server rewrote the device record each
+    // time; the server no longer compares it either, so the times ride the
+    // next report that changes something else, or the heartbeat.
+    it('activity time alone does not change the fingerprint', () => {
+        const before = sessionsFingerprint([{
+            ...base, state: 'working',
+            lastActivityAt: '2026-11-04T02:00:00.000Z', stateChangedAt: '2026-11-04T02:00:00.000Z',
+        } as never]);
+        const after = sessionsFingerprint([{
+            ...base, state: 'working',
+            lastActivityAt: '2026-11-04T02:00:20.000Z', stateChangedAt: '2026-11-04T02:00:20.000Z',
+        } as never]);
+        expect(before).toBe(after);
+    });
+
     it('changed inventory is due immediately', () => {
         expect(sessionsReportDue('fp-new', 'fp-old', 1_000, 2_000)).toBe(true);
     });

@@ -97,6 +97,15 @@ describe('hwip install', () => {
         expect(logs.join('\n')).toContain('Done! Restart your agents.');
     });
 
+    it('points a new user at the phone app with campaign links, after the closing line', async () => {
+        expect(await install({ key: 'ak_1' })).toBe(0);
+        const out = logs.join('\n');
+        expect(out).toContain('  Get the app: https://apps.apple.com/app/id6818053606?ct=cli-install\n');
+        expect(out).toContain('  Android:     https://play.google.com/store/apps/details?id=app.hwip&referrer=utm_source%3Dcli-install\n');
+        expect(out.indexOf('Done! Restart your agents.')).toBeLessThan(out.indexOf('Get the app:'));
+        expect(out.indexOf('Get the app:')).toBeLessThan(out.indexOf('Notifications now fire'));
+    });
+
     // C107: a config.json that is not JSON used to load as {}; the install then replaced it with the new key alone.
     it('leaves a config.json it cannot read as JSON alone, and says so before asking anything', async () => {
         const { mkdirSync, writeFileSync } = await import('node:fs');

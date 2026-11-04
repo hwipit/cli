@@ -443,13 +443,17 @@ export const withRunSeqs = (sessions: AgentSession[], seqs: Map<string, RunSeqs>
         return block ? { ...s, firstSeq: block.firstSeq } : s;
     });
 
+/** What makes a cycle's inventory a change worth sending. lastActivityAt and
+ *  stateChangedAt are left out: they move on every terminal output, and the
+ *  server does not compare them either (REPORTED_SESSION_FIELDS). They reach
+ *  the server with the next report that changes something else, or the
+ *  heartbeat. */
 export const sessionsFingerprint = (sessions: AgentSession[]): string =>
     sessions
         .map((s) => JSON.stringify([
             s.name, s.attached, s.agentKind, s.agentSessionId ?? null,
             s.project, s.label ?? null, s.providerSessionName ?? null, s.providerSessionNameSource ?? null, s.providerSessionHandle ?? null, s.createdAt ?? null, s.runId ?? null, s.firstSeq ?? null,
-            s.lastActivityAt ?? null, s.state ?? null,
-            s.stateChangedAt ?? null, s.stateRuleId ?? null,
+            s.state ?? null, s.stateRuleId ?? null,
             s.blockedPrompt?.id ?? null, s.blockedPrompt?.at ?? null,
         ]))
         .sort()

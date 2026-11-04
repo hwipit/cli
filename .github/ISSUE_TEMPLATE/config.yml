@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/hwipit/cli/security/advisories/new
+    about: Report security problems privately, not in a public issue.
+  - name: Setup help and documentation
+    url: https://docs.hwip.app
+    about: Step-by-step setup for the CLI, the app and your agents.

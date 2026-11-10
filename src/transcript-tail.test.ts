@@ -490,6 +490,22 @@ describe('projectTranscriptEntries', () => {
         expect(events).toEqual([{ kind: 'prompt', text: '/simplify' }]);
     });
 
+    it('keeps a slash command\'s arguments in the person\'s turn', () => {
+        const events = projectTranscriptEntries([
+            line({
+                type: 'user',
+                origin: { kind: 'human' },
+                message: {
+                    role: 'user',
+                    content:
+                        '<command-message>summary</command-message>\n<command-name>/summary</command-name>\n<command-args>prompt run</command-args>',
+                },
+            }),
+        ]);
+
+        expect(events).toEqual([{ kind: 'prompt', text: '/summary prompt run' }]);
+    });
+
     it.each(['[Request interrupted by user]', '[Request interrupted by user for tool use]'])(
         'does not show the interrupt marker %s as a prompt',
         (marker) => {

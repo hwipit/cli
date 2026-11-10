@@ -77,6 +77,13 @@ import {
     scanSubagents,
     type SubagentScanState,
 } from './subagent-transcripts.js';
+import {
+    initialBackgroundTaskState,
+    recordBackgroundTasks,
+    trackBackgroundTasks,
+    type BackgroundTaskState,
+    type SessionBackgroundTasks,
+} from './background-tasks.js';
 import { projectTranscriptEntries, type TranscriptSource } from './transcript-tail.js';
 import {
     installService,
@@ -305,6 +312,9 @@ interface AgentSession {
      *  transcript subagent has one: a pane subagent is watched as a screen, and
      *  nothing counts what happens on it. */
     toolCount?: number;
+    /** Background commands this Claude session is running — a count only;
+     *  what they are travels sealed (`agent.tasks.request`). Absent at zero. */
+    backgroundTaskCount?: number;
     /** Set on a subagent with no pane at all (Claude Code's `Agent` tool): there
      *  is no screen to stream, only its transcript. Absent on a pane subagent —
      *  which can run Claude Code too, so the kind cannot stand in for this. */
@@ -4412,6 +4422,10 @@ export interface CollectResult {
      *  name → the transcript it writes and the agent kind whose projector reads
      *  it. Only sessions this machine can actually read; no subagent rows. */
     recordable: Record<string, RecordableSession>;
+    /** Also local: Claude session name → its running background commands and
+     *  pane pid. Built on whichever thread sweeps; the main thread, which
+     *  answers the phone's requests, stores it (`recordBackgroundTasks`). */
+    backgroundTasks: Record<string, SessionBackgroundTasks>;
 }
 
 /**
@@ -4421,6 +4435,8 @@ export interface CollectResult {
  * viewer nothing but a re-render.
  */
 const subagentScans = new Map<string, SubagentScanState>();
+/** Per Claude session: what its transcript says is running in the background. */
+const backgroundTaskStates = new Map<string, BackgroundTaskState>();
 
 /**
  * Inventory pass that also records *why* each `hwip-*` session was
@@ -4449,7 +4465,7 @@ export const collectSessionsVerbose = (): CollectResult => {
         // Invalidate so the next cycle re-runs full discovery instead of
         // wedging the listener at "reported 0 session(s)" forever.
         invalidateTmuxSocketCache();
-        return { sessions: [], rejected: [], targets: {}, subagentTranscripts: {}, recordable: {} };
+        return { sessions: [], rejected: [], targets: {}, subagentTranscripts: {}, recordable: {}, backgroundTasks: {} };
     }
 
     const rawLines = (list.stdout ?? '').split('\n').filter(Boolean);
@@ -4513,6 +4529,7 @@ export const collectSessionsVerbose = (): CollectResult => {
     const resumeIdOf = new Map<string, string>();
     const targets: Record<string, string> = {};
     const subagentTranscripts: Record<string, string> = {};
+    const backgroundTasks: Record<string, SessionBackgroundTasks> = {};
     const recordable: Record<string, RecordableSession> = {};
     for (const [name, group] of groups) {
         // Main pane = the lowest (window, pane) index that runs an agent.
@@ -4582,7 +4599,7 @@ export const collectSessionsVerbose = (): CollectResult => {
             : null;
         if (resumeId) resumeIdOf.set(name, resumeId);
         targets[name] = main.row.paneId;
-        sessions.push({
+        const mainSession: AgentSession = {
             name,
             attached: group.attached,
             agentKind: main.agent.kind,
@@ -4596,7 +4613,8 @@ export const collectSessionsVerbose = (): CollectResult => {
             runId: runIdOfEpoch(group.created),
             lastActivityAt: epochToIso(group.activity),
             ...deriveSessionState(name, main.agent.kind, capturePaneText(name, main.row.paneId)),
-        });
+        };
+        sessions.push(mainSession);
         // Subagent panes: every OTHER pane of this session whose tty's
         // foreground process group runs a registered agent (measured:
         // pane_current_command alone says `bash` for a pi subagent — the
@@ -4657,6 +4675,13 @@ export const collectSessionsVerbose = (): CollectResult => {
         }
         const transcriptPath = main.agent.kind === 'claude' ? mainTranscript : null;
         if (transcriptPath) {
+            // Background commands (`Bash` with run_in_background): the phone
+            // shows how many, and asks for the rows themselves sealed.
+            const tracked = backgroundTaskStates.get(name) ?? initialBackgroundTaskState();
+            backgroundTaskStates.set(name, tracked);
+            const tasks = trackBackgroundTasks(transcriptPath, tracked);
+            if (tasks.length > 0) backgroundTasks[name] = { tasks, panePid: info.panePid ?? null };
+            if (tasks.length > 0) mainSession.backgroundTaskCount = tasks.length;
             const scan = subagentScans.get(name) ?? initialSubagentScanState();
             subagentScans.set(name, scan);
             const reserved = new Set(extras.map(paneNum));
@@ -4697,6 +4722,7 @@ export const collectSessionsVerbose = (): CollectResult => {
         }
     }
     pruneToLive(subagentScans, new Set(groups.keys()));
+    pruneToLive(backgroundTaskStates, new Set(groups.keys()));
     pruneToLive(sessionStates, new Set(sessions.map((s) => s.name)));
     // An id two panes both answer to belongs to at most one of them, and the
     // sweep cannot tell which — opencode names the busiest session in the
@@ -4736,7 +4762,7 @@ export const collectSessionsVerbose = (): CollectResult => {
             providerSessionNameSource: s.providerSessionNameSource,
         })),
     );
-    return { sessions, rejected, targets, subagentTranscripts, recordable };
+    return { sessions, rejected, targets, subagentTranscripts, recordable, backgroundTasks };
 };
 
 /**
@@ -4756,6 +4782,7 @@ const collectSessions = (): AgentSession[] => {
     // back to the (focus-following) bare session name.
     recordTargets(result.targets);
     recordSubagentTranscripts(result.subagentTranscripts);
+    recordBackgroundTasks(result.backgroundTasks);
     return result.sessions;
 };
 
@@ -6343,11 +6370,12 @@ export const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             }
         };
         const publishSessions = (inventory: CollectResult, sessions: AgentSession[]): void => {
-            const { rejected, targets, subagentTranscripts, recordable } = inventory;
+            const { rejected, targets, subagentTranscripts, recordable, backgroundTasks } = inventory;
             recordInventory(sessions);
             worktreeCleanup.observe(sessions.map((s) => s.name));
             recordTargets(targets);
             recordSubagentTranscripts(subagentTranscripts);
+            recordBackgroundTasks(backgroundTasks);
             turnRecorder?.observe(recordable);
             // Let the user's own status bar say what the phone says. Change-gated
             // internally, so an unchanged sweep spawns nothing.

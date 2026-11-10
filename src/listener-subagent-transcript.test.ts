@@ -325,3 +325,58 @@ describe('in-process subagents in the inventory sweep', () => {
         expect(sessions.map((s) => s.name)).toEqual(['hwip-a']);
     });
 });
+
+describe('background commands in the inventory sweep', () => {
+    const OUT = '/private/tmp/claude-501/-tmp-proj/962a64bb-b1bd-4a4c-9ce5-d4bab12e1567/tasks/bq1x2y3z4.output';
+    const writeBackground = (opts: { launched: boolean }): void => {
+        mkdirSync(PROJECT_DIR, { recursive: true });
+        rmSync(join(PROJECT_DIR, SESSION_ID), { recursive: true, force: true });
+        const lines = opts.launched ? [
+            JSON.stringify({
+                type: 'assistant', timestamp: '2026-11-11T00:00:00.000Z',
+                message: { content: [{ type: 'tool_use', id: 'toolu_bg', name: 'Bash', input: { command: 'pnpm dev', description: 'Dev server', run_in_background: true } }] },
+            }),
+            JSON.stringify({
+                type: 'user', timestamp: '2026-11-11T00:00:01.000Z',
+                message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_bg', content: `Command running in background with ID: bq1x2y3z4. Output is being written to: ${OUT}. You will be notified when it completes.` }] },
+                toolUseResult: { backgroundTaskId: 'bq1x2y3z4' },
+            }),
+        ] : [];
+        // A fresh file each time: a new inode restarts the tail.
+        rmSync(join(PROJECT_DIR, `${SESSION_ID}.jsonl`), { force: true });
+        writeFileSync(join(PROJECT_DIR, `${SESSION_ID}.jsonl`), lines.map((l) => `${l}\n`).join(''));
+    };
+
+    beforeEach(() => {
+        vi.spyOn(console, 'log').mockImplementation(() => {});
+        listener.recordTargets(null);
+        // The task's output file is open, as while the command runs.
+        for (const bin of ['/usr/sbin/lsof', '/usr/bin/lsof']) {
+            fakeOther[bin] = () => ({ status: 0, stdout: `p4242\nn${OUT}\n`, stderr: '' });
+        }
+    });
+
+    // First: module state carries a session's tasks across sweeps, as it must for a running listener.
+    it('leaves the count out when nothing runs in the background', () => {
+        writeBackground({ launched: false });
+
+        const { sessions, backgroundTasks } = listener.collectSessionsVerbose();
+
+        expect(sessions.find((s) => s.name === 'hwip-a')).not.toHaveProperty('backgroundTaskCount');
+        expect(backgroundTasks['hwip-a']).toBeUndefined();
+    });
+
+    it('counts a running background command on its session, and hands the rows back beside the report', () => {
+        writeBackground({ launched: true });
+
+        const { sessions, backgroundTasks } = listener.collectSessionsVerbose();
+
+        expect(sessions.find((s) => s.name === 'hwip-a')).toMatchObject({ backgroundTaskCount: 1 });
+        expect(backgroundTasks['hwip-a']).toEqual({
+            tasks: [{ id: 'bq1x2y3z4', description: 'Dev server', startedAt: '2026-11-11T00:00:01.000Z', outputPath: OUT }],
+            panePid: PANE.pid,
+        });
+        // The rows never ride the report itself.
+        expect(JSON.stringify(sessions)).not.toContain('Dev server');
+    });
+});

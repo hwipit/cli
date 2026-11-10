@@ -78,7 +78,7 @@ describe('collectSessionsVerbose — what the sweep does today', () => {
         it('reports nothing, whatever stdout carries', () => {
             listPanes = { status: 1, stdout: paneRow({ session: 'hwip-stale' }) + '\n', stderr: 'no server running' };
             expect(listener.collectSessionsVerbose()).toEqual({
-                sessions: [], rejected: [], targets: {}, subagentTranscripts: {}, recordable: {},
+                sessions: [], rejected: [], targets: {}, subagentTranscripts: {}, recordable: {}, backgroundTasks: {},
             });
         });
 

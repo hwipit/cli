@@ -228,8 +228,8 @@ const isAgentToolUse = (line: string): boolean => {
 /** The four ways Claude Code reports a background subagent stopping — measured
  *  2026-09-14 over every parent transcript on this machine (787 completed, 12
  *  failed, 12 killed, 2 stopped, nothing else). */
-const TASK_END = /<status>(?:completed|failed|killed|stopped)<\/status>/;
-const TASK_ID = /<task-id>([^<]{1,200})<\/task-id>/;
+export const TASK_END = /<status>(?:completed|failed|killed|stopped)<\/status>/;
+export const TASK_ID = /<task-id>([^<]{1,200})<\/task-id>/;
 
 /**
  * The subagent a parent line says has ended, and when — or null.

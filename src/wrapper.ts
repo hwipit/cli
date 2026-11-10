@@ -29,7 +29,7 @@ import {
     stopListener,
     type ListenerStart,
 } from './listener-process.js';
-import { restartService, serviceInstalled } from './listener-service.js';
+import { restartService, serviceInstalled, serviceStatus } from './listener-service.js';
 import type { RemoteAgent } from './remote-agents.js';
 import { recallSession } from './session-registry.js';
 import { ensureWorktree } from './worktree.js';
@@ -375,7 +375,7 @@ export const splitAgentOptions = (extra: string[]): { opts: AgentLaunchOptions; 
 
 /** POSIX shell-quote so passthrough args survive being joined into a tmux shell-command string. */
 const SHELL_SAFE = /^[\w\-./=:@%+,]+$/;
-const shellQuote = (s: string): string =>
+export const shellQuote = (s: string): string =>
     s.length > 0 && SHELL_SAFE.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
 
 export const targetForAgent = (
@@ -433,6 +433,26 @@ export const targetForAgent = (
     const herdrEnv = herdrEnvArgs(agentKind, process.env, installedTmuxVersion());
     const agentEnv = launchEnvArgs(launchEnv, installedTmuxVersion());
     return { kind: 'tmux-new', cmd: 'tmux', args: ['new', '-A', '-s', session, ...herdrEnv, ...agentEnv, shellCmd, ...sidecar, ...herdrSessionArgs(session)], session };
+};
+
+/**
+ * `target` (an attached `tmux new`) run under `sh`, which outlives tmux by the
+ * one `hwip resume-hint` call and then exits with tmux's status. `sh` rather
+ * than this process waiting: the wrapper hands itself over with execve so no
+ * node heap sits resident for the whole session, and `sh` costs next to none.
+ */
+export const withResumeHint = (
+    target: SpawnTarget,
+    agent: Pick<RemoteAgent, 'kind' | 'resumeArgs'>,
+    since: number,
+    hwip: { node: string; cli: string } = { node: process.execPath, cli: process.argv[1] ?? '' },
+): SpawnTarget => {
+    if (target.kind !== 'tmux-new' || !target.session || !agent.resumeArgs || !hwip.cli) return target;
+    const hint = [hwip.node, hwip.cli, 'resume-hint', '--session', target.session, '--type', agent.kind, '--at', String(since)]
+        .map(shellQuote)
+        .join(' ');
+    const script = `tmux "$@"; s=$?; ${hint} || :; exit $s`;
+    return { ...target, cmd: 'sh', args: ['-c', script, 'sh', ...target.args] };
 };
 
 // ── Background listener auto-start ────────────────────────────────────
@@ -496,6 +516,15 @@ export const ensureListenerRunning = async (launchedByListener: boolean = takeLi
             return;
         }
         if (reportFailedStart(await awaitServiceListener(logOffset, pid))) return;
+        // The service starts whatever install it was registered from, which
+        // need not be this one (`hwip` from Homebrew, the plist from an nvm
+        // node). Restarting it brings the same old build back, and every
+        // `hwip cc` after would restart it again without ever saying why.
+        const restarted = runningListenerVersion();
+        if (listenerVersionDrifted(restarted, VERSION)) {
+            console.error(staleServiceNote(restarted, serviceStatus().cliPath));
+            return;
+        }
         if (pid === null) console.log(`hwip: listener started by ${owner} (log: ${LISTENER_LOG_FILE})`);
         else console.log(`hwip: listener ${running ?? '(pre-1.26)'} is stale — ${owner} restarting on ${VERSION}`);
         return;
@@ -523,6 +552,12 @@ export const ensureListenerRunning = async (launchedByListener: boolean = takeLi
         console.log(`hwip: listener autostarted in background (log: ${LISTENER_LOG_FILE})`);
     }
 };
+
+/** What to say when the login service came back on an older install than this one. */
+const staleServiceNote = (running: string | null, serviceCli: string | null): string =>
+    `hwip: the login service restarted the listener on ${running ?? 'an unstamped build'}, not ${VERSION} — ` +
+    `it runs ${serviceCli ?? 'another install'}.\n` +
+    '      Point it at this install: hwip listener --install-service';
 
 /** Say why a just-started listener is not running; true when it said anything. */
 const reportFailedStart = (started: ListenerStart): boolean => {
@@ -635,6 +670,8 @@ export const handleAgentSession = async (
 ): Promise<number> => {
     // First of all, before `ensureWorktree` runs git (its hooks would inherit the marker).
     const launchedByListener = takeListenerLaunchMarker();
+    // The resume hint trusts only a registry record the sweep wrote after this.
+    const launchedAt = Date.now();
     // Best-effort: make sure the phone-bridge daemon is running, and running
     // the build we were launched from. The user shouldn't need to remember a
     // second command for the picker on their phone to work.
@@ -684,7 +721,8 @@ export const handleAgentSession = async (
         }
     }
 
-    return (deps.launch ?? launchTarget)({ kind, cmd, args, session, env }, agent.binary);
+    const target: SpawnTarget = { kind, cmd, args, session, env };
+    return (deps.launch ?? launchTarget)(withResumeHint(target, agent, launchedAt), agent.binary);
 };
 
 /**
@@ -744,7 +782,7 @@ const launchTarget = async ({ kind, cmd, args, session, env: agentEnv }: SpawnTa
             // from a plain shell pane" would send them after the wrong thing.
             if (kind === 'tmux-new' && code && code !== 0 && dur < 2000) {
                 console.error(
-                    `hwip: ${cmd} ${args.join(' ')} exited ${code} after ${dur}ms.\n` +
+                    `hwip: tmux exited ${code} after ${dur}ms.\n` +
                     `  If this terminal is itself inside tmux (or an iTerm/Warp\n` +
                     `  tmux-integration pane), run \`hwip cc\` from a plain shell\n` +
                     `  pane instead — \`tmux new\` needs a real TTY to attach.`,

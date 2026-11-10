@@ -713,6 +713,7 @@ export type SealPurpose =
   | 'screen.history'
   | 'session.diff'
   | 'schedule.list'
+  | 'agent.tasks'
   | 'turn.batch';
 
 export interface SealedV2 {

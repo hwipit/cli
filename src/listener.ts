@@ -78,12 +78,14 @@ import {
     type SubagentScanState,
 } from './subagent-transcripts.js';
 import {
+    backgroundTasksFor,
     initialBackgroundTaskState,
     recordBackgroundTasks,
     trackBackgroundTasks,
     type BackgroundTaskState,
     type SessionBackgroundTasks,
 } from './background-tasks.js';
+import { liveTaskRows } from './background-tasks-requests.js';
 import { projectTranscriptEntries, type TranscriptSource } from './transcript-tail.js';
 import {
     installService,
@@ -1776,6 +1778,76 @@ export const handleScheduleListRequest = (req: ScheduleListRequest, send: (data:
             return reply({ error: 'subscriber_unverified' });
         },
     ).catch((err) => log(`! schedule list: the answer could not be sent (${err instanceof Error ? err.message : err})`));
+    return true;
+};
+
+// ─── Background commands: the phone reads a session's list ──────────
+
+export interface BackgroundTasksRequest {
+    subtype?: string;
+    targetDeviceId?: string;
+    sessionName?: string;
+    requestId?: string;
+    subscriberPublicKey?: string;
+    /** The asking device, stamped by the relay: whose registered key the one above has to be. */
+    deviceId?: string;
+}
+
+/** Why a list request got no list: a refusal of the requester (`RefusalCode`), or one of these. */
+type BackgroundTasksError = RefusalCode | 'rate_limited' | 'encrypt_failed';
+
+/**
+ * Answer a phone's request for the background commands a Claude session runs
+ * (`Bash` with `run_in_background`). The rows are Claude's descriptions of
+ * them, which can say what a command is for, so the answer is sealed for a key
+ * that checked out and bound to the session — never in the clear, whatever
+ * this listener's seal history. Each task is checked for a live writer on its
+ * output now, not only at the last sweep, so a dead one is not listed.
+ */
+export const handleBackgroundTasksRequest = (req: BackgroundTasksRequest, send: (data: Record<string, unknown>) => void): boolean => {
+    if (req.subtype !== 'agent.tasks.request') return false;
+    if (typeof req.requestId !== 'string' || !req.requestId || req.requestId.length > MAX_REQUEST_ID_LENGTH) return false;
+    if (typeof req.sessionName !== 'string' || !req.sessionName || req.sessionName.length > MAX_REQUEST_ID_LENGTH) return false;
+    if (req.targetDeviceId !== computeListenerDeviceId()) return false;
+    const { requestId, sessionName } = req;
+
+    const frame = {
+        subtype: 'agent.tasks.result',
+        requestId,
+        sessionName,
+        ...(typeof req.deviceId === 'string' && req.deviceId ? { targetDeviceId: req.deviceId } : {}),
+        at: new Date().toISOString(),
+    };
+    const reply = (fields: { error: BackgroundTasksError } | { encrypted: SealedV2 }): void => { send({ ...frame, ...fields }); };
+
+    const asker = typeof req.deviceId === 'string' && /^[\w-]{1,64}$/.test(req.deviceId) ? req.deviceId : '';
+    if (!checkRateLimit(`tasks:list:${asker}`)) {
+        reply({ error: 'rate_limited' });
+        return true;
+    }
+    // No key, no list: a plaintext request is refused even where screens still go out in the clear.
+    if (!asksForSeal(req)) {
+        reply({ error: 'e2ee_required' });
+        return true;
+    }
+
+    whenSealAdmitted(
+        req,
+        (phoneKey) => {
+            liveTaskRows(backgroundTasksFor(sessionName)?.tasks ?? [])
+                .then(async (tasks) => {
+                    await initDeviceCrypto();
+                    return sealV2('agent.tasks', JSON.stringify({ v: 1, requestId, at: frame.at, tasks }), phoneKey, sessionName);
+                })
+                .then((encrypted) => reply({ encrypted }))
+                .catch((err) => {
+                    // A seal that fails is an error, never a plaintext list.
+                    log(`⧉ tasks ${sessionName}: seal failed (${err instanceof Error ? err.message : err})`);
+                    reply({ error: 'encrypt_failed' });
+                });
+        },
+        (reason) => { reply({ error: reason }); },
+    );
     return true;
 };
 
@@ -6598,6 +6670,8 @@ export const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
                     && !handleFileBlobRequest(m.data as DiffRequest, sendEphemeral)
                     // Reading the schedules: files this machine wrote itself, sealed for the asker.
                     && !handleScheduleListRequest(m.data as ScheduleListRequest, sendEphemeral)
+                    // A session's background commands: what Claude said they are, sealed for the asker.
+                    && !handleBackgroundTasksRequest(m.data as BackgroundTasksRequest, sendEphemeral)
                 ) {
                     void handleScreenRequest(m.data as ScreenRequest)
                         .then((reply) => { if (reply) sendEphemeral(reply); })

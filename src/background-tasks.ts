@@ -26,7 +26,7 @@
  * session's tasks together.
  */
 import { existsSync, realpathSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 
 import { TASK_END, TASK_ID } from './subagent-transcripts.js';
 import { readTranscriptDelta, type TailState } from './transcript-tail.js';
@@ -165,11 +165,36 @@ const LSOF_CANDIDATES = ['/usr/sbin/lsof', '/usr/bin/lsof'];
 export const lsofWriters: WriterProbe = (paths) => {
     const bin = LSOF_CANDIDATES.find((candidate) => existsSync(candidate));
     if (!bin || paths.length === 0) return null;
-    const r = spawnSync(bin, ['-F', 'n', '--', ...paths], { encoding: 'utf8', timeout: 3_000 });
+    const r = spawnSync(bin, ['-F', 'n', '--', ...paths], { encoding: 'utf8', timeout: LSOF_TIMEOUT_MS });
     if (r.error || (r.status !== 0 && r.status !== 1)) return null;
+    return openAmong(paths, r.stdout);
+};
+
+/** An answer that resolves later: what the phone's requests use on the main thread. */
+export type AsyncWriterProbe = (paths: readonly string[]) => Promise<ReadonlySet<string> | null>;
+
+/**
+ * `lsofWriters` without blocking: the main thread serves the socket, and a
+ * synchronous spawn there delays frames and pongs (inventory-offload.ts).
+ */
+export const lsofWritersAsync: AsyncWriterProbe = (paths) => {
+    const bin = LSOF_CANDIDATES.find((candidate) => existsSync(candidate));
+    if (!bin || paths.length === 0) return Promise.resolve(null);
+    return new Promise((resolve) => {
+        execFile(bin, ['-F', 'n', '--', ...paths], { encoding: 'utf8', timeout: LSOF_TIMEOUT_MS }, (err, stdout) => {
+            // Exit 1 is still an answer (one path open nowhere); a timeout, a spawn failure or another status is none.
+            const code = (err as { code?: unknown } | null)?.code;
+            resolve(!err || code === 1 ? openAmong(paths, stdout) : null);
+        });
+    });
+};
+
+const LSOF_TIMEOUT_MS = 3_000;
+
+/** Which of `paths` lsof's `-F n` output names. lsof names a file by its real path (/tmp is /private/tmp on macOS). */
+const openAmong = (paths: readonly string[], stdout: string): ReadonlySet<string> => {
     const open = new Set<string>();
-    for (const row of r.stdout.split('\n')) if (row.startsWith('n')) open.add(row.slice(1));
-    // lsof names a file by its real path (/tmp is /private/tmp on macOS).
+    for (const row of stdout.split('\n')) if (row.startsWith('n')) open.add(row.slice(1));
     return new Set(paths.filter((p) => open.has(p) || open.has(realPathOrSelf(p))));
 };
 

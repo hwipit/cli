@@ -8,6 +8,7 @@ import {
     BACKGROUND_TASK_PROBE_MS,
     initialBackgroundTaskState,
     lsofWriters,
+    lsofWritersAsync,
     trackBackgroundTasks,
     type WriterProbe,
 } from './background-tasks.js';
@@ -187,6 +188,7 @@ describe('lsofWriters (the real lsof)', () => {
         try {
             for (let i = 0; i < 50 && !existsSync(busy); i++) await new Promise((r) => setTimeout(r, 20));
             expect(lsofWriters([busy, idle])).toEqual(new Set([busy]));
+            expect(await lsofWritersAsync([busy, idle])).toEqual(new Set([busy]));
         } finally {
             child.kill('SIGKILL');
         }

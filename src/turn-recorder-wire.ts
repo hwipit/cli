@@ -21,8 +21,12 @@ import {
 } from './turn-recorder.js';
 
 const UPLOAD_TIMEOUT_MS = 15_000;
-/** The turns route has its own per-minute allowance on the server (240); chunks keep to 30, well inside it. */
-export const RECORDER_UPLOADS_PER_MINUTE = 30;
+/**
+ * The turns route has its own per-minute allowance on the server (240, per account); chunks keep to half
+ * of it, so a second machine still has room. 30 was too few: on 2026-11-10 nineteen live sessions made
+ * chunks about as fast as 30 a minute let them out, and a backlog of ~100 never drained.
+ */
+export const RECORDER_UPLOADS_PER_MINUTE = 120;
 /** How long a session waits after a 403 before the same chunk is tried again. */
 const RECORDER_KEY_RETRY_MS = 5 * 60_000;
 /** After this many 403s in a row the chunk is dropped: the key it was sealed with is not the one on file, and will not be. */

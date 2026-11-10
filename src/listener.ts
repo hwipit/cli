@@ -86,6 +86,7 @@ import {
     type SessionBackgroundTasks,
 } from './background-tasks.js';
 import { liveTaskRows } from './background-tasks-requests.js';
+import { fitTaskOutputBody, readTaskOutputTail } from './background-tasks-output.js';
 import { stopBackgroundTask, type StopOutcome } from './background-tasks-stop.js';
 import { projectTranscriptEntries, type TranscriptSource } from './transcript-tail.js';
 import {
@@ -1962,6 +1963,87 @@ export const handleBackgroundTaskStopRequest = (req: BackgroundTaskStopRequest, 
                 .catch((err) => {
                     log(`⧉ tasks ${sessionName}: stop failed (${err instanceof Error ? err.message : err})`);
                     reply({ result: 'kill_failed' });
+                });
+        },
+        (reason) => { reply({ error: reason }); },
+    );
+    return true;
+};
+
+// ─── Background commands: the phone reads the end of one's output ──
+
+export interface BackgroundTaskOutputRequest {
+    subtype?: string;
+    targetDeviceId?: string;
+    sessionName?: string;
+    requestId?: string;
+    /** Which task, by the id the list gave. Never a path: the path is the one the transcript gave. */
+    taskId?: unknown;
+    subscriberPublicKey?: string;
+    deviceId?: string;
+}
+
+type BackgroundTaskOutputError = RefusalCode | 'rate_limited' | 'bad_request' | 'not_found' | 'path_refused' | 'read_failed' | 'encrypt_failed';
+
+/**
+ * Answer a phone's request for the end of a background command's output
+ * (`readTaskOutputTail`: the last 16 KB of the file the transcript named, if
+ * it is that task's `tasks/<id>.output`). A log can hold anything a command
+ * printed, so the answer is sealed for a key that checked out and bound to
+ * the session, the request and the task — never in the clear.
+ */
+export const handleBackgroundTaskOutputRequest = (req: BackgroundTaskOutputRequest, send: (data: Record<string, unknown>) => void): boolean => {
+    if (req.subtype !== 'agent.task.output.request') return false;
+    if (typeof req.requestId !== 'string' || !req.requestId || req.requestId.length > MAX_REQUEST_ID_LENGTH) return false;
+    if (typeof req.sessionName !== 'string' || !req.sessionName || req.sessionName.length > MAX_REQUEST_ID_LENGTH) return false;
+    if (req.targetDeviceId !== computeListenerDeviceId()) return false;
+    const { requestId, sessionName } = req;
+
+    const frame = {
+        subtype: 'agent.task.output.result',
+        requestId,
+        sessionName,
+        ...(typeof req.deviceId === 'string' && req.deviceId ? { targetDeviceId: req.deviceId } : {}),
+        at: new Date().toISOString(),
+    };
+    const reply = (fields: { error: BackgroundTaskOutputError } | { encrypted: SealedV2 }): void => { send({ ...frame, ...fields }); };
+
+    const asker = typeof req.deviceId === 'string' && /^[\w-]{1,64}$/.test(req.deviceId) ? req.deviceId : '';
+    if (!checkRateLimit(`tasks:output:${asker}`)) {
+        reply({ error: 'rate_limited' });
+        return true;
+    }
+    if (!asksForSeal(req)) {
+        reply({ error: 'e2ee_required' });
+        return true;
+    }
+    const { taskId } = req;
+    if (typeof taskId !== 'string' || !TASK_ID_PATTERN.test(taskId)) {
+        reply({ error: 'bad_request' });
+        return true;
+    }
+
+    whenSealAdmitted(
+        req,
+        (phoneKey) => {
+            const task = backgroundTasksFor(sessionName)?.tasks.find((t) => t.id === taskId);
+            if (!task) return reply({ error: 'not_found' });
+            readTaskOutputTail(task)
+                .then(async (tail) => {
+                    if ('error' in tail) return reply({ error: tail.error });
+                    const body = fitTaskOutputBody({ requestId, at: frame.at, taskId }, tail, SEALED_FRAME_MAX_BYTES);
+                    try {
+                        await initDeviceCrypto();
+                        return reply({ encrypted: await sealV2('agent.task.output', body, phoneKey, sessionName) });
+                    } catch (err) {
+                        // A seal that fails is an error, never the output in the clear.
+                        log(`⧉ tasks ${sessionName}: output seal failed (${err instanceof Error ? err.message : err})`);
+                        return reply({ error: 'encrypt_failed' });
+                    }
+                })
+                .catch((err) => {
+                    log(`⧉ tasks ${sessionName}: output read failed (${err instanceof Error ? err.message : err})`);
+                    reply({ error: 'read_failed' });
                 });
         },
         (reason) => { reply({ error: reason }); },
@@ -6791,6 +6873,7 @@ export const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
                     // A session's background commands: what Claude said they are, sealed for the asker.
                     && !handleBackgroundTasksRequest(m.data as BackgroundTasksRequest, sendEphemeral)
                     && !handleBackgroundTaskStopRequest(m.data as BackgroundTaskStopRequest, sendEphemeral)
+                    && !handleBackgroundTaskOutputRequest(m.data as BackgroundTaskOutputRequest, sendEphemeral)
                 ) {
                     void handleScreenRequest(m.data as ScreenRequest)
                         .then((reply) => { if (reply) sendEphemeral(reply); })

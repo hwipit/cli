@@ -882,11 +882,13 @@ Background commands a Claude session runs (`Bash` with `run_in_background`) are 
 ```
 { subtype: 'agent.tasks.request',      targetDeviceId, sessionName, requestId, subscriberPublicKey }
 { subtype: 'agent.tasks.result',       requestId, sessionName, at, encrypted | error }
+{ subtype: 'agent.task.output.request', targetDeviceId, sessionName, requestId, taskId, subscriberPublicKey }
+{ subtype: 'agent.task.output.result',  requestId, sessionName, at, encrypted | error }
 { subtype: 'agent.task.stop.request',  targetDeviceId, sessionName, requestId, subscriberPublicKey, encrypted }
 { subtype: 'agent.task.stop.result',   requestId, sessionName, at, result | error }
 ```
 
-The list is sealed for the asking device (purpose `agent.tasks`, bound to the session) as `{ v: 1, requestId, at, tasks: [{ id, description, startedAt }] }` — Claude's description of each command, never the command line or where its output goes, and only commands whose output some process still writes (`lsof`). A stop request seals `{ v: 1, requestId, taskId, at }` for this machine (purpose `agent.task.stop`). The listener finds the process group to signal on its own: the one group whose leader writes the task's output file and descends from the session's pane, never this listener's group, the pane's foreground group (Claude itself) or one between the leader and the pane. It sends that group `SIGTERM` and answers `result: 'stopped'`; otherwise it signals nothing and answers `not_found` (nobody writes the output, or the command left its group), `ambiguous` (more than one group qualifies), `refused` or `kill_failed`. Claude then writes the task's end, and the count drops on the next report. Errors are `e2ee_required` (no key), `subscriber_unverified`, `bad_request` (an envelope that does not open, a mismatch, a stale or repeated request, a task id that is not one) and `rate_limited`.
+The list is sealed for the asking device (purpose `agent.tasks`, bound to the session) as `{ v: 1, requestId, at, tasks: [{ id, description, startedAt }] }` — Claude's description of each command, never the command line or where its output goes, and only commands whose output some process still writes (`lsof`). The end of one command's output is sealed the same way (purpose `agent.task.output`) as `{ v: 1, requestId, at, taskId, text, size, truncated }`: the last 16 KB of the file the transcript named, cut to whole characters and from the top again when the sealed frame would pass 20 KB (a coloured log's escape codes grow six-fold in JSON), read only when its real path is a `tasks/<taskId>.output` file with no other name (a symlink out of there, a hard link, a directory or another task's file is `path_refused`; a task this session does not run, or a file that is gone, is `not_found`; `read_failed` and `encrypt_failed` say what broke). A stop request seals `{ v: 1, requestId, taskId, at }` for this machine (purpose `agent.task.stop`). The listener finds the process group to signal on its own: the one group whose leader writes the task's output file and descends from the session's pane, never this listener's group, the pane's foreground group (Claude itself) or one between the leader and the pane. It sends that group `SIGTERM` and answers `result: 'stopped'`; otherwise it signals nothing and answers `not_found` (nobody writes the output, or the command left its group), `ambiguous` (more than one group qualifies), `refused` or `kill_failed`. Claude then writes the task's end, and the count drops on the next report. Errors are `e2ee_required` (no key), `subscriber_unverified`, `bad_request` (an envelope that does not open, a mismatch, a stale or repeated request, a task id that is not one) and `rate_limited`.
 
 ### Your API key and redirects
 
@@ -1024,7 +1026,7 @@ handing the listener a key:
   with a fresh salt and the message's purpose (`stream.frame`,
   `stream.input`, `stream.alive`, `stream.started`, `screen.snapshot`,
   `screen.history`, `session.diff`, `schedule.list`, `agent.tasks`,
-  `agent.task.stop`, `turn.batch`) as the key's info, and
+  `agent.task.output`, `agent.task.stop`, `turn.batch`) as the key's info, and
   AES-256-GCM over data that names the purpose, both keys in send →
   receive order and the session. The sealed frame also holds the
   session name, its `seq`/`epoch` and that nonce, so a relay that cannot
@@ -1095,8 +1097,9 @@ request without a key while this listener pins no device, and otherwise an
 error code (`e2ee_required`, `subscriber_unverified`, …) and no schedule. Prompts are in
 it, so a request that asked for a seal is never answered in the clear.
 
-A Claude session's background commands — the answer to `agent.tasks.request` —
-are sealed for a key that checked out, always: there is no plaintext answer,
+A Claude session's background commands — the answer to `agent.tasks.request`,
+and the end of one's output for `agent.task.output.request` — are sealed for a
+key that checked out, always: there is no plaintext answer,
 pinned devices or not. Stopping one (`agent.task.stop.request`) ends a
 process, so the request itself is sealed by the phone's key (purpose
 `agent.task.stop`, bound to the session) and that key has to be the asking

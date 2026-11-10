@@ -20,6 +20,8 @@ let tmuxCalls: string[][] = [];
 /** The PATH each new-session call handed tmux: the started agent inherits it. */
 let newSessionPaths: Array<string | undefined> = [];
 let newSessionFails = false;
+/** Sessions `hwip sh` marked (`@hwip_shell` naming itself). */
+let markedShells = new Set<string>();
 
 const fakeTmux = (args: readonly string[]) => {
     const a = args[0] === '-S' ? args.slice(2) : args;
@@ -47,6 +49,18 @@ const fakeTmux = (args: readonly string[]) => {
         if (a[4]?.includes('#{session_name}')) return { status: 0, stdout: ['node', session, ''].join(FIELD_SEP), stderr: '' };
         if (a[4] === '#{pane_current_command}') return { status: 0, stdout: 'node', stderr: '' };
         return { status: 0, stdout: ['node', 'claude', '/tmp/proj', '1234', ''].join(FIELD_SEP), stderr: '' };
+    }
+    if (a[0] === 'new' && a.includes('-d')) {
+        // `hwip sh --detach`: created, then marked by the `set-option` chained after it.
+        const name = a[a.indexOf('-s') + 1];
+        liveSessions.push(name);
+        if (a.includes('@hwip_shell')) markedShells.add(name);
+        return { status: 0, stdout: '', stderr: '' };
+    }
+    if (a[0] === 'has-session') return { status: liveSessions.includes(a[a.indexOf('-t') + 1].replace(/^=/, '')) ? 0 : 1, stdout: '', stderr: '' };
+    if (a[0] === 'show-options') {
+        const name = a[a.indexOf('-t') + 1].replace(/^=/, '').replace(/:$/, '');
+        return { status: 0, stdout: markedShells.has(name) ? `${name}\n` : '', stderr: '' };
     }
     if (a[0] === 'capture-pane') return { status: 0, stdout: 'idle pane\n', stderr: '' };
     return { status: 1, stdout: '', stderr: '' };
@@ -741,5 +755,69 @@ describe('agent.session.resume.request — fresh start', () => {
     it('fresh start: fresh that is not true is read as absent', () => {
         expect(ask({ fresh: 'yes' })).toMatchObject({ resumed: true });
         expect(launched()).toEqual(['claude', '--resume', CONVERSATION]);
+    });
+});
+
+/**
+ * A Terminal in a project, from the phone (`fresh: true` naming agent kind `shell`): `hwip sh --detach` in the directory
+ * the named session ran in. The phone still names only a session; the directory comes from this machine's record.
+ */
+describe('agent.session.resume.request — Terminal start', () => {
+    const device = computeListenerDeviceId();
+    let sent: Array<Record<string, unknown>>;
+    const ask = (fields: Record<string, unknown> = {}) => {
+        handleSessionResumeRequest(
+            { subtype: 'agent.session.resume.request', targetDeviceId: device,
+              sessionName: 'hwip-term', agentKind: 'shell', requestId: 'r1', fresh: true, ...fields },
+            (data) => { sent.push(data); },
+        );
+        return sent.at(-1);
+    };
+    const shellStarts = () => tmuxCalls.filter((c) => c[0] === 'new');
+    let clock = Date.now();
+
+    beforeEach(() => {
+        sent = [];
+        tmuxCalls = [];
+        liveSessions = [];
+        markedShells = new Set();
+        rmSync(join(TMP, 'state'), { recursive: true, force: true });
+        // A claude session ran here: its record gives the directory, whatever agent it ran.
+        rememberSessions([{ name: 'hwip-term', cwd: PROJECT_DIR, agentKind: 'claude', runId: '1785546000' }]);
+        clock += 10 * 60_000;
+        vi.spyOn(Date, 'now').mockReturnValue(clock);
+    });
+    afterEach(() => vi.restoreAllMocks());
+
+    it('opens the project\'s marked login shell in the recorded directory', () => {
+        expect(ask()).toMatchObject({ resumed: true, sessionName: 'hwip-api-sh' });
+        const call = shellStarts()[0];
+        expect(call[call.indexOf('-c') + 1]).toBe(PROJECT_DIR);
+        expect(call).toContain('@hwip_shell');
+        expect(markedShells.has('hwip-api-sh')).toBe(true);
+    });
+
+    it('a Terminal already open answers as it is, with no second shell', () => {
+        expect(ask()).toMatchObject({ resumed: true, sessionName: 'hwip-api-sh' });
+        expect(ask()).toMatchObject({ resumed: true, sessionName: 'hwip-api-sh' });
+        expect(shellStarts()).toHaveLength(1);
+    });
+
+    it('a session of that name hwip sh did not mark is refused, not taken over', () => {
+        liveSessions = ['hwip-api-sh'];
+        expect(ask()).toMatchObject({ error: 'already_running' });
+        expect(shellStarts()).toEqual([]);
+    });
+
+    it('a name this machine never ran, or whose folder is gone, starts nothing', () => {
+        expect(ask({ sessionName: 'hwip-nowhere' })).toMatchObject({ error: 'unknown_session' });
+        rememberSessions([{ name: 'hwip-gone', cwd: join(TMP, 'work', 'deleted'), agentKind: 'claude', runId: '1785549000' }]);
+        expect(ask({ sessionName: 'hwip-gone' })).toMatchObject({ error: 'missing_directory' });
+        expect(shellStarts()).toEqual([]);
+    });
+
+    it('without fresh, shell is an agent kind like any other: no record, no start', () => {
+        expect(ask({ fresh: undefined })).toMatchObject({ error: 'unknown_session' });
+        expect(shellStarts()).toEqual([]);
     });
 });

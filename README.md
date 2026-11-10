@@ -435,9 +435,12 @@ block here.
    real terminal: `cd` and `export` stick, `sudo`/`ssh` prompts work, and a
    long command does not tie up an agent. `--label <x>` names it
    `hwip-<project>-<x>`; `--detach` creates it without attaching. Away from
-   the desk, open one from the phone through any running Claude Code
-   session by sending `!hwip sh --detach` (Claude Code's `!` bash mode —
-   see Defense item 7). Inside tmux it never attaches; it prints a
+   the desk, open one from the phone's **New session → Terminal**: the
+   listener runs the same `hwip sh --detach` in the directory the chosen
+   project last ran in (`session-shell-v1`; the phone names a session it saw,
+   never a directory). Through any running Claude Code session, sending
+   `!hwip sh --detach` does the same (Claude Code's `!` bash mode — see
+   Defense item 7). Inside tmux it never attaches; it prints a
    `tmux switch-client -t <session>` line instead. Running it again for a
    session it opened reattaches, and a session of that name it did not open
    is refused.
@@ -980,8 +983,11 @@ into a shell-adjacent pane). The defense is layered:
 What the marker does not stop: anything running as your user on this
 machine can set `@hwip_shell` on a session, or run `hwip sh` itself — and
 so can the phone, while a Claude Code session (`!tmux set-option …`) or a
-marked shell is open to it. It keeps the phone from choosing panes only
-when neither is.
+marked shell is open to it. And the phone can always open a marked shell of
+its own: New session → Terminal starts `hwip-<project>-sh` in any project
+this machine recorded. The marker keeps the phone from typing into panes
+you opened yourself (an agent's, a plain shell's), not from running
+commands on this machine.
 And no layer authenticates the sender: whoever holds your API key, or
 controls the backend, can type into every marked shell and, through `!`,
 every Claude Code session.

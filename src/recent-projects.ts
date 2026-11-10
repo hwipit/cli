@@ -27,19 +27,29 @@ const isSubagent = (name: string): boolean => /\.\d+$/.test(name);
 /** A session a schedule started: starting from it would copy the scheduled run, not the project. */
 const isScheduled = (name: string): boolean => name.includes('-sched-');
 
-/** Each project's agents, from the newest session of each, in the order `known` gives (newest first). */
+/**
+ * Each project's agents, from the newest session of each, in the order `known` gives (newest first).
+ *
+ * A project with a session in `live` is listed without counting toward the 12: a running session's entry is always the
+ * newest, so twelve running projects would leave no room for one the machine ran before (hwip docs/session-runs.md Q50).
+ * Its entries still go out — the agents it ran before and does not run now are only here.
+ */
 export const recentProjects = (
     known: readonly { name: string; agentKind: string; project?: string }[],
+    live: ReadonlySet<string> = new Set(),
 ): RecentProject[] => {
-    const projects = new Set<string>();
+    const projectOf = (e: { name: string; project?: string }): string => e.project || e.name;
+    const eligible = known.filter((e) => !isSubagent(e.name) && !isScheduled(e.name));
+    // As the phone counts running: a scheduled run or a subagent is no running session of the project there.
+    const running = new Set(eligible.filter((e) => live.has(e.name)).map(projectOf));
+    const past = new Set<string>();
     const seen = new Set<string>();
     const listed: RecentProject[] = [];
-    for (const e of known) {
-        if (isSubagent(e.name) || isScheduled(e.name)) continue;
-        const project = e.project || e.name;
-        if (!projects.has(project)) {
-            if (projects.size >= RECENT_PROJECTS_MAX) continue;
-            projects.add(project);
+    for (const e of eligible) {
+        const project = projectOf(e);
+        if (!running.has(project) && !past.has(project)) {
+            if (past.size >= RECENT_PROJECTS_MAX) continue;
+            past.add(project);
         }
         const key = `${project}\u0000${e.agentKind}`;
         if (seen.has(key)) continue;
@@ -50,8 +60,10 @@ export const recentProjects = (
 };
 
 /**
- * The list for this report, or undefined when the registry would not read — an empty list would
+ * The list for this report beside `live`, the sessions it reports running, or undefined when the registry would not read — an empty list would
  * clear what the server holds, and the phone would lose every project to start in.
  */
-export const recentProjectsToReport = (now: number = Date.now()): RecentProject[] | undefined =>
-    registryUnreadable() ? undefined : recentProjects(knownSessions(now));
+export const recentProjectsToReport = (
+    live: ReadonlySet<string>,
+    now: number = Date.now(),
+): RecentProject[] | undefined => (registryUnreadable() ? undefined : recentProjects(knownSessions(now), live));

@@ -63,6 +63,28 @@ describe('recentProjects', () => {
         expect(listed.at(-1)).toEqual({ name: 'hwip-p0', agentKind: 'codex', project: 'p0' });
         expect(listed.some((p) => p.project === `p${RECENT_PROJECTS_MAX}`)).toBe(false);
     });
+
+    it('lists projects that run now on top of the twelve, so they never crowd out one the machine ran before', () => {
+        const running = Array.from({ length: RECENT_PROJECTS_MAX }, (_, i) => entry(`hwip-r${i}`));
+        const past = Array.from({ length: RECENT_PROJECTS_MAX + 1 }, (_, i) => entry(`hwip-p${i}`));
+        const listed = recentProjects([...running, entry('hwip-r0-2', 'pi', 'r0'), ...past], new Set(running.map((e) => e.name)));
+
+        expect(new Set(listed.map((p) => p.project)).size).toBe(2 * RECENT_PROJECTS_MAX);
+        // A running project keeps the agent it ran before and does not run now.
+        expect(listed).toContainEqual({ name: 'hwip-r0-2', agentKind: 'pi', project: 'r0' });
+        expect(listed.some((p) => p.project === `p${RECENT_PROJECTS_MAX}`)).toBe(false);
+    });
+
+    it('counts a project whose only live session is a scheduled run or a subagent as a past one', () => {
+        const past = Array.from({ length: RECENT_PROJECTS_MAX }, (_, i) => entry(`hwip-p${i}`));
+        const listed = recentProjects(
+            [entry('hwip-s-sched-1a2b', 'claude', 's'), entry('hwip-s.3', 'claude', 's'), entry('hwip-s', 'claude', 's'), ...past],
+            new Set(['hwip-s-sched-1a2b', 'hwip-s.3']),
+        );
+
+        expect(listed[0]).toEqual({ name: 'hwip-s', agentKind: 'claude', project: 's' });
+        expect(new Set(listed.map((p) => p.project)).size).toBe(RECENT_PROJECTS_MAX);
+    });
 });
 
 describe('recentProjectsToReport', () => {
@@ -73,11 +95,11 @@ describe('recentProjectsToReport', () => {
     it('reads what this machine ran from the registry', () => {
         rememberSessions([{ name: 'hwip-api', cwd: '/work/api', agentKind: 'claude', project: 'api' }]);
 
-        expect(recentProjectsToReport()).toEqual([{ name: 'hwip-api', agentKind: 'claude', project: 'api' }]);
+        expect(recentProjectsToReport(new Set())).toEqual([{ name: 'hwip-api', agentKind: 'claude', project: 'api' }]);
     });
 
     it('is an empty list on a machine that never ran a session', () => {
-        expect(recentProjectsToReport()).toEqual([]);
+        expect(recentProjectsToReport(new Set())).toEqual([]);
     });
 
     /** An empty list would wipe what the server holds, and the phone would lose every project to start in. */
@@ -85,7 +107,7 @@ describe('recentProjectsToReport', () => {
         mkdirSync(stateDir(), { recursive: true });
         writeFileSync(join(stateDir(), 'known-sessions.json'), '{ half written');
 
-        expect(recentProjectsToReport()).toBeUndefined();
+        expect(recentProjectsToReport(new Set())).toBeUndefined();
     });
 });
 

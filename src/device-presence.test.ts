@@ -31,7 +31,7 @@ describe('createDeviceKeyRegistration', () => {
     it('sends the public key and what this build opens, and nothing else, on the presence message', async () => {
         const h = harness();
         expect(await h.reg.onOpen()).toBe(true);
-        expect(h.sent).toEqual([{ type: LISTENER_PRESENCE, data: { publicKey: 'PUBKEY', capabilities: ['file-chunk-v1', 'lan-large-v1', 'schedule-session-v1', 'session-start-v1'] } }]);
+        expect(h.sent).toEqual([{ type: LISTENER_PRESENCE, data: { publicKey: 'PUBKEY', capabilities: ['file-chunk-v1', 'lan-large-v1', 'schedule-session-v1', 'session-start-v1', 'session-shell-v1'] } }]);
     });
 
     // The apps show "into this session" and "once" only to a listener that can run them: an older one refuses both.

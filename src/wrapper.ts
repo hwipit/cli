@@ -770,7 +770,7 @@ const launchTarget = async ({ kind, cmd, args, session, env: agentEnv }: SpawnTa
 export type ShellSessionState = 'none' | 'marked' | 'unmarked';
 
 /** A tmux call, injectable for tests. */
-type RunTmux = (args: string[]) => { status: number | null; stdout: string; stderr?: string };
+export type RunTmux = (args: string[]) => { status: number | null; stdout: string; stderr?: string };
 
 const runTmux: RunTmux = (args) => {
     const r = spawnSync('tmux', args, { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
@@ -834,12 +834,30 @@ export const shellTargets = (
     opts: AgentLaunchOptions,
     inTmux: boolean = !!process.env.TMUX,
 ): { create: SpawnTarget; attach: SpawnTarget | null } => {
-    const create = targetForAgent(shell, ['-l'], 'shell', { label: opts.label ?? 'sh', detach: true });
+    const create = targetForAgent(shell, ['-l'], 'shell', { projectDir: opts.projectDir, label: opts.label ?? 'sh', detach: true });
     const session = create.session ?? '';
     // `attach-session`, never `new -A`: a session that died since the probe
     // must not come back as a fresh, unmarked one.
     const attach: SpawnTarget = { kind: 'tmux-new', cmd: 'tmux', args: ['attach-session', '-t', `=${session}`], session };
     return { create, attach: opts.detach || inTmux ? null : attach };
+};
+
+/**
+ * The phone's Terminal start (hwip docs/session-runs.md Q50): `hwip sh --detach` run in `projectDir` — the same
+ * `hwip-<project>-sh` login shell, marked so the phone may type into it. One already open under that name is the answer
+ * as it is; a session of that name `hwip sh` did not mark is refused, never taken over.
+ */
+export const startShellSession = (
+    projectDir: string,
+    shell: string,
+    run: RunTmux = runTmux,
+): { session: string } | { refused: 'already_running' | 'start_failed' } => {
+    const { create } = shellTargets(shell, { projectDir, detach: true }, true);
+    const session = create.session ?? '';
+    const plan = planShellSession(create, null, readShellSessionState(session, run));
+    if (plan.kind === 'refuse') return { refused: 'already_running' };
+    if (plan.kind === 'create' && run(plan.args).status !== 0) return { refused: 'start_failed' };
+    return { session };
 };
 
 /**

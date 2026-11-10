@@ -25,7 +25,7 @@ import { spawnSync } from 'child_process';
 import { createHash } from 'crypto';
 import { constants as fsConstants, copyFileSync, existsSync, linkSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, truncateSync, unlinkSync, writeFileSync } from 'fs';
 import { handBackToSudoUser, mkdirHandedBack } from './private-files.js';
-import { homedir, hostname } from 'os';
+import { homedir, hostname, userInfo } from 'os';
 import { join, basename, dirname, isAbsolute, resolve, sep } from 'path';
 import WebSocket from 'ws';
 import { checkoutOf, configIgnoredBecause, groupOf, keyIsFromFile, loadConfig, resolveBaseUrl, resolvedEnv, type HwipConfig, SESSION_LABEL_OPTION, SESSION_PROJECT_OPTION, SESSION_SHELL_OPTION, TRUST_FILE, VERSION, type Checkout } from './config.js';
@@ -136,7 +136,7 @@ import {
     subagentTranscriptFor, tmuxTargetFor, type PaneInfo,
 } from './tmux-pane.js';
 import { liveRunIdOf, liveSessionNames, liveTmuxRuns, sessionExists, sessionLiveness } from './tmux-liveness.js';
-import { familyNames } from './wrapper.js';
+import { familyNames, startShellSession } from './wrapper.js';
 import { noteRunSeqs, runSeqsByRun, runSeqsKey, type RunSeqs } from './run-seqs.js';
 import { FlagValueError, flagOn } from './args.js';
 import { listSchedules, readScheduleState, removeSchedule, writeScheduleState } from './schedule.js';
@@ -1857,6 +1857,39 @@ const conversationRunning = (known: KnownSession, live: ReadonlySet<string>): bo
     });
 };
 
+/** The `agentKind` a fresh start names to ask for a Terminal (`hwip sh`) instead of an agent (`SESSION_SHELL_CAPABILITY`). */
+export const SHELL_START_KIND = 'shell';
+
+/**
+ * A Terminal in `sessionName`'s project (hwip docs/session-runs.md Q50): `hwip sh --detach` in the directory this machine recorded for it — the login
+ * shell the phone may type into (`@hwip_shell`), audited as every shell input is. The phone names a session it saw, never
+ * a directory, as for an agent; the newest run of the name gives the directory, whichever agent ran it.
+ */
+const startShellBeside = (sessionName: string, reply: (fields: Partial<SessionResumeResult>) => true): true => {
+    const known = recallSession(sessionName, Date.now());
+    if (!known) {
+        log(`✗ shell beside ${sessionName}: never seen on this machine`);
+        return reply({ error: 'unknown_session' });
+    }
+    if (!sessionDirectoryExists(known)) {
+        log(`✗ shell beside ${sessionName}: ${known.cwd} is gone`);
+        return reply({ error: 'missing_directory' });
+    }
+    // One shell per project: a repeat tap reopens it, so this bucket only stops a flood of starts.
+    if (!checkRateLimit(`start:shell:${known.cwd}`, undefined, FRESH_START_COST)) return reply({ error: 'rate_limited' });
+    const shell = process.env.SHELL || userInfo().shell || '/bin/sh';
+    const started = startShellSession(known.cwd, shell, (args) => {
+        const r = spawnSync('tmux', tmuxArgs(args), { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
+        return { status: r.error ? null : r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
+    });
+    if ('refused' in started) {
+        log(`✗ shell beside ${sessionName}: ${started.refused}`);
+        return reply({ error: started.refused });
+    }
+    log(`＋ shell ${started.session} in ${known.cwd}`);
+    return reply({ resumed: true, sessionName: started.session });
+};
+
 /**
  * Start a remembered session again, detached, and tell the phone what happened.
  * Returns true when the message was ours to answer.
@@ -1897,6 +1930,8 @@ export const handleSessionResumeRequest = (
     // process, and the two share one budget so a flood cannot be laundered
     // through whichever path is cheaper.
     if (!checkRateLimit(sessionName, undefined, SUBMIT_COST)) return reply({ error: 'rate_limited' });
+
+    if (req.fresh === true && req.agentKind === SHELL_START_KIND) return startShellBeside(sessionName, reply);
 
     // A named agent is answered with that run or not at all. Falling back to the
     // newest run would start claude for a phone that asked for pi — silently,
@@ -6332,7 +6367,7 @@ export const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             // already exists rather than a request of their own: the phone is
             // already reading this device record (recent-projects.ts).
             const reported = withRunSeqs(sessions);
-            const recent = recentProjectsToReport();
+            const recent = recentProjectsToReport(new Set(sessions.map((s) => s.name)));
             const fingerprint =
                 `${sessionsFingerprint(reported)}␞${recent ? JSON.stringify(recent) : '-'}`;
             if (!sessionsReportDue(fingerprint, lastSentFingerprint, lastSentAtMs, Date.now())) {

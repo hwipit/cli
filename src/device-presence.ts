@@ -40,6 +40,8 @@ import { SCHEDULE_SESSION_CAPABILITY } from './schedule.js';
  * offer it only to a computer that lists this.
  */
 export const SESSION_START_CAPABILITY = 'session-start-v1';
+/** A fresh start that names agent kind `shell` opens the project's `hwip sh` Terminal (listener `startShellBeside`). */
+export const SESSION_SHELL_CAPABILITY = 'session-shell-v1';
 
 /** The one message both halves of presence ride; the server answers
  *  `listener.presence.ack` or `listener.presence.error`. */
@@ -67,7 +69,7 @@ export const createDeviceKeyRegistration = (deps: DeviceKeyRegistrationDeps): De
     const register = async (): Promise<boolean> => {
         try {
             const publicKey = await deps.publicKey();
-            const sent = deps.send({ type: LISTENER_PRESENCE, data: { publicKey, capabilities: [FILE_CHUNK_CAPABILITY, LAN_LARGE_CAPABILITY, SCHEDULE_SESSION_CAPABILITY, SESSION_START_CAPABILITY] } });
+            const sent = deps.send({ type: LISTENER_PRESENCE, data: { publicKey, capabilities: [FILE_CHUNK_CAPABILITY, LAN_LARGE_CAPABILITY, SCHEDULE_SESSION_CAPABILITY, SESSION_START_CAPABILITY, SESSION_SHELL_CAPABILITY] } });
             if (!sent) deps.log('device key: not registered — no connection right now, retried at the next open');
             return sent;
         } catch (err) {

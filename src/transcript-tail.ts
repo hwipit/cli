@@ -681,6 +681,9 @@ const SYNTHETIC_BLOCKS = /<(task-notification|system-reminder|local-command-cave
 /** `<command-name>/simplify</command-name>` — the one wrapper worth keeping, as what it names. */
 const COMMAND_NAME = /<command-name>([^<]*)<\/command-name>/;
 
+/** `<command-args>prompt run</command-args>` — what the person typed after the command name. */
+const COMMAND_ARGS = /<command-args>([\s\S]*?)<\/command-args>/;
+
 /**
  * Whether this entry is a person speaking.
  *
@@ -748,10 +751,12 @@ const typedTextOf = (entry: Record<string, unknown>): string | null => {
  * separate feature, not a reason to ship the path.
  */
 const stripAttachmentMarkers = (text: string): string => {
-    const command = text.match(COMMAND_NAME)?.[1]?.trim();
+    const name = text.match(COMMAND_NAME)?.[1]?.trim();
+    const args = text.match(COMMAND_ARGS)?.[1]?.trim();
     const body = text.replace(SYNTHETIC_BLOCKS, '');
-    // A slash command is a person's turn, and its name is the whole of what they
-    // said — the wrapper around it is not.
+    // A slash command is a person's turn, and its name and arguments are the
+    // whole of what they said — the wrapper around them is not.
+    const command = name && args ? `${name} ${args}` : name;
     const withCommand = command ? `${command}\n${body}` : body;
     return withCommand.replace(/\[Image:[^\]]*\]/g, '').replace(/\n{3,}/g, '\n\n');
 };

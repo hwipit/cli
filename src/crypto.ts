@@ -714,6 +714,7 @@ export type SealPurpose =
   | 'session.diff'
   | 'schedule.list'
   | 'agent.tasks'
+  | 'agent.task.stop'
   | 'turn.batch';
 
 export interface SealedV2 {

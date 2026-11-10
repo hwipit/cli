@@ -877,6 +877,17 @@ The phone also reads this machine's schedules (see [Scheduled sessions](#schedul
 
 `schedules` is the list as a JSON string; `encrypted` is the list sealed for the asking device (purpose `schedule.list`, bound to this machine's device id) as `{ v: 1, requestId, at, schedules: [...], unreadable? }` — the app checks that the `requestId` inside is the one it asked, so an older sealed list is not taken for a newer answer. `unreadable` is how many schedule files could not be read; a directory that cannot be listed at all, or that holds more than 20 files, is the error `read_failed`, never an empty list (and a remove then fails as `schedule_failed`; `hwip schedule rm` still works on the computer). A list too long for one frame has its prompts shortened, step by step (`too_large` only when it does not fit even without them). Each entry holds `id`, `source`, `agentKind`, `project` (the directory's name, not its path), `session`, `when`, `prompt` (cut to 500 characters, shorter when the list would not fit; `promptLocked: true` says the phone cannot change it — it is not the whole text, or the schedule has agent arguments — so the app leaves it to `hwip schedule edit`), `maxRuntimeMin`, `nextAt` and the `last` result — never a directory path or the agent's arguments. `when` is `{ kind: 'daily', at, days }`, `{ kind: 'every', minutes }` or `{ kind: 'once', at }` (an ISO 8601 instant). A schedule into a session also holds `target: 'session'` and the `runId` it types into, and `sessionEnded: true` when that run is over (absent while it runs, or when tmux could not say). `last.outcome` may be `session_busy` or `session_ended` for those.
 
+Background commands a Claude session runs (`Bash` with `run_in_background`) are read off its transcript. The session report carries only their number, `backgroundTaskCount`; the phone asks for the rest:
+
+```
+{ subtype: 'agent.tasks.request',      targetDeviceId, sessionName, requestId, subscriberPublicKey }
+{ subtype: 'agent.tasks.result',       requestId, sessionName, at, encrypted | error }
+{ subtype: 'agent.task.stop.request',  targetDeviceId, sessionName, requestId, subscriberPublicKey, encrypted }
+{ subtype: 'agent.task.stop.result',   requestId, sessionName, at, result | error }
+```
+
+The list is sealed for the asking device (purpose `agent.tasks`, bound to the session) as `{ v: 1, requestId, at, tasks: [{ id, description, startedAt }] }` — Claude's description of each command, never the command line or where its output goes, and only commands whose output some process still writes (`lsof`). A stop request seals `{ v: 1, requestId, taskId, at }` for this machine (purpose `agent.task.stop`). The listener finds the process group to signal on its own: the one group whose leader writes the task's output file and descends from the session's pane, never this listener's group, the pane's foreground group (Claude itself) or one between the leader and the pane. It sends that group `SIGTERM` and answers `result: 'stopped'`; otherwise it signals nothing and answers `not_found` (nobody writes the output, or the command left its group), `ambiguous` (more than one group qualifies), `refused` or `kill_failed`. Claude then writes the task's end, and the count drops on the next report. Errors are `e2ee_required` (no key), `subscriber_unverified`, `bad_request` (an envelope that does not open, a mismatch, a stale or repeated request, a task id that is not one) and `rate_limited`.
+
 ### Your API key and redirects
 
 Every request that carries your API key refuses to follow a redirect: a host
@@ -1012,7 +1023,8 @@ handing the listener a key:
   inside envelope v2: ECDH P-256 between the two device keys, HKDF-SHA256
   with a fresh salt and the message's purpose (`stream.frame`,
   `stream.input`, `stream.alive`, `stream.started`, `screen.snapshot`,
-  `screen.history`, `session.diff`, `schedule.list`, `turn.batch`) as the key's info, and
+  `screen.history`, `session.diff`, `schedule.list`, `agent.tasks`,
+  `agent.task.stop`, `turn.batch`) as the key's info, and
   AES-256-GCM over data that names the purpose, both keys in send →
   receive order and the session. The sealed frame also holds the
   session name, its `seq`/`epoch` and that nonce, so a relay that cannot
@@ -1082,6 +1094,15 @@ the same rule: sealed for a key that checked out, in the clear only for a
 request without a key while this listener pins no device, and otherwise an
 error code (`e2ee_required`, `subscriber_unverified`, …) and no schedule. Prompts are in
 it, so a request that asked for a seal is never answered in the clear.
+
+A Claude session's background commands — the answer to `agent.tasks.request` —
+are sealed for a key that checked out, always: there is no plaintext answer,
+pinned devices or not. Stopping one (`agent.task.stop.request`) ends a
+process, so the request itself is sealed by the phone's key (purpose
+`agent.task.stop`, bound to the session) and that key has to be the asking
+device's trusted one; the request id, task id and time inside the seal must
+match the frame, sit within five minutes of this machine's clock, and not have
+been acted on before.
 
 **Reading a session's changes** (`agent.diff.files.request` and
 `agent.diff.file.request`) is sealed both ways and never answered in the

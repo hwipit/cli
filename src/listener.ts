@@ -86,6 +86,7 @@ import {
     type SessionBackgroundTasks,
 } from './background-tasks.js';
 import { liveTaskRows } from './background-tasks-requests.js';
+import { stopBackgroundTask, type StopOutcome } from './background-tasks-stop.js';
 import { projectTranscriptEntries, type TranscriptSource } from './transcript-tail.js';
 import {
     installService,
@@ -1844,6 +1845,123 @@ export const handleBackgroundTasksRequest = (req: BackgroundTasksRequest, send: 
                     // A seal that fails is an error, never a plaintext list.
                     log(`⧉ tasks ${sessionName}: seal failed (${err instanceof Error ? err.message : err})`);
                     reply({ error: 'encrypt_failed' });
+                });
+        },
+        (reason) => { reply({ error: reason }); },
+    );
+    return true;
+};
+
+// ─── Background commands: the phone stops one ──────────────────────
+
+export interface BackgroundTaskStopRequest {
+    subtype?: string;
+    targetDeviceId?: string;
+    sessionName?: string;
+    requestId?: string;
+    subscriberPublicKey?: string;
+    /** `{v: 1, requestId, taskId, at}`, sealed by the phone for this listener (`agent.task.stop`), bound to the session. */
+    encrypted?: unknown;
+    deviceId?: string;
+}
+
+type BackgroundTaskStopError = RefusalCode | 'rate_limited' | 'bad_request';
+
+/** Task ids as Claude Code writes them (`STARTED` in background-tasks.ts). */
+const TASK_ID_PATTERN = /^[A-Za-z0-9]{1,32}$/;
+/** How far a stop request's own clock may sit from this machine's. */
+const STOP_CLOCK_SKEW_MS = 5 * 60_000;
+/**
+ * Stop requests already acted on, by phone key and request id → when. Kept for
+ * twice the skew: an envelope is taken while its own `at` is within the skew
+ * of now, and a phone clock running ahead keeps it takeable past one window
+ * from when it was acted on.
+ */
+const actedStops = new Map<string, number>();
+const MAX_ACTED_STOPS = 512;
+
+/** True the first time a phone's request id is seen. */
+const firstStop = (key: string, now: number): boolean => {
+    for (const [seen, at] of actedStops) if (now - at > 2 * STOP_CLOCK_SKEW_MS) actedStops.delete(seen);
+    if (actedStops.has(key)) return false;
+    if (actedStops.size >= MAX_ACTED_STOPS) actedStops.delete(actedStops.keys().next().value!);
+    actedStops.set(key, now);
+    return true;
+};
+
+/**
+ * Stop a background command a Claude session runs, for a trusted phone. The
+ * one remote path here that ends a process, so the request has to prove who
+ * sent it: it is sealed by the phone's key, which must be the asking device's
+ * trusted key, and names the request, the task and its time inside the seal.
+ * A key alone is public and proves nothing. The phone names a task by id;
+ * which process group that is, and whether it may be signalled at all, is
+ * decided on this machine (`background-tasks-stop.ts`). The answer is a status
+ * in the clear: it says nothing about the task beyond whether it was stopped.
+ */
+export const handleBackgroundTaskStopRequest = (req: BackgroundTaskStopRequest, send: (data: Record<string, unknown>) => void): boolean => {
+    if (req.subtype !== 'agent.task.stop.request') return false;
+    if (typeof req.requestId !== 'string' || !req.requestId || req.requestId.length > MAX_REQUEST_ID_LENGTH) return false;
+    if (typeof req.sessionName !== 'string' || !req.sessionName || req.sessionName.length > MAX_REQUEST_ID_LENGTH) return false;
+    if (req.targetDeviceId !== computeListenerDeviceId()) return false;
+    const { requestId, sessionName } = req;
+
+    const frame = {
+        subtype: 'agent.task.stop.result',
+        requestId,
+        sessionName,
+        ...(typeof req.deviceId === 'string' && req.deviceId ? { targetDeviceId: req.deviceId } : {}),
+        at: new Date().toISOString(),
+    };
+    const reply = (fields: { error: BackgroundTaskStopError } | { result: StopOutcome }): void => { send({ ...frame, ...fields }); };
+
+    const asker = typeof req.deviceId === 'string' && /^[\w-]{1,64}$/.test(req.deviceId) ? req.deviceId : '';
+    if (!checkRateLimit(`tasks:stop:${asker}`)) {
+        reply({ error: 'rate_limited' });
+        return true;
+    }
+    if (!asksForSeal(req)) {
+        reply({ error: 'e2ee_required' });
+        return true;
+    }
+    const sealedRequest = req.encrypted;
+    if (!isSealedV2(sealedRequest)) {
+        reply({ error: 'bad_request' });
+        return true;
+    }
+
+    const answer = async (phoneKey: string): Promise<{ error: BackgroundTaskStopError } | { result: StopOutcome }> => {
+        let asked: { v?: unknown; requestId?: unknown; taskId?: unknown; at?: unknown } | null;
+        try {
+            // Untrusted until the checks below: every field is `unknown`.
+            asked = JSON.parse(await openV2('agent.task.stop', sealedRequest, phoneKey, sessionName)) as typeof asked;
+        } catch {
+            return { error: 'bad_request' };
+        }
+        if (typeof asked !== 'object' || asked === null || asked.v !== 1 || asked.requestId !== requestId) return { error: 'bad_request' };
+        if (typeof asked.taskId !== 'string' || !TASK_ID_PATTERN.test(asked.taskId)) return { error: 'bad_request' };
+        const now = Date.now();
+        const at = typeof asked.at === 'string' ? Date.parse(asked.at) : Number.NaN;
+        if (!Number.isFinite(at) || Math.abs(now - at) > STOP_CLOCK_SKEW_MS) return { error: 'bad_request' };
+        // A relay that kept a sealed stop can hand it back; the seal names the request, so the second one is refused.
+        if (!firstStop(`${phoneKey}\n${requestId}`, now)) return { error: 'bad_request' };
+        const { taskId } = asked;
+        const running = backgroundTasksFor(sessionName);
+        const task = running?.tasks.find((t) => t.id === taskId);
+        if (!task || running?.panePid == null) return { result: 'not_found' };
+        const result = await stopBackgroundTask(task, running.panePid);
+        log(`⧉ tasks ${sessionName}: stop ${taskId} → ${result}`);
+        return { result };
+    };
+
+    whenSealAdmitted(
+        req,
+        (phoneKey) => {
+            answer(phoneKey)
+                .then(reply)
+                .catch((err) => {
+                    log(`⧉ tasks ${sessionName}: stop failed (${err instanceof Error ? err.message : err})`);
+                    reply({ result: 'kill_failed' });
                 });
         },
         (reason) => { reply({ error: reason }); },
@@ -6672,6 +6790,7 @@ export const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
                     && !handleScheduleListRequest(m.data as ScheduleListRequest, sendEphemeral)
                     // A session's background commands: what Claude said they are, sealed for the asker.
                     && !handleBackgroundTasksRequest(m.data as BackgroundTasksRequest, sendEphemeral)
+                    && !handleBackgroundTaskStopRequest(m.data as BackgroundTaskStopRequest, sendEphemeral)
                 ) {
                     void handleScreenRequest(m.data as ScreenRequest)
                         .then((reply) => { if (reply) sendEphemeral(reply); })

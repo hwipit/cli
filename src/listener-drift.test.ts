@@ -25,6 +25,22 @@ vi.mock('./listener-process.js', async (importOriginal) => ({
     listenerLogSize: () => 0,
 }));
 
+const service = vi.hoisted(() => ({
+    installed: vi.fn(() => false),
+    restart: vi.fn(() => ({ ok: true as const, detail: 'restarted' })),
+    cliPath: vi.fn<() => string | null>(() => null),
+}));
+
+vi.mock('./listener-service.js', async (importOriginal) => {
+    const real = await importOriginal<typeof import('./listener-service.js')>();
+    return {
+        ...real,
+        serviceInstalled: () => service.installed(),
+        restartService: () => service.restart(),
+        serviceStatus: () => ({ ...real.serviceStatus(), cliPath: service.cliPath() }),
+    };
+});
+
 const { ensureListenerRunning, listenerVersionDrifted } = await import('./wrapper.js');
 
 beforeEach(() => {
@@ -39,6 +55,8 @@ afterEach(() => {
     proc.runningListenerVersion.mockReturnValue(null);
     proc.startListenerDetached.mockResolvedValue({ kind: 'running' });
     proc.awaitServiceListener.mockResolvedValue({ kind: 'running' });
+    service.installed.mockReturnValue(false);
+    service.cliPath.mockReturnValue(null);
 });
 
 describe('listenerVersionDrifted', () => {
@@ -167,5 +185,32 @@ describe('ensureListenerRunning', () => {
         proc.startListenerDetached.mockResolvedValue({ kind: 'not-spawned' });
         await expect(ensureListenerRunning()).resolves.toBeUndefined();
         expect(console.error).toHaveBeenCalled();
+    });
+});
+
+describe('ensureListenerRunning with the login service installed', () => {
+    beforeEach(() => service.installed.mockReturnValue(true));
+
+    it('has the service restart a stale daemon and says so', async () => {
+        proc.runningListenerPid.mockReturnValue(4242);
+        proc.runningListenerVersion.mockReturnValueOnce(null).mockReturnValue(VERSION);
+        await ensureListenerRunning();
+        expect(service.restart).toHaveBeenCalled();
+        expect(proc.stopListener).not.toHaveBeenCalled();
+        expect(vi.mocked(console.log).mock.calls.flat().join('\n')).toContain(`restarting on ${VERSION}`);
+    });
+
+    // The incident: `hwip` on PATH came from Homebrew, the plist from an nvm
+    // node one release behind. Every `hwip cc` restarted the service, which
+    // came back on the same old build, and announced a restart each time.
+    it('names the install the service runs when the restart brings the old build back', async () => {
+        proc.runningListenerPid.mockReturnValue(4242);
+        proc.runningListenerVersion.mockReturnValue(null);
+        service.cliPath.mockReturnValue('/nvm/lib/node_modules/@hwip/cli/dist/cli.js');
+        await ensureListenerRunning();
+        expect(console.log).not.toHaveBeenCalled();
+        const said = vi.mocked(console.error).mock.calls.flat().join('\n');
+        expect(said).toContain('it runs /nvm/lib/node_modules/@hwip/cli/dist/cli.js');
+        expect(said).toContain('hwip listener --install-service');
     });
 });

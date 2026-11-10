@@ -151,7 +151,9 @@ describe('commandUsage', () => {
 // warns on any flag outside `COMMAND_FLAGS`, so a flag documented but not read
 // is a flag that warns when someone follows the help.
 describe('usage and the flags a command reads', () => {
-    const commands = Object.keys(COMMAND_FLAGS).filter((c) => c !== 'remote-hook');
+    // Internal: hooks and the wrapper's own `sh` call these, never a person.
+    const internal = new Set(['remote-hook', 'resume-hint']);
+    const commands = Object.keys(COMMAND_FLAGS).filter((c) => !internal.has(c));
     const flagsIn = (text: string): string[] => [...new Set([...text.matchAll(/--([a-z][a-z-]*)/g)].map((m) => m[1]!))];
     // The usage of `install` and others names the global flags too, in prose.
     const known = (command: string): string[] => [...COMMAND_FLAGS[command]!, ...GLOBAL_FLAGS];

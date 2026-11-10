@@ -818,6 +818,8 @@ const main = async (): Promise<number> => {
       return (await import('./listener.js')).handleListener(args);
     case 'remote-hook':
       return handleRemoteHook(args);
+    case 'resume-hint':
+      return (await import('./resume-hint.js')).handleResumeHint(args);
     default:
       printError(`Unknown command: ${command}`, flagOn(args, 'json', true));
       printUsage();

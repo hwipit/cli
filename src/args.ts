@@ -204,6 +204,7 @@ export const COMMAND_FLAGS: Readonly<Record<string, readonly string[]>> = {
     'install-service', 'uninstall-service', 'service-status',
   ],
   'remote-hook': [],
+  'resume-hint': ['session', 'type', 'at'],
 };
 
 /**

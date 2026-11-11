@@ -17,6 +17,10 @@ import type { BackgroundTask } from './background-tasks.js';
 /** How much of the end of an output the phone sees: a few screens of a log. */
 export const TASK_OUTPUT_TAIL_BYTES = 16 * 1024;
 
+/** Whether `path` names this task's own output file: `…/tasks/<id>.output`. */
+export const isTaskOutputPath = (path: string, taskId: string): boolean =>
+    basename(path) === `${taskId}.output` && basename(dirname(path)) === 'tasks';
+
 export type TaskOutputTail =
     | { readonly text: string; readonly size: number; readonly truncated: boolean }
     | { readonly error: 'not_found' | 'path_refused' | 'read_failed' };
@@ -46,7 +50,7 @@ export const readTaskOutputTail = async (task: BackgroundTask, limit = TASK_OUTP
     } catch (err) {
         return (err as NodeJS.ErrnoException).code === 'ENOENT' ? { error: 'not_found' } : { error: 'read_failed' };
     }
-    if (basename(real) !== `${task.id}.output` || basename(dirname(real)) !== 'tasks') return { error: 'path_refused' };
+    if (!isTaskOutputPath(real, task.id)) return { error: 'path_refused' };
     let checked;
     let handle;
     try {

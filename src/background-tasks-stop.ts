@@ -13,6 +13,9 @@
  * So the target is the one process group whose leader writes the output and
  * descends from the session's pane. Anything less certain signals nothing.
  */
+import { realpath } from 'node:fs/promises';
+
+import { isTaskOutputPath } from './background-tasks-output.js';
 import { lsofBin, runProbe, type BackgroundTask } from './background-tasks.js';
 import { parseProcTable, type ProcTable } from './remote-agents.js';
 
@@ -122,6 +125,10 @@ export interface StopDeps {
 
 /** Find the task's process group and send it SIGTERM — the group, so the command's children end with it. */
 export const stopBackgroundTask = async (task: BackgroundTask, panePid: number, deps: StopDeps = {}): Promise<StopOutcome> => {
+    // Only the task's own output file says who runs it: a transcript line naming another file points at whoever has that
+    // open. A file already gone keeps its name, and lsof then finds nobody.
+    const real = await realpath(task.outputPath).catch(() => task.outputPath);
+    if (!isTaskOutputPath(real, task.id)) return 'refused';
     const target = await findTaskProcessGroup(task.outputPath, panePid, deps.probes ?? defaultStopProbes);
     if (target.kind !== 'group') return target.kind;
     try {

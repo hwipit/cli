@@ -126,6 +126,17 @@ describe('stopBackgroundTask — stop request signal', () => {
         expect(kills).toEqual([]);
     });
 
+    it('refuses, without asking lsof, a task whose output is not its tasks/<id>.output file', async () => {
+        const { stopBackgroundTask: real } = await vi.importActual<typeof import('./background-tasks-stop.js')>('./background-tasks-stop.js');
+        let asked = 0;
+        const kill = (): void => { throw new Error('never'); };
+        const looking = probes({ writerPids: async () => { asked++; return [300]; } });
+        for (const outputPath of ['/Users/me/.aws/credentials', '/private/tmp/claude-501/-p/s/tasks/b2.output', '/private/tmp/claude-501/-p/s/a1.output']) {
+            expect(await real({ id: 'a1', description: null, startedAt: null, outputPath }, 100, { probes: looking, kill })).toBe('refused');
+        }
+        expect(asked).toBe(0);
+    });
+
     it('reports a signal the system refused as kill_failed', async () => {
         const { stopBackgroundTask: real } = await vi.importActual<typeof import('./background-tasks-stop.js')>('./background-tasks-stop.js');
         const kill = (): void => { throw Object.assign(new Error('EPERM'), { code: 'EPERM' }); };

@@ -77,6 +77,17 @@ import {
     scanSubagents,
     type SubagentScanState,
 } from './subagent-transcripts.js';
+import {
+    backgroundTasksFor,
+    initialBackgroundTaskState,
+    recordBackgroundTasks,
+    trackBackgroundTasks,
+    type BackgroundTaskState,
+    type SessionBackgroundTasks,
+} from './background-tasks.js';
+import { liveTaskRows } from './background-tasks-requests.js';
+import { fitTaskOutputBody, readTaskOutputTail } from './background-tasks-output.js';
+import { stopBackgroundTask, type StopOutcome } from './background-tasks-stop.js';
 import { projectTranscriptEntries, type TranscriptSource } from './transcript-tail.js';
 import {
     installService,
@@ -305,6 +316,9 @@ interface AgentSession {
      *  transcript subagent has one: a pane subagent is watched as a screen, and
      *  nothing counts what happens on it. */
     toolCount?: number;
+    /** Background commands this Claude session is running — a count only;
+     *  what they are travels sealed (`agent.tasks.request`). Absent at zero. */
+    backgroundTaskCount?: number;
     /** Set on a subagent with no pane at all (Claude Code's `Agent` tool): there
      *  is no screen to stream, only its transcript. Absent on a pane subagent —
      *  which can run Claude Code too, so the kind cannot stand in for this. */
@@ -1766,6 +1780,276 @@ export const handleScheduleListRequest = (req: ScheduleListRequest, send: (data:
             return reply({ error: 'subscriber_unverified' });
         },
     ).catch((err) => log(`! schedule list: the answer could not be sent (${err instanceof Error ? err.message : err})`));
+    return true;
+};
+
+// ─── Background commands: the phone reads a session's list ──────────
+
+export interface BackgroundTasksRequest {
+    subtype?: string;
+    targetDeviceId?: string;
+    sessionName?: string;
+    requestId?: string;
+    subscriberPublicKey?: string;
+    /** The asking device, stamped by the relay: whose registered key the one above has to be. */
+    deviceId?: string;
+}
+
+/** Why a list request got no list: a refusal of the requester (`RefusalCode`), or one of these. */
+type BackgroundTasksError = RefusalCode | 'rate_limited' | 'encrypt_failed';
+
+/**
+ * Answer a phone's request for the background commands a Claude session runs
+ * (`Bash` with `run_in_background`). The rows are Claude's descriptions of
+ * them, which can say what a command is for, so the answer is sealed for a key
+ * that checked out and bound to the session — never in the clear, whatever
+ * this listener's seal history. Each task is checked for a live writer on its
+ * output now, not only at the last sweep, so a dead one is not listed.
+ */
+export const handleBackgroundTasksRequest = (req: BackgroundTasksRequest, send: (data: Record<string, unknown>) => void): boolean => {
+    if (req.subtype !== 'agent.tasks.request') return false;
+    if (typeof req.requestId !== 'string' || !req.requestId || req.requestId.length > MAX_REQUEST_ID_LENGTH) return false;
+    if (typeof req.sessionName !== 'string' || !req.sessionName || req.sessionName.length > MAX_REQUEST_ID_LENGTH) return false;
+    if (req.targetDeviceId !== computeListenerDeviceId()) return false;
+    const { requestId, sessionName } = req;
+
+    const frame = {
+        subtype: 'agent.tasks.result',
+        requestId,
+        sessionName,
+        ...(typeof req.deviceId === 'string' && req.deviceId ? { targetDeviceId: req.deviceId } : {}),
+        at: new Date().toISOString(),
+    };
+    const reply = (fields: { error: BackgroundTasksError } | { encrypted: SealedV2 }): void => { send({ ...frame, ...fields }); };
+
+    const asker = typeof req.deviceId === 'string' && /^[\w-]{1,64}$/.test(req.deviceId) ? req.deviceId : '';
+    if (!checkRateLimit(`tasks:list:${asker}`)) {
+        reply({ error: 'rate_limited' });
+        return true;
+    }
+    // No key, no list: a plaintext request is refused even where screens still go out in the clear.
+    if (!asksForSeal(req)) {
+        reply({ error: 'e2ee_required' });
+        return true;
+    }
+
+    whenSealAdmitted(
+        req,
+        (phoneKey) => {
+            liveTaskRows(backgroundTasksFor(sessionName)?.tasks ?? [])
+                .then(async (tasks) => {
+                    await initDeviceCrypto();
+                    return sealV2('agent.tasks', JSON.stringify({ v: 1, requestId, at: frame.at, tasks }), phoneKey, sessionName);
+                })
+                .then((encrypted) => reply({ encrypted }))
+                .catch((err) => {
+                    // A seal that fails is an error, never a plaintext list.
+                    log(`⧉ tasks ${sessionName}: seal failed (${err instanceof Error ? err.message : err})`);
+                    reply({ error: 'encrypt_failed' });
+                });
+        },
+        (reason) => { reply({ error: reason }); },
+    );
+    return true;
+};
+
+// ─── Background commands: the phone stops one ──────────────────────
+
+export interface BackgroundTaskStopRequest {
+    subtype?: string;
+    targetDeviceId?: string;
+    sessionName?: string;
+    requestId?: string;
+    subscriberPublicKey?: string;
+    /** `{v: 1, requestId, taskId, at}`, sealed by the phone for this listener (`agent.task.stop`), bound to the session. */
+    encrypted?: unknown;
+    deviceId?: string;
+}
+
+type BackgroundTaskStopError = RefusalCode | 'rate_limited' | 'bad_request';
+
+/** Task ids as Claude Code writes them (`STARTED` in background-tasks.ts). */
+const TASK_ID_PATTERN = /^[A-Za-z0-9]{1,32}$/;
+/** How far a stop request's own clock may sit from this machine's. */
+const STOP_CLOCK_SKEW_MS = 5 * 60_000;
+/**
+ * Stop requests already acted on, by phone key and request id → when. Kept for
+ * twice the skew: an envelope is taken while its own `at` is within the skew
+ * of now, and a phone clock running ahead keeps it takeable past one window
+ * from when it was acted on. In memory only: a listener restarted inside the
+ * window would take a replayed stop again, which can end only a command the
+ * session still runs, found again from this machine's own probes.
+ */
+const actedStops = new Map<string, number>();
+const MAX_ACTED_STOPS = 512;
+
+/** True the first time a phone's request id is seen. */
+const firstStop = (key: string, now: number): boolean => {
+    for (const [seen, at] of actedStops) if (now - at > 2 * STOP_CLOCK_SKEW_MS) actedStops.delete(seen);
+    if (actedStops.has(key)) return false;
+    if (actedStops.size >= MAX_ACTED_STOPS) actedStops.delete(actedStops.keys().next().value!);
+    actedStops.set(key, now);
+    return true;
+};
+
+/**
+ * Stop a background command a Claude session runs, for a trusted phone. The
+ * one remote path here that ends a process, so the request has to prove who
+ * sent it: it is sealed by the phone's key, which must be the asking device's
+ * trusted key, and names the request, the task and its time inside the seal.
+ * A key alone is public and proves nothing. The phone names a task by id;
+ * which process group that is, and whether it may be signalled at all, is
+ * decided on this machine (`background-tasks-stop.ts`). The answer is a status
+ * in the clear: it says nothing about the task beyond whether it was stopped.
+ */
+export const handleBackgroundTaskStopRequest = (req: BackgroundTaskStopRequest, send: (data: Record<string, unknown>) => void): boolean => {
+    if (req.subtype !== 'agent.task.stop.request') return false;
+    if (typeof req.requestId !== 'string' || !req.requestId || req.requestId.length > MAX_REQUEST_ID_LENGTH) return false;
+    if (typeof req.sessionName !== 'string' || !req.sessionName || req.sessionName.length > MAX_REQUEST_ID_LENGTH) return false;
+    if (req.targetDeviceId !== computeListenerDeviceId()) return false;
+    const { requestId, sessionName } = req;
+
+    const frame = {
+        subtype: 'agent.task.stop.result',
+        requestId,
+        sessionName,
+        ...(typeof req.deviceId === 'string' && req.deviceId ? { targetDeviceId: req.deviceId } : {}),
+        at: new Date().toISOString(),
+    };
+    const reply = (fields: { error: BackgroundTaskStopError } | { result: StopOutcome }): void => { send({ ...frame, ...fields }); };
+
+    const asker = typeof req.deviceId === 'string' && /^[\w-]{1,64}$/.test(req.deviceId) ? req.deviceId : '';
+    if (!checkRateLimit(`tasks:stop:${asker}`)) {
+        reply({ error: 'rate_limited' });
+        return true;
+    }
+    if (!asksForSeal(req)) {
+        reply({ error: 'e2ee_required' });
+        return true;
+    }
+    const sealedRequest = req.encrypted;
+    if (!isSealedV2(sealedRequest)) {
+        reply({ error: 'bad_request' });
+        return true;
+    }
+
+    const answer = async (phoneKey: string): Promise<{ error: BackgroundTaskStopError } | { result: StopOutcome }> => {
+        let asked: { v?: unknown; requestId?: unknown; taskId?: unknown; at?: unknown } | null;
+        try {
+            // Untrusted until the checks below: every field is `unknown`.
+            asked = JSON.parse(await openV2('agent.task.stop', sealedRequest, phoneKey, sessionName)) as typeof asked;
+        } catch {
+            return { error: 'bad_request' };
+        }
+        if (typeof asked !== 'object' || asked === null || asked.v !== 1 || asked.requestId !== requestId) return { error: 'bad_request' };
+        if (typeof asked.taskId !== 'string' || !TASK_ID_PATTERN.test(asked.taskId)) return { error: 'bad_request' };
+        const now = Date.now();
+        const at = typeof asked.at === 'string' ? Date.parse(asked.at) : Number.NaN;
+        if (!Number.isFinite(at) || Math.abs(now - at) > STOP_CLOCK_SKEW_MS) return { error: 'bad_request' };
+        // A relay that kept a sealed stop can hand it back; the seal names the request, so the second one is refused.
+        if (!firstStop(`${phoneKey}\n${requestId}`, now)) return { error: 'bad_request' };
+        const { taskId } = asked;
+        const running = backgroundTasksFor(sessionName);
+        const task = running?.tasks.find((t) => t.id === taskId);
+        if (!task || running?.panePid == null) return { result: 'not_found' };
+        const result = await stopBackgroundTask(task, running.panePid);
+        log(`⧉ tasks ${sessionName}: stop ${taskId} → ${result}`);
+        return { result };
+    };
+
+    whenSealAdmitted(
+        req,
+        (phoneKey) => {
+            answer(phoneKey)
+                .then(reply)
+                .catch((err) => {
+                    log(`⧉ tasks ${sessionName}: stop failed (${err instanceof Error ? err.message : err})`);
+                    reply({ result: 'kill_failed' });
+                });
+        },
+        (reason) => { reply({ error: reason }); },
+    );
+    return true;
+};
+
+// ─── Background commands: the phone reads the end of one's output ──
+
+export interface BackgroundTaskOutputRequest {
+    subtype?: string;
+    targetDeviceId?: string;
+    sessionName?: string;
+    requestId?: string;
+    /** Which task, by the id the list gave. Never a path: the path is the one the transcript gave. */
+    taskId?: unknown;
+    subscriberPublicKey?: string;
+    deviceId?: string;
+}
+
+type BackgroundTaskOutputError = RefusalCode | 'rate_limited' | 'bad_request' | 'not_found' | 'path_refused' | 'read_failed' | 'encrypt_failed';
+
+/**
+ * Answer a phone's request for the end of a background command's output
+ * (`readTaskOutputTail`: the last 16 KB of the file the transcript named, if
+ * it is that task's `tasks/<id>.output`). A log can hold anything a command
+ * printed, so the answer is sealed for a key that checked out and bound to
+ * the session, the request and the task — never in the clear.
+ */
+export const handleBackgroundTaskOutputRequest = (req: BackgroundTaskOutputRequest, send: (data: Record<string, unknown>) => void): boolean => {
+    if (req.subtype !== 'agent.task.output.request') return false;
+    if (typeof req.requestId !== 'string' || !req.requestId || req.requestId.length > MAX_REQUEST_ID_LENGTH) return false;
+    if (typeof req.sessionName !== 'string' || !req.sessionName || req.sessionName.length > MAX_REQUEST_ID_LENGTH) return false;
+    if (req.targetDeviceId !== computeListenerDeviceId()) return false;
+    const { requestId, sessionName } = req;
+
+    const frame = {
+        subtype: 'agent.task.output.result',
+        requestId,
+        sessionName,
+        ...(typeof req.deviceId === 'string' && req.deviceId ? { targetDeviceId: req.deviceId } : {}),
+        at: new Date().toISOString(),
+    };
+    const reply = (fields: { error: BackgroundTaskOutputError } | { encrypted: SealedV2 }): void => { send({ ...frame, ...fields }); };
+
+    const asker = typeof req.deviceId === 'string' && /^[\w-]{1,64}$/.test(req.deviceId) ? req.deviceId : '';
+    if (!checkRateLimit(`tasks:output:${asker}`)) {
+        reply({ error: 'rate_limited' });
+        return true;
+    }
+    if (!asksForSeal(req)) {
+        reply({ error: 'e2ee_required' });
+        return true;
+    }
+    const { taskId } = req;
+    if (typeof taskId !== 'string' || !TASK_ID_PATTERN.test(taskId)) {
+        reply({ error: 'bad_request' });
+        return true;
+    }
+
+    whenSealAdmitted(
+        req,
+        (phoneKey) => {
+            const task = backgroundTasksFor(sessionName)?.tasks.find((t) => t.id === taskId);
+            if (!task) return reply({ error: 'not_found' });
+            const answer = async (): Promise<{ error: BackgroundTaskOutputError } | { encrypted: SealedV2 }> => {
+                const tail = await readTaskOutputTail(task);
+                if ('error' in tail) return { error: tail.error };
+                const body = fitTaskOutputBody({ requestId, at: frame.at, taskId }, tail, SEALED_FRAME_MAX_BYTES);
+                try {
+                    await initDeviceCrypto();
+                    return { encrypted: await sealV2('agent.task.output', body, phoneKey, sessionName) };
+                } catch (err) {
+                    // A seal that fails is an error, never the output in the clear.
+                    log(`⧉ tasks ${sessionName}: output seal failed (${err instanceof Error ? err.message : err})`);
+                    return { error: 'encrypt_failed' };
+                }
+            };
+            answer().then(reply, (err: unknown) => {
+                log(`⧉ tasks ${sessionName}: output read failed (${err instanceof Error ? err.message : err})`);
+                reply({ error: 'read_failed' });
+            });
+        },
+        (reason) => { reply({ error: reason }); },
+    );
     return true;
 };
 
@@ -4412,6 +4696,10 @@ export interface CollectResult {
      *  name → the transcript it writes and the agent kind whose projector reads
      *  it. Only sessions this machine can actually read; no subagent rows. */
     recordable: Record<string, RecordableSession>;
+    /** Also local: Claude session name → its running background commands and
+     *  pane pid. Built on whichever thread sweeps; the main thread, which
+     *  answers the phone's requests, stores it (`recordBackgroundTasks`). */
+    backgroundTasks: Record<string, SessionBackgroundTasks>;
 }
 
 /**
@@ -4421,6 +4709,8 @@ export interface CollectResult {
  * viewer nothing but a re-render.
  */
 const subagentScans = new Map<string, SubagentScanState>();
+/** Per Claude session: what its transcript says is running in the background. */
+const backgroundTaskStates = new Map<string, BackgroundTaskState>();
 
 /**
  * Inventory pass that also records *why* each `hwip-*` session was
@@ -4449,7 +4739,7 @@ export const collectSessionsVerbose = (): CollectResult => {
         // Invalidate so the next cycle re-runs full discovery instead of
         // wedging the listener at "reported 0 session(s)" forever.
         invalidateTmuxSocketCache();
-        return { sessions: [], rejected: [], targets: {}, subagentTranscripts: {}, recordable: {} };
+        return { sessions: [], rejected: [], targets: {}, subagentTranscripts: {}, recordable: {}, backgroundTasks: {} };
     }
 
     const rawLines = (list.stdout ?? '').split('\n').filter(Boolean);
@@ -4513,6 +4803,7 @@ export const collectSessionsVerbose = (): CollectResult => {
     const resumeIdOf = new Map<string, string>();
     const targets: Record<string, string> = {};
     const subagentTranscripts: Record<string, string> = {};
+    const backgroundTasks: Record<string, SessionBackgroundTasks> = {};
     const recordable: Record<string, RecordableSession> = {};
     for (const [name, group] of groups) {
         // Main pane = the lowest (window, pane) index that runs an agent.
@@ -4582,7 +4873,7 @@ export const collectSessionsVerbose = (): CollectResult => {
             : null;
         if (resumeId) resumeIdOf.set(name, resumeId);
         targets[name] = main.row.paneId;
-        sessions.push({
+        const mainSession: AgentSession = {
             name,
             attached: group.attached,
             agentKind: main.agent.kind,
@@ -4596,7 +4887,8 @@ export const collectSessionsVerbose = (): CollectResult => {
             runId: runIdOfEpoch(group.created),
             lastActivityAt: epochToIso(group.activity),
             ...deriveSessionState(name, main.agent.kind, capturePaneText(name, main.row.paneId)),
-        });
+        };
+        sessions.push(mainSession);
         // Subagent panes: every OTHER pane of this session whose tty's
         // foreground process group runs a registered agent (measured:
         // pane_current_command alone says `bash` for a pi subagent — the
@@ -4657,6 +4949,13 @@ export const collectSessionsVerbose = (): CollectResult => {
         }
         const transcriptPath = main.agent.kind === 'claude' ? mainTranscript : null;
         if (transcriptPath) {
+            // Background commands (`Bash` with run_in_background): the phone
+            // shows how many, and asks for the rows themselves sealed.
+            const tracked = backgroundTaskStates.get(name) ?? initialBackgroundTaskState();
+            backgroundTaskStates.set(name, tracked);
+            const tasks = trackBackgroundTasks(transcriptPath, tracked);
+            if (tasks.length > 0) backgroundTasks[name] = { tasks, panePid: info.panePid ?? null };
+            if (tasks.length > 0) mainSession.backgroundTaskCount = tasks.length;
             const scan = subagentScans.get(name) ?? initialSubagentScanState();
             subagentScans.set(name, scan);
             const reserved = new Set(extras.map(paneNum));
@@ -4697,6 +4996,7 @@ export const collectSessionsVerbose = (): CollectResult => {
         }
     }
     pruneToLive(subagentScans, new Set(groups.keys()));
+    pruneToLive(backgroundTaskStates, new Set(groups.keys()));
     pruneToLive(sessionStates, new Set(sessions.map((s) => s.name)));
     // An id two panes both answer to belongs to at most one of them, and the
     // sweep cannot tell which — opencode names the busiest session in the
@@ -4736,7 +5036,7 @@ export const collectSessionsVerbose = (): CollectResult => {
             providerSessionNameSource: s.providerSessionNameSource,
         })),
     );
-    return { sessions, rejected, targets, subagentTranscripts, recordable };
+    return { sessions, rejected, targets, subagentTranscripts, recordable, backgroundTasks };
 };
 
 /**
@@ -4756,6 +5056,7 @@ const collectSessions = (): AgentSession[] => {
     // back to the (focus-following) bare session name.
     recordTargets(result.targets);
     recordSubagentTranscripts(result.subagentTranscripts);
+    recordBackgroundTasks(result.backgroundTasks);
     return result.sessions;
 };
 
@@ -6343,11 +6644,12 @@ export const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
             }
         };
         const publishSessions = (inventory: CollectResult, sessions: AgentSession[]): void => {
-            const { rejected, targets, subagentTranscripts, recordable } = inventory;
+            const { rejected, targets, subagentTranscripts, recordable, backgroundTasks } = inventory;
             recordInventory(sessions);
             worktreeCleanup.observe(sessions.map((s) => s.name));
             recordTargets(targets);
             recordSubagentTranscripts(subagentTranscripts);
+            recordBackgroundTasks(backgroundTasks);
             turnRecorder?.observe(recordable);
             // Let the user's own status bar say what the phone says. Change-gated
             // internally, so an unchanged sweep spawns nothing.
@@ -6570,6 +6872,10 @@ export const streamSession = (wsUrl: string, apiKey: string): StreamHandle => {
                     && !handleFileBlobRequest(m.data as DiffRequest, sendEphemeral)
                     // Reading the schedules: files this machine wrote itself, sealed for the asker.
                     && !handleScheduleListRequest(m.data as ScheduleListRequest, sendEphemeral)
+                    // A session's background commands: what Claude said they are, sealed for the asker.
+                    && !handleBackgroundTasksRequest(m.data as BackgroundTasksRequest, sendEphemeral)
+                    && !handleBackgroundTaskStopRequest(m.data as BackgroundTaskStopRequest, sendEphemeral)
+                    && !handleBackgroundTaskOutputRequest(m.data as BackgroundTaskOutputRequest, sendEphemeral)
                 ) {
                     void handleScreenRequest(m.data as ScreenRequest)
                         .then((reply) => { if (reply) sendEphemeral(reply); })

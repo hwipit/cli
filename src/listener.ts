@@ -2028,23 +2028,23 @@ export const handleBackgroundTaskOutputRequest = (req: BackgroundTaskOutputReque
         (phoneKey) => {
             const task = backgroundTasksFor(sessionName)?.tasks.find((t) => t.id === taskId);
             if (!task) return reply({ error: 'not_found' });
-            readTaskOutputTail(task)
-                .then(async (tail) => {
-                    if ('error' in tail) return reply({ error: tail.error });
-                    const body = fitTaskOutputBody({ requestId, at: frame.at, taskId }, tail, SEALED_FRAME_MAX_BYTES);
-                    try {
-                        await initDeviceCrypto();
-                        return reply({ encrypted: await sealV2('agent.task.output', body, phoneKey, sessionName) });
-                    } catch (err) {
-                        // A seal that fails is an error, never the output in the clear.
-                        log(`⧉ tasks ${sessionName}: output seal failed (${err instanceof Error ? err.message : err})`);
-                        return reply({ error: 'encrypt_failed' });
-                    }
-                })
-                .catch((err) => {
-                    log(`⧉ tasks ${sessionName}: output read failed (${err instanceof Error ? err.message : err})`);
-                    reply({ error: 'read_failed' });
-                });
+            const answer = async (): Promise<{ error: BackgroundTaskOutputError } | { encrypted: SealedV2 }> => {
+                const tail = await readTaskOutputTail(task);
+                if ('error' in tail) return { error: tail.error };
+                const body = fitTaskOutputBody({ requestId, at: frame.at, taskId }, tail, SEALED_FRAME_MAX_BYTES);
+                try {
+                    await initDeviceCrypto();
+                    return { encrypted: await sealV2('agent.task.output', body, phoneKey, sessionName) };
+                } catch (err) {
+                    // A seal that fails is an error, never the output in the clear.
+                    log(`⧉ tasks ${sessionName}: output seal failed (${err instanceof Error ? err.message : err})`);
+                    return { error: 'encrypt_failed' };
+                }
+            };
+            answer().then(reply, (err: unknown) => {
+                log(`⧉ tasks ${sessionName}: output read failed (${err instanceof Error ? err.message : err})`);
+                reply({ error: 'read_failed' });
+            });
         },
         (reason) => { reply({ error: reason }); },
     );

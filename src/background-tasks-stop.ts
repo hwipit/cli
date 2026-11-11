@@ -13,10 +13,7 @@
  * So the target is the one process group whose leader writes the output and
  * descends from the session's pane. Anything less certain signals nothing.
  */
-import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
-
-import type { BackgroundTask } from './background-tasks.js';
+import { lsofBin, runProbe, type BackgroundTask } from './background-tasks.js';
 import { parseProcTable, type ProcTable } from './remote-agents.js';
 
 /** What a stop found. Only `group` is ever signalled. */
@@ -41,31 +38,18 @@ export interface StopProbes {
 
 /** Deepest ancestor chain walked from a group leader up to the pane. */
 const MAX_ANCESTRY = 64;
-const PROBE_TIMEOUT_MS = 3_000;
-const PS_MAX_BUFFER = 16 * 1024 * 1024;
-const LSOF_CANDIDATES = ['/usr/sbin/lsof', '/usr/bin/lsof'];
-
-const run = (bin: string, args: string[], okCodes: readonly number[]): Promise<string | null> =>
-    new Promise((resolve) => {
-        execFile(bin, args, { encoding: 'utf8', timeout: PROBE_TIMEOUT_MS, maxBuffer: PS_MAX_BUFFER, env: { ...process.env, LC_ALL: 'C' } },
-            (err, stdout) => {
-                const code = (err as { code?: unknown } | null)?.code;
-                resolve(!err || (typeof code === 'number' && okCodes.includes(code)) ? stdout : null);
-            });
-    });
 
 /** `lsof -t -- <path>`: one pid per line. Exit 1 is "open nowhere", still an answer. */
 const lsofPids = async (path: string): Promise<readonly number[] | null> => {
-    const bin = LSOF_CANDIDATES.find((candidate) => existsSync(candidate));
+    const bin = lsofBin();
     if (!bin) return null;
-    const out = await run(bin, ['-t', '--', path], [1]);
+    const out = await runProbe(bin, ['-t', '--', path], [1]);
     if (out === null) return null;
     return out.split('\n').map(Number).filter((pid) => Number.isInteger(pid) && pid > 0);
 };
 
-/** The process table without blocking the main thread, which serves the socket. */
 const psTable = async (): Promise<ProcTable | null> => {
-    const out = await run('ps', ['-axo', 'pid=,ppid=,pgid=,tpgid=,comm='], []);
+    const out = await runProbe('ps', ['-axo', 'pid=,ppid=,pgid=,tpgid=,comm='], []);
     return out === null ? null : parseProcTable(out);
 };
 

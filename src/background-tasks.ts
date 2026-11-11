@@ -156,6 +156,26 @@ const realPathOrSelf = (p: string): string => {
 };
 
 const LSOF_CANDIDATES = ['/usr/sbin/lsof', '/usr/bin/lsof'];
+const PROBE_TIMEOUT_MS = 3_000;
+const PROBE_MAX_BUFFER = 16 * 1024 * 1024;
+
+/** The lsof binary, or null when this machine has none. */
+export const lsofBin = (): string | null => LSOF_CANDIDATES.find((candidate) => existsSync(candidate)) ?? null;
+
+/**
+ * Run a probe (`lsof`, `ps`) without blocking the main thread, which serves
+ * the socket (inventory-offload.ts). Its stdout, or null on a spawn failure,
+ * a timeout or an exit status outside `okCodes` — lsof's exit 1 ("open
+ * nowhere") is still an answer.
+ */
+export const runProbe = (bin: string, args: string[], okCodes: readonly number[]): Promise<string | null> =>
+    new Promise((resolve) => {
+        execFile(bin, args, { encoding: 'utf8', timeout: PROBE_TIMEOUT_MS, maxBuffer: PROBE_MAX_BUFFER, env: { ...process.env, LC_ALL: 'C' } },
+            (err, stdout) => {
+                const code = (err as { code?: unknown } | null)?.code;
+                resolve(!err || (typeof code === 'number' && okCodes.includes(code)) ? stdout : null);
+            });
+    });
 
 /**
  * `lsof -F n -- <paths>`: one `n<name>` line per open file. lsof exits 1 when
@@ -163,9 +183,9 @@ const LSOF_CANDIDATES = ['/usr/sbin/lsof', '/usr/bin/lsof'];
  * rest; a spawn failure, a timeout or another status is no answer.
  */
 export const lsofWriters: WriterProbe = (paths) => {
-    const bin = LSOF_CANDIDATES.find((candidate) => existsSync(candidate));
+    const bin = lsofBin();
     if (!bin || paths.length === 0) return null;
-    const r = spawnSync(bin, ['-F', 'n', '--', ...paths], { encoding: 'utf8', timeout: LSOF_TIMEOUT_MS });
+    const r = spawnSync(bin, ['-F', 'n', '--', ...paths], { encoding: 'utf8', timeout: PROBE_TIMEOUT_MS });
     if (r.error || (r.status !== 0 && r.status !== 1)) return null;
     return openAmong(paths, r.stdout);
 };
@@ -173,23 +193,13 @@ export const lsofWriters: WriterProbe = (paths) => {
 /** An answer that resolves later: what the phone's requests use on the main thread. */
 export type AsyncWriterProbe = (paths: readonly string[]) => Promise<ReadonlySet<string> | null>;
 
-/**
- * `lsofWriters` without blocking: the main thread serves the socket, and a
- * synchronous spawn there delays frames and pongs (inventory-offload.ts).
- */
-export const lsofWritersAsync: AsyncWriterProbe = (paths) => {
-    const bin = LSOF_CANDIDATES.find((candidate) => existsSync(candidate));
-    if (!bin || paths.length === 0) return Promise.resolve(null);
-    return new Promise((resolve) => {
-        execFile(bin, ['-F', 'n', '--', ...paths], { encoding: 'utf8', timeout: LSOF_TIMEOUT_MS }, (err, stdout) => {
-            // Exit 1 is still an answer (one path open nowhere); a timeout, a spawn failure or another status is none.
-            const code = (err as { code?: unknown } | null)?.code;
-            resolve(!err || code === 1 ? openAmong(paths, stdout) : null);
-        });
-    });
+/** `lsofWriters` without blocking: a synchronous spawn on the main thread delays frames and pongs. */
+export const lsofWritersAsync: AsyncWriterProbe = async (paths) => {
+    const bin = lsofBin();
+    if (!bin || paths.length === 0) return null;
+    const out = await runProbe(bin, ['-F', 'n', '--', ...paths], [1]);
+    return out === null ? null : openAmong(paths, out);
 };
-
-const LSOF_TIMEOUT_MS = 3_000;
 
 /** Which of `paths` lsof's `-F n` output names. lsof names a file by its real path (/tmp is /private/tmp on macOS). */
 const openAmong = (paths: readonly string[], stdout: string): ReadonlySet<string> => {

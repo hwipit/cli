@@ -1876,7 +1876,9 @@ const STOP_CLOCK_SKEW_MS = 5 * 60_000;
  * Stop requests already acted on, by phone key and request id → when. Kept for
  * twice the skew: an envelope is taken while its own `at` is within the skew
  * of now, and a phone clock running ahead keeps it takeable past one window
- * from when it was acted on.
+ * from when it was acted on. In memory only: a listener restarted inside the
+ * window would take a replayed stop again, which can end only a command the
+ * session still runs, found again from this machine's own probes.
  */
 const actedStops = new Map<string, number>();
 const MAX_ACTED_STOPS = 512;

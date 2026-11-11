@@ -96,6 +96,23 @@ describe('trackBackgroundTasks', () => {
         }]);
     });
 
+    it('finds a command launched long before the listener first reads the transcript', () => {
+        // A first read that starts off the end would miss a dev server started a few hours of turns ago.
+        const filler = JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'x'.repeat(1000) }] } });
+        const file = transcript(launch(), started(), ...Array.from({ length: 600 }, () => filler));
+        const state = initialBackgroundTaskState();
+        let tasks = trackBackgroundTasks(file, state, { probe: everyoneWrites });
+        for (let tick = 0; tick < 5 && tasks.length === 0; tick++) tasks = trackBackgroundTasks(file, state, { probe: everyoneWrites });
+        expect(tasks.map((t) => t.id)).toEqual(['ba3nrpj41']);
+    });
+
+    it('drops a launch result whose structured id disagrees with its text', () => {
+        const odd = JSON.parse(started()) as { toolUseResult: { backgroundTaskId: string } };
+        odd.toolUseResult.backgroundTaskId = 'other1';
+        const file = transcript(launch(), JSON.stringify(odd));
+        expect(trackBackgroundTasks(file, initialBackgroundTaskState(), { probe: everyoneWrites })).toEqual([]);
+    });
+
     it('never carries the command itself — only the description', () => {
         const file = transcript(launch(), started());
         const tasks = trackBackgroundTasks(file, initialBackgroundTaskState(), { probe: everyoneWrites });

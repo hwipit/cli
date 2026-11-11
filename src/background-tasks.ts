@@ -127,6 +127,8 @@ const fold = (state: BackgroundTaskState, line: string): void => {
             const description = typeof input.description === 'string' && input.description.trim()
                 ? input.description.trim().slice(0, MAX_DESCRIPTION_CHARS)
                 : null;
+            // A launch whose result never comes is forgotten past the cap, like the running list.
+            if (state.launches.size >= MAX_BACKGROUND_TASKS) state.launches.delete(state.launches.keys().next().value!);
             state.launches.set(block.id, description);
         } else if (entry.type === 'user' && block?.type === 'tool_result' && typeof block.tool_use_id === 'string') {
             if (!state.launches.has(block.tool_use_id)) continue;
@@ -134,8 +136,10 @@ const fold = (state: BackgroundTaskState, line: string): void => {
             state.launches.delete(block.tool_use_id);
             const match = STARTED.exec(textOf(block.content) ?? '');
             if (!match) continue;
+            const id = match[1]!;
+            // The structured id, when there, must agree with the text: two answers to "which task" are no answer.
             const structured = entry.toolUseResult?.backgroundTaskId;
-            const id = typeof structured === 'string' && structured === match[1] ? structured : match[1]!;
+            if (structured !== undefined && structured !== id) continue;
             if (state.running.size >= MAX_BACKGROUND_TASKS) continue;
             state.running.set(id, {
                 id,
@@ -218,7 +222,9 @@ export const trackBackgroundTasks = (
     state: BackgroundTaskState,
     opts: { probe?: WriterProbe; now?: number } = {},
 ): BackgroundTask[] => {
-    const read = readTranscriptDelta(transcriptPath, state.tail);
+    // From the start: a command launched before the last 256 KB of turns is still running (a dev server), and a
+    // window off the end would never see its launch. A long transcript catches up one tick's read at a time.
+    const read = readTranscriptDelta(transcriptPath, state.tail, { fromStart: true });
     if (read) {
         state.tail = read.state;
         for (const line of read.lines) fold(state, line);

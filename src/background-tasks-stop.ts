@@ -29,7 +29,7 @@ export type StopTarget =
 export type StopOutcome = 'stopped' | 'not_found' | 'ambiguous' | 'refused' | 'kill_failed';
 
 export interface StopProbes {
-    /** Pids with the file open, or null when that cannot be told. */
+    /** Pids with the file open (lsof does not tell a reader from a writer), or null when that cannot be told. */
     readonly writerPids: (path: string) => Promise<readonly number[] | null>;
     readonly procTable: () => Promise<ProcTable | null>;
     /** This listener's pid, whose group is never signalled. */

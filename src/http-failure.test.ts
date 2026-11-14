@@ -1,9 +1,10 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createServer, type Server } from 'node:http';
 import { createServer as createTcpServer, type AddressInfo } from 'node:net';
+import { getGlobalDispatcher, setGlobalDispatcher, type Dispatcher } from 'undici';
 import { HwipHook } from './hwip-hook.js';
 import { AuthenticationError, HwipError } from './errors.js';
-import { httpFailureMessage, isConfigFailure, networkFailureMessage, neverConnected, useProxyFromEnv } from './http-failure.js';
+import { httpFailureMessage, isConfigFailure, networkFailureMessage, neverConnected, useHttp1Transport, useProxyFromEnv } from './http-failure.js';
 
 // C13: offline was "fetch failed", an outage page was "Unexpected token <",
 // and a rejected key said nothing about `hwip login`. Real fetch against a
@@ -283,5 +284,55 @@ describe('which failures are the configuration', () => {
         expect(isConfigFailure(new HwipError('could not reach host: the base URL is not a valid address', 'NETWORK_ERROR', 0))).toBe(true);
         expect(isConfigFailure(new HwipError('the device state is unknown', 'INTERNAL', 503))).toBe(false);
         expect(isConfigFailure(Object.assign(new Error('this hook belongs to another account'), { status: 500 }))).toBe(false);
+    });
+});
+
+// The listener wedged inside Node 26's HTTP/2 send loop. Whether a fetch can use HTTP/2 is
+// decided by the ALPN list in its TLS ClientHello: a bare TCP server reads that hello, and the
+// fetch then fails, which is fine.
+/** The protocol names in a ClientHello's ALPN extension (type 0x0010), in the order offered. */
+const alpnOffer = (hello: Buffer): string[] => {
+    for (let at = 0; at + 6 <= hello.length; at++) {
+        if (hello[at] !== 0x00 || hello[at + 1] !== 0x10) continue;
+        const listLength = hello.readUInt16BE(at + 4);
+        const end = at + 6 + listLength;
+        if (hello.readUInt16BE(at + 2) !== listLength + 2 || end > hello.length) continue;
+        const names: string[] = [];
+        let cursor = at + 6;
+        while (cursor < end) {
+            names.push(hello.toString('latin1', cursor + 1, cursor + 1 + hello[cursor]!));
+            cursor += 1 + hello[cursor]!;
+        }
+        if (cursor === end && names.length > 0) return names;
+    }
+    return [];
+};
+
+describe('useHttp1Transport', () => {
+    const nodeFetch = globalThis.fetch;
+    let dispatcher: Dispatcher;
+    let tcp: Server;
+    let hello: Promise<Buffer>;
+
+    beforeAll(async () => {
+        dispatcher = getGlobalDispatcher();
+        hello = new Promise((resolve) => {
+            tcp = createTcpServer((socket) => socket.once('data', (chunk: Buffer) => { resolve(chunk); socket.destroy(); }));
+        });
+        await new Promise<void>((resolve) => tcp.listen(0, '127.0.0.1', resolve));
+    });
+
+    afterAll(async () => {
+        globalThis.fetch = nodeFetch;
+        setGlobalDispatcher(dispatcher);
+        await new Promise<void>((resolve) => tcp.close(() => resolve()));
+    });
+
+    it('never offers HTTP/2', async () => {
+        await useProxyFromEnv({});
+        await useHttp1Transport();
+        const { port } = tcp.address() as AddressInfo;
+        await fetch(`https://localhost:${port}/`, { signal: AbortSignal.timeout(5_000) }).catch(() => undefined);
+        expect(alpnOffer(await hello)).toEqual(['http/1.1']);
     });
 });

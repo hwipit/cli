@@ -122,7 +122,7 @@ import { optionalFeatures } from './optional-features.js';
 import { createSubscriberTrust, type Admission, type RefusalCode, type SubscriberTrust } from './subscriber-trust.js';
 import { isTransferId } from './lan-auth.js';
 import { downloadsDir, resolveDownloadPath, safeFileName, sweepStaleParts } from './downloads.js';
-import { webSocketProxyOptions } from './http-failure.js';
+import { useHttp1Transport, webSocketProxyOptions } from './http-failure.js';
 import { notifyDesktop, type DesktopNotification } from './desktop-notify.js';
 import { createWorktreeCleanup } from './listener-worktree-cleanup.js';
 import { tmuxRun } from './worktree.js';
@@ -7226,6 +7226,8 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
             `Tail \`~/.hwip/listener.log\` to follow it, or kill ${otherPid} first.`);
         return 0;
     }
+
+    await useHttp1Transport();
 
     const settings = listenerSettings(args);
     if ('exit' in settings) {

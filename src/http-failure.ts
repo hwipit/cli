@@ -298,10 +298,11 @@ const configProxyValue = (key: keyof ProxyConfig, config: ProxyConfig): string |
  *
  * Not through Node's own `http.setGlobalProxyFromEnv`: it exists only from 24.14
  * and 25.4, and the CLI runs on older Nodes. `fetch` gets undici's
- * `EnvHttpProxyAgent` as the global dispatcher (undici 6, Node >= 18.17); `ws`
+ * `EnvHttpProxyAgent` as the global dispatcher (undici 6, Node >= 18.17 — Node 26's
+ * own fetch ignores it; the daemon swaps in undici's fetch, `useHttp1Transport`); `ws`
  * opens its own connection, so it gets a CONNECT-tunnelling agent from
- * `https-proxy-agent` (`webSocketProxyOptions`). Both libraries load only here,
- * so a run with no proxy pays nothing for them.
+ * `https-proxy-agent` (`webSocketProxyOptions`). Both libraries load only here
+ * (undici also in the daemon), so a command run with no proxy pays nothing for them.
  *
  * A proxy that cannot be set up is an error, not a direct connection: going
  * around a proxy someone configured is the wrong way to fail. The error names
@@ -358,6 +359,21 @@ export const useProxyFromEnv = async (env: ProxyEnv = process.env, config: Proxy
             return agent;
         },
     };
+};
+
+/**
+ * Pin the daemon's `fetch` to HTTP/1.1: an aborted HTTP/2 upload on Node 26 wedged the
+ * event loop in nghttp2's send loop (one shared session); HTTP/1.1 gives each request its
+ * own socket. Node 26's fetch (undici 8) reads `undici.globalDispatcher.2`, undici 6 writes
+ * `.1`, and an undici 6 dispatcher handed to Node 26's fetch fails "invalid onError method"
+ * — so the fetch is swapped for undici 6's own, which also makes `useProxyFromEnv`'s proxy
+ * agent apply again. Daemon only (`cli-lazy-load.test.ts`); call after `useProxyFromEnv`.
+ */
+export const useHttp1Transport = async (): Promise<void> => {
+    const undici = await import('undici');
+    // With a proxy, its agent is already the dispatcher (HTTP/1.1, undici 6's default).
+    if (!active) undici.setGlobalDispatcher(new undici.Agent({ allowH2: false }));
+    globalThis.fetch = undici.fetch as unknown as typeof fetch;
 };
 
 /**

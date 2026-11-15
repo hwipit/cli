@@ -721,7 +721,8 @@ going is refused (`still_running`).
 
 When a session waits for your approval, the listener also sends what it is waiting
 for — the tool, the command or the diff, and the answers — so the app can show it
-and answer. That covers Claude Code (a Bash command, a file edit or a new file),
+and answer. That covers Claude Code (a Bash command, a file edit, a new file or another tool's
+generic "Tool use" approval),
 Gemini CLI (its tool approvals), OpenCode (its permission request; the listener reads
 the screen with its colours, since only a colour marks the chosen button), pi
 approval extensions that ask through `ctx.ui.select` and Codex (a shell command or a file edit; the app answers with

@@ -60,6 +60,22 @@ describe('parseBlockedDialog — captured dialogs', () => {
         expect(p.question).toBe('Do you want to make this edit to notes.txt?');
     });
 
+    it('reads the generic Tool use dialog: the bars before the description and the note are dropped', () => {
+        // Transcribed from a screenshot of Claude Code's EnterWorktree approval, paths anonymised.
+        const p = parseBlockedDialog(pane('claude-blocked-tool-use.txt'), 'claude')!;
+        expect(p).toMatchObject({
+            title: 'Tool use',
+            subtitle: 'Creates an isolated worktree (via git or configured hooks) and switches the session into it',
+            detail: ['Entering worktree(/Users/dev/demo-wt-feat)'],
+            note: 'permission-root relocation to "/Users/dev/demo-wt-feat" — a model-supplied worktree outside .claude/worktrees/',
+            question: 'Do you want to proceed?',
+        });
+        expect(p.options).toEqual([
+            { n: 1, label: 'Yes', keys: ['enter'] },
+            { n: 2, label: 'No', keys: ['down', 'enter'] },
+        ]);
+    });
+
     it('yields nothing for the dialogs it has no layout for', () => {
         expect(parseBlockedDialog(pane('claude-blocked-trust-dialog.txt'), 'claude')).toBeUndefined();
         expect(parseBlockedDialog(pane('claude-idle.txt'), 'claude')).toBeUndefined();
@@ -100,7 +116,7 @@ describe('parseBlockedDialog — shape', () => {
     });
 
     it('reads a title only from the known list', () => {
-        expect(KNOWN_TITLES).toEqual(['Bash command', 'Edit file', 'Create file']);
+        expect(KNOWN_TITLES).toEqual(['Bash command', 'Edit file', 'Create file', 'Tool use']);
         expect(parseBlockedDialog(bashDialog(['ls']).replace('Bash command', 'Fetch'), 'claude')).toBeUndefined();
     });
 

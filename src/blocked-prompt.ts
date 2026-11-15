@@ -29,8 +29,8 @@
  *
  *      Esc to cancel · Tab to amend  footer
  *
- * Only the titles in `KNOWN_TITLES` are read. Another dialog (a plan, a
- * question to the user, an MCP tool) has no captured layout, so it yields
+ * Only the titles in `KNOWN_TITLES` are read; `Tool use` (any other tool, MCP
+ * ones included) has the same layout. Another dialog has no captured layout, so it yields
  * nothing and the session keeps reporting the bare `blocked` state.
  *
  * Gemini CLI layout (v0.46.0, `blocked-prompt-gemini.test.ts`): one rounded box,
@@ -55,8 +55,9 @@ import { createHash } from 'node:crypto';
 import { parseClaudePlan, parseClaudeQuestion } from './blocked-prompt-claude-dialogs.js';
 import type { AgentKind } from './remote-agents.js';
 
-/** Dialog titles whose layout was captured and is read. */
-export const KNOWN_TITLES: readonly string[] = ['Bash command', 'Edit file', 'Create file'];
+/** Dialog titles whose layout was captured and is read. `Tool use` is the generic approval for any other tool (an MCP
+ * tool, EnterWorktree): its description and note are drawn behind a `│` bar. */
+export const KNOWN_TITLES: readonly string[] = ['Bash command', 'Edit file', 'Create file', 'Tool use'];
 
 export const MAX_DETAIL_LINES = 12;
 export const MAX_DETAIL_LINE_CHARS = 300;
@@ -162,12 +163,14 @@ const parseClaudeDialog = (pane: string): ParsedPrompt | undefined => {
     if (!title || !KNOWN_TITLES.includes(title)) return undefined;
     const body = head.slice(head.findIndex((l) => l.trim() !== '') + 1);
     const firstDash = body.findIndex((l) => DASHED_RULE.test(l));
-    const before = (firstDash < 0 ? body : body.slice(0, firstDash)).map((l) => l.trim()).filter(Boolean);
+    // `Tool use` draws its description and note behind a `│` bar; the bar is not part of the words.
+    const words = (l: string): string => l.trim().replace(/^│\s*/, '');
+    const before = (firstDash < 0 ? body : body.slice(0, firstDash)).map(words).filter(Boolean);
     const rest = firstDash < 0 ? [] : body.slice(firstDash + 1);
     const secondDash = rest.findIndex((l) => DASHED_RULE.test(l));
     const detailLines = (secondDash < 0 ? rest : rest.slice(0, secondDash)).map((l) => l.replace(/^ /, ''));
     while (detailLines.length > 0 && detailLines[detailLines.length - 1]!.trim() === '') detailLines.pop();
-    const after = secondDash < 0 ? [] : rest.slice(secondDash + 1).map((l) => l.trim()).filter(Boolean);
+    const after = secondDash < 0 ? [] : rest.slice(secondDash + 1).map(words).filter(Boolean);
 
     return assemble({
         region,

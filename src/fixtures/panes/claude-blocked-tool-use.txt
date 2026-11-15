@@ -1,0 +1,18 @@
+  ⎿  Allowed by auto mode
+
+⏺ Entering worktree(/Users/dev/demo-wt-feat)
+
+────────────────────────────────────────────────────────────
+ Tool use
+ │ Creates an isolated worktree (via git or configured hooks) and switches the session into it
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Entering worktree(/Users/dev/demo-wt-feat)
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ permission-root relocation to "/Users/dev/demo-wt-feat" — a
+ │ model-supplied worktree outside .claude/worktrees/
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend

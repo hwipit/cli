@@ -27,6 +27,7 @@ const deps = (over: Partial<ResumeHintDeps> = {}): ResumeHintDeps => ({
     recall: () => run(),
     alive: () => false,
     cwd: '/work/gikae',
+    inTmux: false,
     ...over,
 });
 
@@ -50,9 +51,25 @@ describe('resumeHint', () => {
         expect(line).toBe('hwip: to resume: opencode --session ses_1  (or hwip opencode --session ses_1)');
     });
 
-    // `tmux new` returns on a detach too, and the session is still running then.
-    it('says nothing when the session was only detached', () => {
-        expect(resumeHint('hwip-gikae', claude, LAUNCHED, deps({ alive: () => true }))).toBeNull();
+    // `tmux new` returns on a detach too, and the session is still running then:
+    // a bare prompt reads as a dead session, and a `--resume` would start a second copy.
+    it('names the reattach command when the session was only detached', () => {
+        expect(resumeHint('hwip-gikae', claude, LAUNCHED, deps({ alive: () => true }))).toBe(
+            'hwip: hwip-gikae still running — reattach: tmux attach -t hwip-gikae\n' +
+            'hwip: do not run claude --resume 36b1ab9f-ec6a-4234-81be-895606a059ba while it runs' +
+            ' — that starts a second copy of the same conversation',
+        );
+    });
+
+    it('switches the client instead when the shell is itself inside tmux', () => {
+        const line = resumeHint('hwip-gikae', claude, LAUNCHED, deps({ alive: () => true, inTmux: true }));
+        expect(line).toMatch(/^hwip: hwip-gikae still running — reattach: tmux switch-client -t hwip-gikae\n/);
+    });
+
+    it('names only the reattach command when no conversation id is known', () => {
+        expect(resumeHint('hwip-gikae', claude, LAUNCHED, deps({ alive: () => true, recall: () => null }))).toBe(
+            'hwip: hwip-gikae still running — reattach: tmux attach -t hwip-gikae',
+        );
     });
 
     // A record no sweep has touched since the launch is an earlier run under the same name.

@@ -1,8 +1,8 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { copyFileSync, existsSync, linkSync, mkdirSync, openSync, rmdirSync, rmSync, readFileSync, statSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, linkSync, openSync, rmdirSync, rmSync, readFileSync, statSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
-import { ensurePrivateDir, ensurePrivateFile, handBackToSudoUser } from './private-files.js';
+import { ensurePrivateDir, ensurePrivateFile, handBackToSudoUser, mkdirExclusiveHandedBack } from './private-files.js';
 
 /**
  * Process-level facts about the resident `hwip listener` daemon: where its
@@ -91,7 +91,6 @@ export const claimListenerRuntime = (
     wsUrl?: string,
     commandOf: (pid: number) => PidCommand = commandOfPid,
 ): ListenerClaim => {
-    ensurePrivateDir(HWIP_DIR);
     return withClaimLock(() => claimLocked(version, wsUrl, commandOf));
 };
 
@@ -111,7 +110,7 @@ const withClaimLock = <T>(fn: () => T): T => {
     const giveUpAt = Date.now() + 3_000;
     for (;;) {
         try {
-            mkdirSync(lock, { mode: 0o700 });
+            mkdirExclusiveHandedBack(lock);
             break;
         } catch (err) {
             if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;

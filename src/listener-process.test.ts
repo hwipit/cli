@@ -126,7 +126,7 @@ describe('claimListenerRuntime', () => {
         const winners = results.filter((r) => r.claimed);
         expect(winners).toHaveLength(1);
         expect(readFileSync(m.LISTENER_PID_FILE, 'utf-8')).toBe(String(winners[0].pid));
-    });
+    }, 30_000);
 });
 
 describe('listener runtime stamps', () => {

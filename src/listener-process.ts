@@ -1,5 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { copyFileSync, existsSync, openSync, readFileSync, statSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, linkSync, openSync, readFileSync, statSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { ensurePrivateDir, ensurePrivateFile, handBackToSudoUser } from './private-files.js';
@@ -79,8 +79,8 @@ export const writeListenerRuntime = (version: string, wsUrl?: string): void => {
 export type ListenerClaim = { readonly claimed: true } | { readonly claimed: false; readonly pid: number };
 
 /**
- * Claim the singleton slot atomically: the pid file is created with O_EXCL (`wx`), so of two
- * daemons starting together exactly one creates it. The loser reads the pid on record: a live
+ * Claim the singleton slot atomically: the pid file is created by `link` (fails if it exists, as O_EXCL
+ * does), so of two daemons starting together exactly one creates it. The loser reads the pid on record: a live
  * hwip listener keeps the slot (`claimed: false`); a dead or foreign pid is a stale stamp, which
  * is removed before the next try — two losers clearing the same stale file still leave one winner,
  * because only `wx` can create it again.
@@ -91,25 +91,58 @@ export const claimListenerRuntime = (
     commandOf: (pid: number) => PidCommand = commandOfPid,
 ): ListenerClaim => {
     ensurePrivateDir(HWIP_DIR);
-    for (let attempt = 0; attempt < 5; attempt++) {
-        try {
-            writeFileSync(LISTENER_PID_FILE, String(process.pid), { flag: 'wx', mode: 0o600 });
-        } catch (err) {
-            if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-            const holder = otherListenerPid(process.pid, commandOf);
-            if (holder !== null) return { claimed: false, pid: holder };
-            // Our own pid (a restart in place) or a stale file: replace it.
+    // The pid is written to a private temp file and linked into place: link fails when the pid file exists
+    // (the same guarantee as O_EXCL), and a pid file anyone can see is never empty.
+    const staging = `${LISTENER_PID_FILE}.${process.pid}.tmp`;
+    writeFileSync(staging, String(process.pid), { mode: 0o600 });
+    try {
+        for (let attempt = 0; attempt < 5; attempt++) {
             try {
-                unlinkSync(LISTENER_PID_FILE);
-            } catch { /* a rival removed it first: try to create it again */ }
-            continue;
+                linkSync(staging, LISTENER_PID_FILE);
+            } catch (err) {
+                if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+                let recorded: string;
+                try {
+                    recorded = readFileSync(LISTENER_PID_FILE, 'utf-8');
+                } catch {
+                    continue; // removed since the link failed: try to create it again
+                }
+                const holder = liveListenerOf(recorded, commandOf);
+                if (holder !== null) return { claimed: false, pid: holder };
+                // Our own pid (a restart in place) or a stale file: replace it — but only the file that was read,
+                // so a rival's fresh claim is not removed in passing.
+                try {
+                    if (readFileSync(LISTENER_PID_FILE, 'utf-8') === recorded) unlinkSync(LISTENER_PID_FILE);
+                } catch { /* a rival removed it first */ }
+                continue;
+            }
+            return stampClaim(version, wsUrl);
         }
-        writeFileSync(LISTENER_VERSION_FILE, version);
-        if (wsUrl) writeFileSync(LISTENER_WS_URL_FILE, wsUrl);
-        for (const file of [LISTENER_PID_FILE, LISTENER_VERSION_FILE, ...(wsUrl ? [LISTENER_WS_URL_FILE] : [])]) handBackToSudoUser(file);
-        return { claimed: true };
+    } finally {
+        try {
+            unlinkSync(staging);
+        } catch { /* best-effort */ }
     }
     throw new Error(`could not claim ${LISTENER_PID_FILE}`);
+};
+
+/** The live hwip listener a pid file's text names, other than this process; null when the file is stale. */
+const liveListenerOf = (recorded: string, commandOf: (pid: number) => PidCommand): number | null => {
+    const pid = Number(recorded.trim());
+    if (!Number.isFinite(pid) || pid <= 0 || pid === process.pid) return null;
+    try {
+        process.kill(pid, 0);
+    } catch {
+        return null;
+    }
+    return isListenerPid(pid, commandOf) ? pid : null;
+};
+
+const stampClaim = (version: string, wsUrl: string | undefined): ListenerClaim => {
+    writeFileSync(LISTENER_VERSION_FILE, version);
+    if (wsUrl) writeFileSync(LISTENER_WS_URL_FILE, wsUrl);
+    for (const file of [LISTENER_PID_FILE, LISTENER_VERSION_FILE, ...(wsUrl ? [LISTENER_WS_URL_FILE] : [])]) handBackToSudoUser(file);
+    return { claimed: true };
 };
 
 /** The socket the running daemon connected to, or null when it is unknown. */

@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { existsSync, mkdtempSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { answerFileBound, downloadAttachments, downloadSealedEach, saveFileFromS3, type SaveFileDeps } from './listener.js';
@@ -285,6 +285,17 @@ describe('the download address the API names', () => {
         expect(paths).toHaveLength(2);
         expect(new Set(paths).size).toBe(1);
         expect(readdirSync(dirname(paths[0]))).toEqual(['a.txt']);
+    });
+
+    it('returns no path for a file that could not be written, nor for its repeat', async () => {
+        const fetchFn: typeof fetch = async (input) => String(input).startsWith(API)
+            ? new Response(JSON.stringify({ data: { downloadUrl: PRESIGNED } }))
+            : new Response('bytes');
+        const ctx = { apiKey: 'k', baseUrl: API };
+        const [first] = await downloadAttachments('wfail', [{ fileKey: 'fk', fileName: 'probe.txt' }], ctx, undefined, { fetchFn });
+        mkdirSync(join(dirname(first), 'a.txt')); // a directory under the name: writing the file fails
+        const paths = await downloadAttachments('wfail', [{ fileKey: 'fk', fileName: 'a.txt' }, { fileKey: 'fk', fileName: 'a.txt' }], ctx, undefined, { fetchFn });
+        expect(paths).toEqual([]);
     });
 
     // C143: two different files that share a name are both kept — the second gets a suffix, not dropped.

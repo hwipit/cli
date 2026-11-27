@@ -5740,10 +5740,17 @@ export const downloadAttachments = async (
             const bytes = await fetchAttachmentBytes(f.fileKey, ctx, io);
             mkdirHandedBack(dir);
             const { abs, fresh } = attachmentPath(taken, dir, safeSegment(f.fileName || `file-${i}`, `file-${i}`), bytes);
+            if (fresh) {
+                try {
+                    writeFileSync(abs, bytes);
+                    handBackToSudoUser(abs);
+                } catch (err) {
+                    taken.delete(abs); // nothing was saved under this name: a repeat must not point at it
+                    throw err;
+                }
+            }
             paths.push(abs);
             if (!fresh) continue;
-            writeFileSync(abs, bytes);
-            handBackToSudoUser(abs);
             log(`⇣ ${f.fileName} → ${abs} (${bytes.length}B)`);
         } catch (err) {
             log(`! attachment "${f.fileName}": download failed — ${(err as Error).message}`);

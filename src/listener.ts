@@ -2776,12 +2776,28 @@ export const handleScreenHistoryRequest = (
  * snapshot, the page below it for a history page — so cutting the other end
  * would leave a hole exactly where the text has to join up.
  */
-const capToFrameLimit = (raw: string): { content: string; truncated: boolean } => {
+const sliceUtf8SuffixWithinBytes = (content: string, maxBytes: number): string => {
+    let bytes = 0;
+    let start = content.length;
+    while (start > 0) {
+        let nextStart = start - 1;
+        // Keep surrogate pairs together while we walk backward by code point.
+        const code = content.charCodeAt(nextStart);
+        if (code >= 0xDC00 && code <= 0xDFFF && nextStart > 0) nextStart -= 1;
+        const charBytes = Buffer.byteLength(content.slice(nextStart, start), 'utf-8');
+        if (bytes + charBytes > maxBytes) break;
+        bytes += charBytes;
+        start = nextStart;
+    }
+    return content.slice(start);
+};
+
+export const capToFrameLimit = (raw: string): { content: string; truncated: boolean } => {
     let content = raw;
     let truncated = false;
     while (Buffer.byteLength(content, 'utf-8') > SCREEN_PEEK_MAX_BYTES) {
         const cut = content.indexOf('\n', Math.floor(content.length / 8));
-        content = cut > 0 ? content.slice(cut + 1) : content.slice(-SCREEN_PEEK_MAX_BYTES);
+        content = cut > 0 ? content.slice(cut + 1) : sliceUtf8SuffixWithinBytes(content, SCREEN_PEEK_MAX_BYTES);
         truncated = true;
     }
     return { content, truncated };

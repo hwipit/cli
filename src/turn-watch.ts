@@ -431,6 +431,11 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
     };
 
     const arm = (watcher: Watcher): void => {
+        // Idempotent: a tick that was mid-await when a start re-seeded the watch
+        // re-arms from its finally, after the re-seed's own arm. Overwriting
+        // `timer` while the other is still scheduled leaves a second chain that
+        // `stop` can no longer reach.
+        clearTimeout(watcher.timer);
         watcher.timer = setTimeout(() => {
             void tick(watcher.sessionName);
         }, TURN_POLL_INTERVAL_MS);

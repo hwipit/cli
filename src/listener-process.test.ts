@@ -89,8 +89,9 @@ describe('claimListenerRuntime', () => {
     });
 
     // Two daemons started together: each runs the claim in its own process against one HOME.
-    it('lets exactly one of several simultaneous starts claim the slot', async () => {
+    it.each([false, true])('lets exactly one of several simultaneous starts claim the slot (stale file first: %s)', async (stale) => {
         const m = await load();
+        if (stale) writeFileSync(m.LISTENER_PID_FILE, String(await deadPid()));
         const script = `
             const m = require(process.argv[1]);
             const r = m.claimListenerRuntime('1.0.0', undefined, () => ({ kind: 'running', command: '/usr/local/bin/hwip listener' }));

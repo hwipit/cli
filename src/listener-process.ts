@@ -1,5 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { copyFileSync, existsSync, linkSync, openSync, readFileSync, statSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, linkSync, mkdirSync, openSync, rmdirSync, rmSync, readFileSync, statSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { ensurePrivateDir, ensurePrivateFile, handBackToSudoUser } from './private-files.js';
@@ -82,8 +82,9 @@ export type ListenerClaim = { readonly claimed: true } | { readonly claimed: fal
  * Claim the singleton slot atomically: the pid file is created by `link` (fails if it exists, as O_EXCL
  * does), so of two daemons starting together exactly one creates it. The loser reads the pid on record: a live
  * hwip listener keeps the slot (`claimed: false`); a dead or foreign pid is a stale stamp, which
- * is removed before the next try — two losers clearing the same stale file still leave one winner,
- * because only `wx` can create it again.
+ * is removed before the next try. Replacing a stale file cannot be made conditional on its content
+ * (unlink and rename act on whatever is there), so the whole claim runs under a lock directory:
+ * a rival's fresh claim is never removed by someone who read the stale file before it.
  */
 export const claimListenerRuntime = (
     version: string,
@@ -91,6 +92,32 @@ export const claimListenerRuntime = (
     commandOf: (pid: number) => PidCommand = commandOfPid,
 ): ListenerClaim => {
     ensurePrivateDir(HWIP_DIR);
+    const lock = `${LISTENER_PID_FILE}.lock`;
+    const giveUpAt = Date.now() + 3_000;
+    for (;;) {
+        try {
+            mkdirSync(lock, { mode: 0o700 });
+            break;
+        } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+            // A holder that died inside the critical section (a few syscalls long) leaves the lock behind.
+            try {
+                if (Date.now() - statSync(lock).mtimeMs > 2_000) rmSync(lock, { recursive: true, force: true });
+            } catch { /* released meanwhile */ }
+            if (Date.now() > giveUpAt) throw new Error(`could not lock ${lock}`);
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+        }
+    }
+    try {
+        return claimLocked(version, wsUrl, commandOf);
+    } finally {
+        try {
+            rmdirSync(lock);
+        } catch { /* best-effort */ }
+    }
+};
+
+const claimLocked = (version: string, wsUrl: string | undefined, commandOf: (pid: number) => PidCommand): ListenerClaim => {
     // The pid is written to a private temp file and linked into place: link fails when the pid file exists
     // (the same guarantee as O_EXCL), and a pid file anyone can see is never empty.
     const staging = `${LISTENER_PID_FILE}.${process.pid}.tmp`;

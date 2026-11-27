@@ -173,9 +173,9 @@ the work. Once the answer reports \`hwipState: "REMOTE"\`, sticky REMOTE
 mode takes over.`;
 
 // Tool-access preamble — pi only.
-const PI_TOOL_ACCESS = `## Hwip tools via the CLI (no MCP)
+const PI_TOOL_ACCESS = `## Hwip tools via the CLI
 
-Pi has no MCP, so where these rules name a hwip_* tool, run the hwip CLI with your bash tool instead:
+Hwip registers no MCP server with pi, so where these rules name a hwip_* tool, run the hwip CLI with your bash tool instead:
 
 - hwip_ask    → \`hwip ask --title "…" --body "…" --actions "id:Label,id2:Label2" --timeout 300 --accepts-exit\`
   Blocks until answered; prints one JSON line. \`--accepts-exit\` makes it the MCP tool's twin: the phone may offer "send and exit", and an answer carries \`hwipState\` — \`NORMAL\` after a Done-like button or a send-and-exit (its \`value\` is the user's final instruction: carry it out, no \`hwip ask\`), \`REMOTE\` after any other answer. \`answered: false\` (timeout / unreachable) is a Done-like outcome — treat it as NORMAL.

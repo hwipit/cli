@@ -1773,7 +1773,7 @@ try {
 | Copilot CLI | Session end hook + rules |
 | Cline | Rules file (`~/.cline/rules/hwip.md`) |
 | Aider | Conventions file + `read:` directive in `~/.aider.conf.yml` |
-| Pi | Extension (settle hook + waiting-on-you push + remote detection) + rules — no MCP (pi has none; rules map hwip tools to the CLI) |
+| Pi | Extension (settle hook + waiting-on-you push + remote detection) + rules — no MCP server (hwip registers none with pi; rules map hwip tools to the CLI) |
 | OpenCode | MCP server + idle-notify plugin + rules — the plugin loads on opencode 1.18.35 and 2.0.24 (checked 2026-10-10). On 2.x run `opencode reload` after installing: the background server loads plugins when it starts |
 
 Settings files the agents share with you — Cursor `mcp.json` and `hooks.json`,

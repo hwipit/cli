@@ -478,7 +478,7 @@ describe('templates.ts: pi extension + opencode plugin artifacts', () => {
         const section = PI_RULE.split('## Hwip tools via the CLI')[1]!.split('\n## ')[0]!;
         const flags = [...new Set([...section.matchAll(/--([a-z][a-z-]*)/g)].map((m) => m[1]))];
         expect(flags).toEqual(expect.arrayContaining(['title', 'actions', 'timeout', 'accepts-exit']));
-        // pi has no MCP fallback — a flag renamed in the CLI would strand it
+        // pi gets no hwip MCP server to fall back on — a flag renamed in the CLI would strand it
         // silently, so pin every named flag to the CLI's own arg parsing.
         const dir = dirname(fileURLToPath(import.meta.url));
         const cliSrc = ['ask.ts', 'cli.ts', 'agent-read.ts'].map((file) => readFileSync(join(dir, file), 'utf-8')).join('\n');

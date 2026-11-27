@@ -96,8 +96,8 @@ export interface AskOptions {
      * Stable agent-session key, when this ask was raised from a tmux agent
      * pane. Both fields or neither: the phone's deep link needs the pair to
      * open the agent chat — which is where the live terminal and the key row
-     * live — and falls back to the plain push screen without it. Agents with
-     * no MCP (pi, codex) reach the phone only through this command, so leaving
+     * live — and falls back to the plain push screen without it. Agents without
+     * the hwip MCP server (pi, codex) reach the phone only through this command, so leaving
      * them off is what made their asks land outside the chat.
      */
     agentDeviceId?: string;

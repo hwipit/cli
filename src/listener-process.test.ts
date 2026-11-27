@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -66,6 +66,16 @@ describe('claimListenerRuntime', () => {
             process.kill(live.pid);
             await live.exited;
         }
+    });
+
+    it('breaks a lock directory left by a holder that died', async () => {
+        const m = await load();
+        const lock = `${m.LISTENER_PID_FILE}.lock`;
+        mkdirSync(lock);
+        const old = new Date(Date.now() - 10_000);
+        utimesSync(lock, old, old);
+        expect(m.claimListenerRuntime('1.0.0', undefined, () => ({ kind: 'gone' }))).toEqual({ claimed: true });
+        expect(existsSync(lock)).toBe(false);
     });
 
     it('replaces a stale pid file (dead pid)', async () => {

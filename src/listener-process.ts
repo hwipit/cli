@@ -92,6 +92,21 @@ export const claimListenerRuntime = (
     commandOf: (pid: number) => PidCommand = commandOfPid,
 ): ListenerClaim => {
     ensurePrivateDir(HWIP_DIR);
+    return withClaimLock(() => claimLocked(version, wsUrl, commandOf));
+};
+
+/** The claim lock could not be taken: another start has held it for seconds. */
+export class ListenerClaimLockError extends Error {}
+
+/**
+ * Run `fn` holding the lock directory that serializes everything that removes or replaces the pid file.
+ * A holder that died inside the critical section (a few syscalls long) leaves the lock behind; a lock
+ * older than 2s is broken. That is not airtight (two waiters breaking it together, or a holder stalled
+ * past 2s), but it takes a crash or a stall inside a few syscalls to matter, and the pid file itself is
+ * still only ever created by `link`.
+ */
+const withClaimLock = <T>(fn: () => T): T => {
+    ensurePrivateDir(HWIP_DIR);
     const lock = `${LISTENER_PID_FILE}.lock`;
     const giveUpAt = Date.now() + 3_000;
     for (;;) {
@@ -100,16 +115,15 @@ export const claimListenerRuntime = (
             break;
         } catch (err) {
             if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-            // A holder that died inside the critical section (a few syscalls long) leaves the lock behind.
             try {
                 if (Date.now() - statSync(lock).mtimeMs > 2_000) rmSync(lock, { recursive: true, force: true });
             } catch { /* released meanwhile */ }
-            if (Date.now() > giveUpAt) throw new Error(`could not lock ${lock}`);
+            if (Date.now() > giveUpAt) throw new ListenerClaimLockError(`could not lock ${lock}`);
             Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
         }
     }
     try {
-        return claimLocked(version, wsUrl, commandOf);
+        return fn();
     } finally {
         try {
             rmdirSync(lock);
@@ -121,8 +135,8 @@ const claimLocked = (version: string, wsUrl: string | undefined, commandOf: (pid
     // The pid is written to a private temp file and linked into place: link fails when the pid file exists
     // (the same guarantee as O_EXCL), and a pid file anyone can see is never empty.
     const staging = `${LISTENER_PID_FILE}.${process.pid}.tmp`;
-    writeFileSync(staging, String(process.pid), { mode: 0o600 });
     try {
+        writeFileSync(staging, String(process.pid), { mode: 0o600 });
         for (let attempt = 0; attempt < 5; attempt++) {
             try {
                 linkSync(staging, LISTENER_PID_FILE);
@@ -205,13 +219,18 @@ export const clearListenerRuntime = (pid: number): void => {
  * handler (crash, SIGKILL, reboot-era leftovers). No-op while one is alive.
  */
 export const clearStaleListenerRuntime = (): void => {
-    if (runningListenerPid() !== null) return;
     try {
-        unlinkSync(LISTENER_PID_FILE);
-    } catch { /* nothing to clear */ }
-    try {
-        unlinkSync(LISTENER_VERSION_FILE);
-    } catch { /* nothing to clear */ }
+        // Under the claim lock, so a daemon that claimed since the check is not cleared.
+        withClaimLock(() => {
+            if (runningListenerPid() !== null) return;
+            try {
+                unlinkSync(LISTENER_PID_FILE);
+            } catch { /* nothing to clear */ }
+            try {
+                unlinkSync(LISTENER_VERSION_FILE);
+            } catch { /* nothing to clear */ }
+        });
+    } catch { /* best-effort, as before: a held lock means a start is in progress */ }
 };
 
 /** What `ps` says about a pid. */

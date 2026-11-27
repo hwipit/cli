@@ -54,6 +54,7 @@ import {
     startListenerDetached,
     stopListener,
     claimListenerRuntime,
+    ListenerClaimLockError,
     type ListenerStart,
 } from './listener-process.js';
 import { projectHash, remoteDigest, remoteMarkerPath, stateDir } from './gate.js';
@@ -7010,6 +7011,8 @@ const writeListenerPid = (wsUrl?: string): number | null => {
         const claim = claimListenerRuntime(VERSION, wsUrl);
         return claim.claimed ? null : claim.pid;
     } catch (err) {
+        // A start that cannot tell whether the slot is free must not run: two daemons answer every push twice.
+        if (err instanceof ListenerClaimLockError) throw err;
         log(`! could not write ${LISTENER_PID_FILE}: ${(err as Error).message}`);
         return null;
     }
@@ -7286,8 +7289,14 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
     }
 
     warnInsecureUrl(wsUrl);
-    // The check above and this claim are a window two simultaneous starts both pass; the O_EXCL claim picks one.
-    const holder = writeListenerPid(wsUrl);
+    // The check above and this claim are a window two simultaneous starts both pass; the exclusive claim picks one.
+    let holder: number | null;
+    try {
+        holder = writeListenerPid(wsUrl);
+    } catch (err) {
+        console.error(`hwip listener: ${(err as Error).message} — another start is claiming the slot; try again.`);
+        return 1;
+    }
     if (holder !== null) {
         if (process.env.HWIP_LISTENER_AUTOSTART !== '1') {
             console.error(`hwip listener: another listener is already running (pid ${holder}). ` +

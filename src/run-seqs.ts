@@ -91,6 +91,3 @@ export const runSeqsByRun = (): Map<string, RunSeqs> =>
 
 /** NUL-separated, like the registry's `runKey`: a name holding the separator cannot forge another run's key. */
 export const runSeqsKey = (name: string, runId: string): string => `${name}\u0000${runId}`;
-
-/** Test seam: the file this module reads and writes. */
-export const runSeqsPath = filePath;

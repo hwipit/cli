@@ -776,5 +776,3 @@ export const createTurnWatchers = (deps: TurnWatchDeps) => {
 
     return { handle, stop, stopAll, tick, size: () => watchers.size };
 };
-
-export type TurnWatchers = ReturnType<typeof createTurnWatchers>;

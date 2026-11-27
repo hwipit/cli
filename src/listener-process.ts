@@ -1,8 +1,8 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { copyFileSync, existsSync, openSync, readFileSync, statSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, linkSync, openSync, rmdirSync, rmSync, readFileSync, statSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
-import { ensurePrivateDir, ensurePrivateFile, handBackToSudoUser } from './private-files.js';
+import { ensurePrivateDir, ensurePrivateFile, handBackToSudoUser, mkdirExclusiveHandedBack } from './private-files.js';
 
 /**
  * Process-level facts about the resident `hwip listener` daemon: where its
@@ -75,6 +75,116 @@ export const writeListenerRuntime = (version: string, wsUrl?: string): void => {
     for (const file of [LISTENER_PID_FILE, LISTENER_VERSION_FILE, ...(wsUrl ? [LISTENER_WS_URL_FILE] : [])]) handBackToSudoUser(file);
 };
 
+/** Whether the claim took the slot, or who holds it. */
+export type ListenerClaim = { readonly claimed: true } | { readonly claimed: false; readonly pid: number };
+
+/**
+ * Claim the singleton slot atomically: the pid file is created by `link` (fails if it exists, as O_EXCL
+ * does), so of two daemons starting together exactly one creates it. The loser reads the pid on record: a live
+ * hwip listener keeps the slot (`claimed: false`); a dead or foreign pid is a stale stamp, which
+ * is removed before the next try. Replacing a stale file cannot be made conditional on its content
+ * (unlink and rename act on whatever is there), so the whole claim runs under a lock directory:
+ * a rival's fresh claim is never removed by someone who read the stale file before it.
+ */
+export const claimListenerRuntime = (
+    version: string,
+    wsUrl?: string,
+    commandOf: (pid: number) => PidCommand = commandOfPid,
+): ListenerClaim => {
+    return withClaimLock(() => claimLocked(version, wsUrl, commandOf));
+};
+
+/** The claim lock could not be taken: another start has held it for seconds. */
+export class ListenerClaimLockError extends Error {}
+
+/**
+ * Run `fn` holding the lock directory that serializes everything that removes or replaces the pid file.
+ * A holder that died inside the critical section (a few syscalls long) leaves the lock behind; a lock
+ * older than 2s is broken. That is not airtight (two waiters breaking it together, or a holder stalled
+ * past 2s), but it takes a crash or a stall inside a few syscalls to matter, and the pid file itself is
+ * still only ever created by `link`.
+ */
+const withClaimLock = <T>(fn: () => T): T => {
+    ensurePrivateDir(HWIP_DIR);
+    const lock = `${LISTENER_PID_FILE}.lock`;
+    const giveUpAt = Date.now() + 3_000;
+    for (;;) {
+        try {
+            mkdirExclusiveHandedBack(lock);
+            break;
+        } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+            try {
+                if (Date.now() - statSync(lock).mtimeMs > 2_000) rmSync(lock, { recursive: true, force: true });
+            } catch { /* released meanwhile */ }
+            if (Date.now() > giveUpAt) throw new ListenerClaimLockError(`could not lock ${lock}`);
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+        }
+    }
+    try {
+        return fn();
+    } finally {
+        try {
+            rmdirSync(lock);
+        } catch { /* best-effort */ }
+    }
+};
+
+const claimLocked = (version: string, wsUrl: string | undefined, commandOf: (pid: number) => PidCommand): ListenerClaim => {
+    // The pid is written to a private temp file and linked into place: link fails when the pid file exists
+    // (the same guarantee as O_EXCL), and a pid file anyone can see is never empty.
+    const staging = `${LISTENER_PID_FILE}.${process.pid}.tmp`;
+    try {
+        writeFileSync(staging, String(process.pid), { mode: 0o600 });
+        for (let attempt = 0; attempt < 5; attempt++) {
+            try {
+                linkSync(staging, LISTENER_PID_FILE);
+            } catch (err) {
+                if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+                let recorded: string;
+                try {
+                    recorded = readFileSync(LISTENER_PID_FILE, 'utf-8');
+                } catch {
+                    continue; // removed since the link failed: try to create it again
+                }
+                const holder = liveListenerOf(recorded, commandOf);
+                if (holder !== null) return { claimed: false, pid: holder };
+                // Our own pid (a restart in place) or a stale file: replace it — but only the file that was read,
+                // so a rival's fresh claim is not removed in passing.
+                try {
+                    if (readFileSync(LISTENER_PID_FILE, 'utf-8') === recorded) unlinkSync(LISTENER_PID_FILE);
+                } catch { /* a rival removed it first */ }
+                continue;
+            }
+            return stampClaim(version, wsUrl);
+        }
+    } finally {
+        try {
+            unlinkSync(staging);
+        } catch { /* best-effort */ }
+    }
+    throw new Error(`could not claim ${LISTENER_PID_FILE}`);
+};
+
+/** The live hwip listener a pid file's text names, other than this process; null when the file is stale. */
+const liveListenerOf = (recorded: string, commandOf: (pid: number) => PidCommand): number | null => {
+    const pid = Number(recorded.trim());
+    if (!Number.isFinite(pid) || pid <= 0 || pid === process.pid) return null;
+    try {
+        process.kill(pid, 0);
+    } catch {
+        return null;
+    }
+    return isListenerPid(pid, commandOf) ? pid : null;
+};
+
+const stampClaim = (version: string, wsUrl: string | undefined): ListenerClaim => {
+    writeFileSync(LISTENER_VERSION_FILE, version);
+    if (wsUrl) writeFileSync(LISTENER_WS_URL_FILE, wsUrl);
+    for (const file of [LISTENER_PID_FILE, LISTENER_VERSION_FILE, ...(wsUrl ? [LISTENER_WS_URL_FILE] : [])]) handBackToSudoUser(file);
+    return { claimed: true };
+};
+
 /** The socket the running daemon connected to, or null when it is unknown. */
 export const runningListenerWsUrl = (): string | null => {
     if (runningListenerPid() === null) return null;
@@ -108,13 +218,18 @@ export const clearListenerRuntime = (pid: number): void => {
  * handler (crash, SIGKILL, reboot-era leftovers). No-op while one is alive.
  */
 export const clearStaleListenerRuntime = (): void => {
-    if (runningListenerPid() !== null) return;
     try {
-        unlinkSync(LISTENER_PID_FILE);
-    } catch { /* nothing to clear */ }
-    try {
-        unlinkSync(LISTENER_VERSION_FILE);
-    } catch { /* nothing to clear */ }
+        // Under the claim lock, so a daemon that claimed since the check is not cleared.
+        withClaimLock(() => {
+            if (runningListenerPid() !== null) return;
+            try {
+                unlinkSync(LISTENER_PID_FILE);
+            } catch { /* nothing to clear */ }
+            try {
+                unlinkSync(LISTENER_VERSION_FILE);
+            } catch { /* nothing to clear */ }
+        });
+    } catch { /* best-effort, as before: a held lock means a start is in progress */ }
 };
 
 /** What `ps` says about a pid. */

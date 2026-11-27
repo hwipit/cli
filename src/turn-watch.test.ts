@@ -741,6 +741,68 @@ describe('turn watch regressions', () => {
         }
     });
 
+    it('keeps one poll chain when a start lands while a sealed read is still in flight', async () => {
+        // The poll timers alive right now (see the re-seed test above): a second one is an orphan chain.
+        const armed = new Set<unknown>();
+        const realSetTimeout = globalThis.setTimeout;
+        const realClearTimeout = globalThis.clearTimeout;
+        globalThis.setTimeout = ((fn: () => void, ms?: number, ...rest: unknown[]) => {
+            if (ms !== TURN_POLL_INTERVAL_MS) return realSetTimeout(fn, ms, ...rest);
+            const handle: ReturnType<typeof realSetTimeout> = realSetTimeout(() => {
+                armed.delete(handle);
+                fn();
+            }, ms);
+            armed.add(handle);
+            return handle;
+        }) as typeof globalThis.setTimeout;
+        globalThis.clearTimeout = ((handle: Parameters<typeof globalThis.clearTimeout>[0]) => {
+            armed.delete(handle);
+            realClearTimeout(handle);
+        }) as typeof globalThis.clearTimeout;
+
+        try {
+            const gates: (() => void)[] = [];
+            let released = false;
+            const watchers = createTurnWatchers(
+                makeDeps({
+                    seal: (plaintext) =>
+                        released
+                            ? Promise.resolve({ ciphertext: `sealed:${plaintext.length}` })
+                            : new Promise((resolve) => gates.push(() => resolve({ ciphertext: `sealed:${plaintext.length}` }))),
+                }),
+            );
+            writeFileSync(transcriptFor('s1'), userPrompt('go'));
+            const settle = () => new Promise((r) => realSetTimeout(r, 0));
+            const until = async (done: () => boolean, what: string) => {
+                const deadline = Date.now() + 5_000;
+                while (!done()) {
+                    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+                    await settle();
+                }
+            };
+
+            watchers.handle(start('s1', { subscriberPublicKey: 'key' }), send);
+            await until(() => gates.length === 1, 'the first start to reach its seal');
+            // Same session starts again while that seal is still pending.
+            watchers.handle(start('s1', { subscriberPublicKey: 'key' }), send);
+            await until(() => gates.length === 2, 'the second start to reach its seal');
+
+            released = true;
+            for (const open of gates) open();
+            await until(() => armed.size >= 1, 'a poll to be armed');
+            for (let turn = 0; turn < 25; turn++) {
+                await settle();
+                expect(armed.size).toBeLessThanOrEqual(1);
+            }
+
+            watchers.stopAll('test');
+            expect(armed.size).toBe(0);
+        } finally {
+            globalThis.setTimeout = realSetTimeout;
+            globalThis.clearTimeout = realClearTimeout;
+        }
+    });
+
     it('stops when tmux no longer holds the session', async () => {
         let alive = true;
         const watchers = createTurnWatchers(makeDeps({ sessionExists: () => alive }));

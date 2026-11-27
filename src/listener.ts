@@ -1018,6 +1018,19 @@ export const setPromptSealer = (sealer: PromptSealer | null): void => {
 };
 
 /**
+ * Whether input bound to prompt `id` may still be typed into `session`: the sealer's unspent prompt there, still on
+ * the fresh capture `pane`. Without a sealer no prompt was ever reported, and the id is the dialog's hash as it was.
+ */
+const promptBound = (session: string, id: string, pane: string | null): boolean =>
+    promptSealer ? promptSealer.stillShown(session, id, pane) : promptStillShown(id, pane);
+
+/** Input bound to prompt `id` was typed into `session`: an answer, so the id is spent (`PromptSealer.answered`). */
+const promptAnswered = (session: string, id: string | undefined, typed: boolean): boolean => {
+    if (typed && id !== undefined) promptSealer?.answered(session, id);
+    return typed;
+};
+
+/**
  * The sealed prompt of each main session blocked in a dialog this listener can
  * read, added to a sweep's sessions before they are published. Here and not in
  * the sweep: the sweep runs on the inventory worker (inventory-offload.ts), a
@@ -4412,7 +4425,7 @@ const deliverInput = (input: PendingInput): void => {
     const deps: HandlePushDeps = { noteRefusal: (r) => { reason ??= r; } };
     // Before anything is spent on it: a key bound to a prompt that is gone must not
     // take a rate-limit token, and must not land on whatever is on screen now.
-    const bound = input.ifPrompt === undefined || promptStillShown(input.ifPrompt, capturePaneText(input.sessionName, undefined, true));
+    const bound = input.ifPrompt === undefined || promptBound(input.sessionName, input.ifPrompt, capturePaneText(input.sessionName, undefined, true));
     if (!bound) reason = 'prompt_changed';
     const injected = bound && hasStream(input.sessionName)
         // Stream input arrives on this listener's own subscription: addressed.
@@ -4421,6 +4434,7 @@ const deliverInput = (input: PendingInput): void => {
             : input.tokens
             ? tryInjectKeys(input.sessionName, input.tokens, deps, true)
             : tryInject(input.sessionName, input.text ?? '', deps, { submit: input.submit, addressed: true }));
+    if (!input.wheel) promptAnswered(input.sessionName, input.ifPrompt, injected);
     // Every refusal reachable from here — dead lease, shell pane, rate limit,
     // a failed send-keys — used to be silent, which contradicts the contract
     // above: the sender would keep waiting on a keystroke that never lands
@@ -6263,7 +6277,7 @@ const handlePushInner = async (
 
     // A command bound to a blocked prompt types only while that prompt is on screen. Checked
     // before anything is downloaded or typed, and before the rate limit is spent.
-    if (push.ifPrompt !== undefined && !promptStillShown(push.ifPrompt, deps.capturePane ? deps.capturePane(push.agentSessionName) : capturePaneText(push.agentSessionName, undefined, true))) {
+    if (push.ifPrompt !== undefined && !promptBound(push.agentSessionName, push.ifPrompt, deps.capturePane ? deps.capturePane(push.agentSessionName) : capturePaneText(push.agentSessionName, undefined, true))) {
         log(`! ${push.agentSessionName}: the blocked prompt this command answers is gone — drop`);
         deps.noteRefusal?.('prompt_changed');
         return false;
@@ -6279,7 +6293,7 @@ const handlePushInner = async (
             deps.noteRefusal?.('unknown_key');
             return false;
         }
-        const injected = tryInjectKeys(push.agentSessionName, tokens, deps, addressed);
+        const injected = promptAnswered(push.agentSessionName, push.ifPrompt, tryInjectKeys(push.agentSessionName, tokens, deps, addressed));
         if (injected) deps.onKeysInjected?.(push.agentSessionName);
         return injected;
     }
@@ -6294,7 +6308,7 @@ const handlePushInner = async (
             deps.noteRefusal?.('invalid_command');
             return false;
         }
-        return tryInject(push.agentSessionName, push.insert, deps, { submit: false, addressed });
+        return promptAnswered(push.agentSessionName, push.ifPrompt, tryInject(push.agentSessionName, push.insert, deps, { submit: false, addressed }));
     }
 
     // A shell refuses attachments (shellTextRefusal): say so before they land
@@ -6337,7 +6351,8 @@ const handlePushInner = async (
         }
     }
 
-    return tryInject(push.agentSessionName, composeInjection(push.body ?? '', paths), deps, { submit: true, addressed, files: !!push.files?.length });
+    return promptAnswered(push.agentSessionName, push.ifPrompt,
+        tryInject(push.agentSessionName, composeInjection(push.body ?? '', paths), deps, { submit: true, addressed, files: !!push.files?.length }));
 };
 
 /**

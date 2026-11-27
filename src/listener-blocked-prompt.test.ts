@@ -323,6 +323,55 @@ describe('handlePush — ifPrompt', () => {
         expect(d.sent).toEqual([['Enter']]);
     });
 
+    it('types one answer per showing: a second tap on the same card is refused, the next showing has a new id', async () => {
+        let clock = Date.parse('2026-10-03T02:00:00.000Z');
+        const sealer = createPromptSealer({
+            deviceId: () => 'dev_mac',
+            recipients: async () => [{ deviceId: 'phone', publicKey: 'pk', pinnedAt: 'x' } as never],
+            seal: async () => SEALED,
+            now: () => clock,
+        });
+        setPromptSealer(sealer);
+        try {
+            sealer.observe('hwip-a', 'claude', 'blocked', BASH);
+            await sealer.sealing();
+            const d = deps(BASH);
+            expect(await handlePush(keyPush({ ifPrompt: ID }), d.deps as never)).toBe(true);
+            // The agent asks the very same thing again: the old card's id no longer types.
+            expect(await handlePush(keyPush({ pushId: 'p2', ifPrompt: ID }), d.deps as never)).toBe(false);
+            expect(d.sent).toEqual([['Enter']]);
+            expect(d.refusals).toEqual(['prompt_changed']);
+
+            // Past the redraw grace: the same dialog on screen now is the agent asking again.
+            clock += 5_000;
+            sealer.observe('hwip-a', 'claude', 'blocked', BASH);
+            await sealer.sealing();
+            const next = sealer.observe('hwip-a', 'claude', 'blocked', BASH)!;
+            expect(next.id).not.toBe(ID);
+            expect(await handlePush(keyPush({ pushId: 'p3', ifPrompt: next.id }), d.deps as never)).toBe(true);
+            expect(d.sent).toEqual([['Enter'], ['Enter']]);
+        } finally {
+            setPromptSealer(null);
+        }
+    });
+
+    it('spends no prompt when the keys were not typed', async () => {
+        const sealer = createPromptSealer({
+            deviceId: () => 'dev_mac',
+            recipients: async () => [{ deviceId: 'phone', publicKey: 'pk', pinnedAt: 'x' } as never],
+            seal: async () => SEALED,
+        });
+        setPromptSealer(sealer);
+        try {
+            sealer.observe('hwip-a', 'claude', 'blocked', BASH);
+            const failing = deps(BASH, { sendKeys: () => false });
+            expect(await handlePush(keyPush({ ifPrompt: ID }), failing.deps as never)).toBe(false);
+            expect(sealer.stillShown('hwip-a', ID, BASH)).toBe(true);
+        } finally {
+            setPromptSealer(null);
+        }
+    });
+
     it('drops a push whose ifPrompt is not a string', async () => {
         const d = deps(BASH);
         expect(await handlePush(keyPush({ ifPrompt: 7 }), d.deps as never)).toBe(false);

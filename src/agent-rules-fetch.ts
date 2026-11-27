@@ -129,11 +129,6 @@ const activateManifest = (manifest: DetectionManifest, source: ManifestSource): 
     clearRegexCache();
 };
 
-/** Test hook. */
-export const resetActiveManifest = (): void => {
-    activateManifest(DEFAULT_MANIFEST, 'bundled');
-};
-
 /**
  * Startup path (synchronous): promote the disk cache if it validates,
  * else stay on bundled. Never throws — detection must work offline.

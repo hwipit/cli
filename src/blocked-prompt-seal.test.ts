@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import { parseBlockedDialog } from './blocked-prompt.js';
-import { PROMPT_SEAL_RETRY_MS, createPromptSealer, promptStillShown, type PromptSealerDeps } from './blocked-prompt-seal.js';
+import { PROMPT_REISSUE_GRACE_MS, PROMPT_SEAL_RETRY_MS, createPromptSealer, promptStillShown, type PromptSealerDeps } from './blocked-prompt-seal.js';
 import type { RecorderRecipient, SealedChunk } from './turn-recorder.js';
 
 const fixture = (name: string): string => readFileSync(new URL(`./fixtures/panes/${name}`, import.meta.url), 'utf-8');
@@ -186,6 +186,86 @@ describe('createPromptSealer', () => {
         expect(h.sealer.observe('hwip-a', 'claude', 'blocked', BASH)).toBeUndefined();
         await h.settle();
         expect(h.sealed).toHaveLength(2);
+    });
+});
+
+describe('createPromptSealer — answered', () => {
+    const ID = parseBlockedDialog(BASH, 'claude')!.id;
+
+    it('gives the same dialog shown again after an answer a new id and time, and spends the old id', async () => {
+        const h = harness();
+        h.sealer.observe('hwip-a', 'claude', 'blocked', BASH);
+        await h.settle();
+        const first = h.sealer.observe('hwip-a', 'claude', 'blocked', BASH)!;
+        expect(first.id).toBe(ID);
+        expect(h.sealer.stillShown('hwip-a', ID, BASH)).toBe(true);
+
+        h.sealer.answered('hwip-a', ID);
+        expect(h.sealer.stillShown('hwip-a', ID, BASH)).toBe(false);
+
+        h.advance(5_000);
+        expect(h.sealer.observe('hwip-a', 'claude', 'blocked', BASH)).toBeUndefined();
+        await h.settle();
+        const again = h.sealer.observe('hwip-a', 'claude', 'blocked', BASH)!;
+        expect(again.id).not.toBe(ID);
+        expect(again.id).toMatch(/^[0-9a-f]{16}$/);
+        expect(again.at).toBe('2026-10-03T02:00:05.000Z');
+        expect(JSON.parse(h.sealed[1]!)).toMatchObject({ id: again.id, at: again.at });
+        expect(h.sealer.stillShown('hwip-a', again.id, BASH)).toBe(true);
+        expect(h.sealer.stillShown('hwip-a', ID, BASH)).toBe(false);
+
+        h.sealer.answered('hwip-a', again.id);
+        h.advance(5_000);
+        h.sealer.observe('hwip-a', 'claude', 'blocked', BASH);
+        await h.settle();
+        const third = h.sealer.observe('hwip-a', 'claude', 'blocked', BASH)!;
+        expect(new Set([ID, again.id, third.id]).size).toBe(3);
+    });
+
+    it('spends nothing for an id that is not the current prompt', async () => {
+        const h = harness();
+        h.sealer.observe('hwip-a', 'claude', 'blocked', BASH);
+        await h.settle();
+        h.sealer.answered('hwip-a', 'someotherid');
+        h.sealer.answered('hwip-b', ID);
+        expect(h.sealer.stillShown('hwip-a', ID, BASH)).toBe(true);
+        expect(h.sealer.observe('hwip-a', 'claude', 'blocked', BASH)?.id).toBe(ID);
+    });
+
+    it('refuses an id once the screen moved on, or for a session it never saw', async () => {
+        const h = harness();
+        h.sealer.observe('hwip-a', 'claude', 'blocked', BASH);
+        expect(h.sealer.stillShown('hwip-a', ID, MOVED)).toBe(false);
+        expect(h.sealer.stillShown('hwip-a', ID, null)).toBe(false);
+        expect(h.sealer.stillShown('hwip-b', ID, BASH)).toBe(false);
+    });
+
+    it('gives an answered dialog a new id when it comes back after the session left the prompt', async () => {
+        const h = harness();
+        h.sealer.observe('hwip-a', 'claude', 'blocked', BASH);
+        h.sealer.answered('hwip-a', ID);
+        h.sealer.observe('hwip-a', 'claude', 'working', 'esc to interrupt');
+        h.sealer.observe('hwip-a', 'claude', 'blocked', BASH);
+        await h.settle();
+        const back = h.sealer.observe('hwip-a', 'claude', 'blocked', BASH)!;
+        expect(back.id).not.toBe(ID);
+        expect(h.sealer.stillShown('hwip-a', back.id, BASH)).toBe(true);
+        expect(h.sealer.stillShown('hwip-a', ID, BASH)).toBe(false);
+    });
+
+    it('keeps reporting the answered dialog as it was while the pane has not redrawn yet', async () => {
+        const h = harness();
+        h.sealer.observe('hwip-a', 'claude', 'blocked', BASH);
+        await h.settle();
+        const first = h.sealer.observe('hwip-a', 'claude', 'blocked', BASH)!;
+        h.sealer.answered('hwip-a', ID);
+        h.advance(PROMPT_REISSUE_GRACE_MS - 1);
+        expect(h.sealer.observe('hwip-a', 'claude', 'blocked', BASH)).toEqual(first);
+        expect(h.sealer.stillShown('hwip-a', ID, BASH)).toBe(false);
+        h.advance(1);
+        h.sealer.observe('hwip-a', 'claude', 'blocked', BASH);
+        await h.settle();
+        expect(h.sealer.observe('hwip-a', 'claude', 'blocked', BASH)?.id).not.toBe(ID);
     });
 });
 

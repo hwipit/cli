@@ -737,7 +737,10 @@ as the note. Rows that need typed text (`Type something`, `Chat about this`,
 not read. Other dialogs (a trust prompt) send nothing beyond the state. An answer the app sends is
 typed only while that same prompt is still on screen: if you have moved the
 highlight or answered at the keyboard, the command is refused (`prompt_changed`)
-instead of landing on whatever is there now.
+instead of landing on whatever is there now. Each answer is typed once: when the
+agent asks the very same thing again right after (a retried command), the app is
+sent that prompt under a new id, so its card offers the choices again, and a
+second tap on the answered card is refused rather than approving the new one.
 
 
 ### Diagnostics

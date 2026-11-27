@@ -89,6 +89,7 @@ const {
   STREAM_CAPTURE_LINES,
   SCREEN_HISTORY_MAX_LINES,
   setSubscriberTrust,
+  capToFrameLimit,
 } = await import('./listener.js');
 const { admissionSettled, trustEveryKey } = await import('../tests/helpers/trust.js');
 // What is under test here starts after a subscriber's key checked out.
@@ -344,6 +345,14 @@ describe('agent.screen.history.request — one page of scrollback above the live
       expect(Number(reply?.lines)).toBeLessThan(10);
       expect(Number(reply?.lines)).toBeGreaterThan(0);
       expect(Buffer.byteLength(String(reply?.content), 'utf-8')).toBeLessThanOrEqual(24 * 1024);
+    });
+
+    it('caps an oversized multibyte capture without breaking UTF-8 boundaries', () => {
+      const result = capToFrameLimit('가'.repeat(30000));
+
+      expect(result.truncated).toBe(true);
+      expect(Buffer.byteLength(result.content, 'utf-8')).toBeLessThanOrEqual(24 * 1024);
+      expect(result.content).toBe('가'.repeat((24 * 1024) / 3));
     });
   });
 

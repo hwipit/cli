@@ -53,7 +53,7 @@ import {
     startFailure,
     startListenerDetached,
     stopListener,
-    writeListenerRuntime,
+    claimListenerRuntime,
     type ListenerStart,
 } from './listener-process.js';
 import { projectHash, remoteDigest, remoteMarkerPath, stateDir } from './gate.js';
@@ -5660,10 +5660,14 @@ const openSealedAttachment = async (bytes: Buffer, file: PushFileAttachment, sea
 
 /**
  * Where one command's attachment is saved. The same bytes under a name already used are the same file
- * attached twice: null, so it is stored and named once (C143). Different bytes under a taken name get
- * `name-1.ext`, `name-2.ext`, … — two pasted `image.png` are two files, and neither is dropped.
+ * attached twice: the path it was first saved to, `fresh: false`, so the file is written and named once
+ * (C143) yet every attachment still has a path — a sealed command checks paths against attachments.
+ * Different bytes under a taken name get `name-1.ext`, `name-2.ext`, … — two pasted `image.png` are
+ * two files, and neither is dropped.
  */
-const attachmentPath = (taken: Map<string, string>, dir: string, segment: string, bytes: Uint8Array): string | null => {
+const attachmentPath = (
+    taken: Map<string, string>, dir: string, segment: string, bytes: Uint8Array,
+): { abs: string; fresh: boolean } => {
     const digest = createHash('sha256').update(bytes).digest('hex');
     const dot = segment.lastIndexOf('.');
     const [stem, ext] = dot > 0 ? [segment.slice(0, dot), segment.slice(dot)] : [segment, ''];
@@ -5672,9 +5676,9 @@ const attachmentPath = (taken: Map<string, string>, dir: string, segment: string
         const had = taken.get(abs);
         if (had === undefined) {
             taken.set(abs, digest);
-            return abs;
+            return { abs, fresh: true };
         }
-        if (had === digest) return null;
+        if (had === digest) return { abs, fresh: false };
     }
 };
 
@@ -5709,11 +5713,11 @@ export const downloadAttachments = async (
                 const bytes = meta && Number.isSafeInteger(meta.size) && meta.size >= 0 ? opened.subarray(0, meta.size) : opened;
                 const name = meta?.name ?? f.fileName;
                 mkdirHandedBack(dir);
-                const abs = attachmentPath(taken, dir, safeSegment(name || `file-${i}`, `file-${i}`), bytes);
-                if (abs === null) continue;
+                const { abs, fresh } = attachmentPath(taken, dir, safeSegment(name || `file-${i}`, `file-${i}`), bytes);
+                paths.push(abs);
+                if (!fresh) continue;
                 writeFileSync(abs, bytes);
                 handBackToSudoUser(abs);
-                paths.push(abs);
                 log(`⇣ ${name} → ${abs} (${bytes.length}B, sealed)`);
             }
         } catch (err) {
@@ -5735,11 +5739,11 @@ export const downloadAttachments = async (
         try {
             const bytes = await fetchAttachmentBytes(f.fileKey, ctx, io);
             mkdirHandedBack(dir);
-            const abs = attachmentPath(taken, dir, safeSegment(f.fileName || `file-${i}`, `file-${i}`), bytes);
-            if (abs === null) continue;
+            const { abs, fresh } = attachmentPath(taken, dir, safeSegment(f.fileName || `file-${i}`, `file-${i}`), bytes);
+            paths.push(abs);
+            if (!fresh) continue;
             writeFileSync(abs, bytes);
             handBackToSudoUser(abs);
-            paths.push(abs);
             log(`⇣ ${f.fileName} → ${abs} (${bytes.length}B)`);
         } catch (err) {
             log(`! attachment "${f.fileName}": download failed — ${(err as Error).message}`);
@@ -5789,8 +5793,8 @@ export const downloadSealedEach = async (
             // Padded before sealing: cut back to the size the seal gives.
             const bytes = meta && Number.isSafeInteger(meta.size) && meta.size >= 0 ? opened.subarray(0, meta.size) : opened;
             mkdirHandedBack(dir);
-            const abs = attachmentPath(taken, dir, safeSegment(name, `file-${i}`), bytes);
-            if (abs === null) {
+            const { abs, fresh } = attachmentPath(taken, dir, safeSegment(name, `file-${i}`), bytes);
+            if (!fresh) {
                 // The same bytes under a name already saved: said, so no file goes unaccounted for.
                 missing.push(`${name}: the same file was attached twice`);
                 continue;
@@ -6988,16 +6992,19 @@ const otherListenerAlive = (): number | null => {
     return pid === null || pid === process.pid ? null : pid;
 };
 
-const writeListenerPid = (wsUrl?: string): void => {
+/** Claims the singleton slot (O_EXCL) and stamps it; the pid of the daemon that holds it when it is not us. */
+const writeListenerPid = (wsUrl?: string): number | null => {
     try {
         // Stamp the version alongside the pid: `npm i -g` swaps the package
         // on disk without touching this already-running process, and the
         // stamp is how `hwip cc` notices the drift and restarts us. The socket
         // goes with it so `hwip verify` can say what this daemon is actually
         // connected to without reading a log that rotates out from under it.
-        writeListenerRuntime(VERSION, wsUrl);
+        const claim = claimListenerRuntime(VERSION, wsUrl);
+        return claim.claimed ? null : claim.pid;
     } catch (err) {
         log(`! could not write ${LISTENER_PID_FILE}: ${(err as Error).message}`);
+        return null;
     }
 };
 
@@ -7272,7 +7279,15 @@ export const handleListener = async (args: Record<string, string | boolean>): Pr
     }
 
     warnInsecureUrl(wsUrl);
-    writeListenerPid(wsUrl);
+    // The check above and this claim are a window two simultaneous starts both pass; the O_EXCL claim picks one.
+    const holder = writeListenerPid(wsUrl);
+    if (holder !== null) {
+        if (process.env.HWIP_LISTENER_AUTOSTART !== '1') {
+            console.error(`hwip listener: another listener is already running (pid ${holder}). ` +
+                `Tail \`~/.hwip/listener.log\` to follow it, or kill ${holder} first.`);
+        }
+        return 0;
+    }
     process.on('exit', removeListenerPid);
 
     // Rotate before writing anything, so this run's first line lands in the

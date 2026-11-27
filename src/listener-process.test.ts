@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events';
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // The module resolves its paths from homedir() at import time, so each case
 // gets a throwaway $HOME and a fresh module graph.
@@ -39,6 +40,82 @@ afterEach(() => {
     else process.env.HOME = originalHome;
     for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true });
     vi.resetModules();
+});
+
+describe('claimListenerRuntime', () => {
+    const LISTENER = '/usr/local/bin/hwip listener';
+
+    it('claims an empty slot and stamps it', async () => {
+        const m = await load();
+        expect(m.claimListenerRuntime('9.9.9', 'wss://x.test', () => ({ kind: 'gone' }))).toEqual({ claimed: true });
+        expect(readFileSync(m.LISTENER_PID_FILE, 'utf-8')).toBe(String(process.pid));
+        expect(m.runningListenerVersion()).toBe('9.9.9');
+        expect(m.runningListenerWsUrl()).toBe('wss://x.test');
+    });
+
+    it('refuses to take the slot from a live listener, and leaves its stamps', async () => {
+        const m = await load();
+        const live = livePid();
+        try {
+            writeFileSync(m.LISTENER_PID_FILE, String(live.pid));
+            writeFileSync(m.LISTENER_VERSION_FILE, 'held');
+            expect(m.claimListenerRuntime('9.9.9', undefined, () => ({ kind: 'running', command: LISTENER }))).toEqual({ claimed: false, pid: live.pid });
+            expect(readFileSync(m.LISTENER_PID_FILE, 'utf-8')).toBe(String(live.pid));
+            expect(m.runningListenerVersion()).toBe('held');
+        } finally {
+            process.kill(live.pid);
+            await live.exited;
+        }
+    });
+
+    it('replaces a stale pid file (dead pid)', async () => {
+        const m = await load();
+        writeFileSync(m.LISTENER_PID_FILE, String(await deadPid()));
+        expect(m.claimListenerRuntime('1.0.0')).toEqual({ claimed: true });
+        expect(m.runningListenerPid()).toBe(process.pid);
+    });
+
+    it('replaces a pid file whose pid is alive but not a listener', async () => {
+        const m = await load();
+        const live = livePid();
+        try {
+            writeFileSync(m.LISTENER_PID_FILE, String(live.pid));
+            expect(m.claimListenerRuntime('1.0.0', undefined, () => ({ kind: 'running', command: '/usr/bin/vim notes.md' }))).toEqual({ claimed: true });
+            expect(readFileSync(m.LISTENER_PID_FILE, 'utf-8')).toBe(String(process.pid));
+        } finally {
+            process.kill(live.pid);
+            await live.exited;
+        }
+    });
+
+    // Two daemons started together: each runs the claim in its own process against one HOME.
+    it('lets exactly one of several simultaneous starts claim the slot', async () => {
+        const m = await load();
+        const script = `
+            const m = require(process.argv[1]);
+            const r = m.claimListenerRuntime('1.0.0', undefined, () => ({ kind: 'running', command: '/usr/local/bin/hwip listener' }));
+            process.stdout.write(JSON.stringify({ pid: process.pid, ...r }));
+            setTimeout(() => {}, 1500); // stay alive while the others decide
+        `;
+        const { build } = await import('esbuild');
+        const modPath = join(m.home, 'listener-process.bundle.cjs');
+        await build({ entryPoints: [fileURLToPath(new URL('./listener-process.ts', import.meta.url))], bundle: true, platform: 'node', format: 'cjs', outfile: modPath, logLevel: 'silent' });
+        const runs = Array.from({ length: 6 }, () => new Promise<{ pid: number; claimed: boolean }>((resolve, reject) => {
+            const child = spawn(process.execPath, ['-e', script, modPath], {
+                env: { ...process.env, HOME: m.home }, stdio: ['ignore', 'pipe', 'pipe'],
+            });
+            let out = '';
+            let err = '';
+            child.stdout.on('data', (d: Buffer) => { out += d.toString(); });
+            child.stderr.on('data', (d: Buffer) => { err += d.toString(); });
+            child.on('error', reject);
+            child.on('exit', () => { try { resolve(JSON.parse(out)); } catch { reject(new Error(`start produced no result: ${err}`)); } });
+        }));
+        const results = await Promise.all(runs);
+        const winners = results.filter((r) => r.claimed);
+        expect(winners).toHaveLength(1);
+        expect(readFileSync(m.LISTENER_PID_FILE, 'utf-8')).toBe(String(winners[0].pid));
+    });
 });
 
 describe('listener runtime stamps', () => {

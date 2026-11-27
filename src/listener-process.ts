@@ -75,6 +75,43 @@ export const writeListenerRuntime = (version: string, wsUrl?: string): void => {
     for (const file of [LISTENER_PID_FILE, LISTENER_VERSION_FILE, ...(wsUrl ? [LISTENER_WS_URL_FILE] : [])]) handBackToSudoUser(file);
 };
 
+/** Whether the claim took the slot, or who holds it. */
+export type ListenerClaim = { readonly claimed: true } | { readonly claimed: false; readonly pid: number };
+
+/**
+ * Claim the singleton slot atomically: the pid file is created with O_EXCL (`wx`), so of two
+ * daemons starting together exactly one creates it. The loser reads the pid on record: a live
+ * hwip listener keeps the slot (`claimed: false`); a dead or foreign pid is a stale stamp, which
+ * is removed before the next try — two losers clearing the same stale file still leave one winner,
+ * because only `wx` can create it again.
+ */
+export const claimListenerRuntime = (
+    version: string,
+    wsUrl?: string,
+    commandOf: (pid: number) => PidCommand = commandOfPid,
+): ListenerClaim => {
+    ensurePrivateDir(HWIP_DIR);
+    for (let attempt = 0; attempt < 5; attempt++) {
+        try {
+            writeFileSync(LISTENER_PID_FILE, String(process.pid), { flag: 'wx', mode: 0o600 });
+        } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+            const holder = otherListenerPid(process.pid, commandOf);
+            if (holder !== null) return { claimed: false, pid: holder };
+            // Our own pid (a restart in place) or a stale file: replace it.
+            try {
+                unlinkSync(LISTENER_PID_FILE);
+            } catch { /* a rival removed it first: try to create it again */ }
+            continue;
+        }
+        writeFileSync(LISTENER_VERSION_FILE, version);
+        if (wsUrl) writeFileSync(LISTENER_WS_URL_FILE, wsUrl);
+        for (const file of [LISTENER_PID_FILE, LISTENER_VERSION_FILE, ...(wsUrl ? [LISTENER_WS_URL_FILE] : [])]) handBackToSudoUser(file);
+        return { claimed: true };
+    }
+    throw new Error(`could not claim ${LISTENER_PID_FILE}`);
+};
+
 /** The socket the running daemon connected to, or null when it is unknown. */
 export const runningListenerWsUrl = (): string | null => {
     if (runningListenerPid() === null) return null;

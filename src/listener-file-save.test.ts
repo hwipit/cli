@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 import { existsSync, mkdtempSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { answerFileBound, downloadAttachments, downloadSealedEach, saveFileFromS3, type SaveFileDeps } from './listener.js';
 import { DOWNLOAD_MAX_BYTES } from './file-crypto.js';
 import { getDevicePublicKey, initDeviceCrypto } from './crypto.js';
@@ -255,8 +255,9 @@ describe('the download address the API names', () => {
         expect(calls).toEqual([`${API}/files/fk`]);
     });
 
-    // C143 sealed half: the same sealed file twice in one command is stored and named once.
-    it('names the same sealed file once when one command attaches it twice', async () => {
+    // C143 sealed half: the same sealed file twice in one command is stored once, and both attachments keep a path
+    // (a sealed command whose paths fall short of its files is dropped whole).
+    it('stores the same sealed file once but returns a path per attachment when one command attaches it twice', async () => {
         const sealed = await sealForReceiver(Buffer.from('same bytes'), receiverPublicKey);
         const fetchFn: typeof fetch = async (input) => (String(input).startsWith(API)
             ? new Response(JSON.stringify({ data: { downloadUrl: PRESIGNED } }))
@@ -265,11 +266,13 @@ describe('the download address the API names', () => {
         const paths = await downloadAttachments('dup-sealed', [file, file], { apiKey: 'k', baseUrl: API }, {
             deviceId: ME, senderPublicKey: sealed.senderPublicKey,
         }, { fetchFn });
-        expect(paths).toHaveLength(1);
+        expect(paths).toHaveLength(2);
+        expect(new Set(paths).size).toBe(1);
+        expect(readdirSync(dirname(paths[0]))).toEqual(['a.txt']);
     });
 
-    // C143: the same file attached twice in one command is stored and named once, not twice.
-    it('names the same file once when one command attaches it twice', async () => {
+    // C143: the same file attached twice in one command is stored once; each attachment still has its path.
+    it('stores the same file once but returns a path per attachment when one command attaches it twice', async () => {
         const bytes = 'same bytes';
         const fetchFn: typeof fetch = async (input) => String(input).startsWith(API)
             ? new Response(JSON.stringify({ data: { downloadUrl: PRESIGNED } }))
@@ -279,8 +282,9 @@ describe('the download address the API names', () => {
             { fileKey: 'fk', fileName: 'a.txt' },
         ];
         const paths = await downloadAttachments('dup', files, { apiKey: 'k', baseUrl: API }, undefined, { fetchFn });
-        expect(paths).toHaveLength(1);
-        expect(new Set(paths).size).toBe(paths.length);
+        expect(paths).toHaveLength(2);
+        expect(new Set(paths).size).toBe(1);
+        expect(readdirSync(dirname(paths[0]))).toEqual(['a.txt']);
     });
 
     // C143: two different files that share a name are both kept — the second gets a suffix, not dropped.

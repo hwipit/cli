@@ -614,7 +614,7 @@ const INJECT_BUFFER = 'hwip-inject';
 const sendLiteral = (session: string, text: string): boolean => {
     const target = tmuxTargetFor(session);
     if (target === null) return false; // unresolvable subagent — never spawn
-    return spawnSync('tmux', tmuxArgs(['send-keys', '-l', '-t', target, text]), { stdio: ['ignore', 'ignore', 'pipe'] })
+    return spawnSync('tmux', tmuxArgs(['send-keys', '-l', '-t', target, '--', text]), { stdio: ['ignore', 'ignore', 'pipe'] })
         .status === 0;
 };
 

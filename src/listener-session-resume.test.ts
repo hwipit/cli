@@ -919,6 +919,11 @@ describe('agent.session.resume.request — sealed', () => {
         expect(shellStarts()).toHaveLength(1);
     });
 
+    it('refuses a sealed run id that is not one rather than falling back to the newest run', async () => {
+        expect(await ask(frame({}, body({ agentKind: 'claude', fresh: false, runId: '../x' })))).toMatchObject({ error: 'bad_request' });
+        expect(tmuxCalls.filter((c) => c[0] === 'new-session')).toEqual([]);
+    });
+
     it('refuses a sealed envelope with no key to answer it', async () => {
         expect(await ask(frame({ subscriberPublicKey: undefined }))).toMatchObject({ error: 'e2ee_required' });
         expect(shellStarts()).toEqual([]);

@@ -28,9 +28,16 @@ export const fitAttachmentName = (raw: string, fallback: string): string => {
     if (byteLength(name) <= MAX_ATTACHMENT_NAME_BYTES) return name;
     const rawExt = extname(name);
     const ext = byteLength(rawExt) <= MAX_EXT_BYTES ? rawExt : '';
-    const stem = Array.from(ext ? name.slice(0, -ext.length) : name);
-    while (stem.length > 0 && byteLength(stem.join('')) + byteLength(ext) > MAX_ATTACHMENT_NAME_BYTES) stem.pop();
+    // One pass over the stem's code points, stopping at the budget: a name of any length costs no more than the cut.
+    const budget = MAX_ATTACHMENT_NAME_BYTES - byteLength(ext);
+    let stem = '';
+    let used = 0;
+    for (const point of ext ? name.slice(0, -ext.length) : name) {
+        used += byteLength(point);
+        if (used > budget) break;
+        stem += point;
+    }
     // The cut can leave a dot, a space or nothing: the rules above run once more on what is kept.
-    const kept = stem.join('').replace(/^\.+/, '').trim();
+    const kept = stem.replace(/^\.+/, '').trim();
     return kept ? kept + ext : fallback;
 };

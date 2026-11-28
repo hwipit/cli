@@ -2391,7 +2391,7 @@ export const handleSessionResumeRequest = (
         (body) => {
             const { agentKind, runId, fresh } = body;
             if (agentKind !== undefined && typeof agentKind !== 'string') return void reply({ error: 'bad_request' });
-            if (runId !== undefined && typeof runId !== 'string') return void reply({ error: 'bad_request' });
+            if (runId !== undefined && (typeof runId !== 'string' || !RUN_ID.test(runId))) return void reply({ error: 'bad_request' });
             if (fresh !== undefined && typeof fresh !== 'boolean') return void reply({ error: 'bad_request' });
             run(agentKind, runId, fresh === true);
         },

@@ -29,6 +29,13 @@ describe('fitAttachmentName', () => {
         expect(out).toBe('😀'.repeat(49) + '.txt');
     });
 
+    it('cuts a very long name in one pass', () => {
+        const started = Date.now();
+        const out = fitAttachmentName('가'.repeat(200_000) + '.png', 'f');
+        expect(bytes(out)).toBeLessThanOrEqual(MAX_ATTACHMENT_NAME_BYTES);
+        expect(Date.now() - started).toBeLessThan(1000);
+    });
+
     it('cuts an extension too long to be one like the rest of the name', () => {
         const out = fitAttachmentName('a.' + 'x'.repeat(300), 'f');
         expect(bytes(out)).toBeLessThanOrEqual(MAX_ATTACHMENT_NAME_BYTES);

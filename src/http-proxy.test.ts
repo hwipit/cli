@@ -56,9 +56,11 @@ beforeEach(() => {
     seen.length = 0;
     authSeen.length = 0;
 });
+const builtInFetch = globalThis.fetch;
 afterAll(async () => {
     // Back to a dispatcher that goes direct, so nothing later in this worker is proxied.
     setGlobalDispatcher(new Agent());
+    globalThis.fetch = builtInFetch;
     await useProxyFromEnv({});
     wss.close();
     await Promise.all([proxy, target].map((s) => new Promise<void>((resolve) => { s.close(() => resolve()); s.closeAllConnections(); })));
@@ -97,6 +99,16 @@ describe('a proxy from the environment', () => {
 
         expect(await res.text()).toBe('reached the target');
         expect(seen).toContain(`CONNECT 127.0.0.1:${targetPort}`);
+    });
+
+    // Node 26's built-in fetch ignores undici 6's dispatcher and would go direct (fail-open).
+    it('replaces the built-in fetch only when a proxy is set', async () => {
+        globalThis.fetch = builtInFetch;
+        await useProxyFromEnv({});
+        expect(globalThis.fetch).toBe(builtInFetch);
+
+        await useProxyFromEnv({ HTTPS_PROXY: proxyUrl });
+        expect(globalThis.fetch).not.toBe(builtInFetch);
     });
 
     it('carries the listener socket as well as fetch, and the messages get through', async () => {

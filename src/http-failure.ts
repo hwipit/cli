@@ -299,7 +299,7 @@ const configProxyValue = (key: keyof ProxyConfig, config: ProxyConfig): string |
  * Not through Node's own `http.setGlobalProxyFromEnv`: it exists only from 24.14
  * and 25.4, and the CLI runs on older Nodes. `fetch` gets undici's
  * `EnvHttpProxyAgent` as the global dispatcher (undici 6, Node >= 18.17 — Node 26's
- * own fetch ignores it; the daemon swaps in undici's fetch, `useHttp1Transport`); `ws`
+ * own fetch ignores it, so `fetch` itself is swapped for undici's here); `ws`
  * opens its own connection, so it gets a CONNECT-tunnelling agent from
  * `https-proxy-agent` (`webSocketProxyOptions`). Both libraries load only here
  * (undici also in the daemon), so a command run with no proxy pays nothing for them.
@@ -326,16 +326,21 @@ export const useProxyFromEnv = async (env: ProxyEnv = process.env, config: Proxy
     checkProxyUrl(envHttps === undefined ? '"httpsProxy" in config.json' : env.https_proxy !== undefined ? 'https_proxy' : 'HTTPS_PROXY', httpsProxy);
     const noProxy = env.no_proxy ?? env.NO_PROXY ?? configProxyValue('noProxy', config) ?? '';
 
-    const [{ EnvHttpProxyAgent, setGlobalDispatcher }, { HttpsProxyAgent }] = await Promise.all([
+    const [undici, { HttpsProxyAgent }] = await Promise.all([
         import('undici'),
         import('https-proxy-agent'),
     ]);
+    const { EnvHttpProxyAgent, setGlobalDispatcher } = undici;
     // Always strings, so undici never falls back to reading `process.env` itself.
     setGlobalDispatcher(withoutExperimentalWarning(() => new EnvHttpProxyAgent({
         httpProxy: httpProxy ?? '',
         httpsProxy: httpsProxy ?? '',
         noProxy,
     })));
+    // Node 26's own fetch (undici 8) reads another dispatcher slot than undici 6
+    // writes, so it would go around the proxy just set. Use undici 6's fetch, which
+    // reads the slot that was written: the proxy applies, or the request fails.
+    globalThis.fetch = undici.fetch as unknown as typeof fetch;
     const agents = new Map<string, http.Agent>();
     active = {
         env: { http_proxy: httpProxy, https_proxy: httpsProxy, no_proxy: noProxy },
@@ -366,8 +371,8 @@ export const useProxyFromEnv = async (env: ProxyEnv = process.env, config: Proxy
  * event loop in nghttp2's send loop (one shared session); HTTP/1.1 gives each request its
  * own socket. Node 26's fetch (undici 8) reads `undici.globalDispatcher.2`, undici 6 writes
  * `.1`, and an undici 6 dispatcher handed to Node 26's fetch fails "invalid onError method"
- * — so the fetch is swapped for undici 6's own, which also makes `useProxyFromEnv`'s proxy
- * agent apply again. Daemon only (`cli-lazy-load.test.ts`); call after `useProxyFromEnv`.
+ * — so the fetch is swapped for undici 6's own, which `useProxyFromEnv` does too when a proxy is set.
+ * Daemon only (`cli-lazy-load.test.ts`); call after `useProxyFromEnv`.
  */
 export const useHttp1Transport = async (): Promise<void> => {
     const undici = await import('undici');

@@ -12,7 +12,9 @@
 import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
+import { describe, expect, it, beforeAll, beforeEach, afterEach, vi } from 'vitest';
+import { v2Party } from '../tests/helpers/seal.js';
+import { trustEveryKey } from '../tests/helpers/trust.js';
 
 const FIELD_SEP = '␟';
 /** tmux sessions that exist right now. */
@@ -67,8 +69,9 @@ const TMP = mkdtempSync(join(tmpdir(), 'hwip-exit-'));
 process.env.HOME = TMP;
 process.env.XDG_STATE_HOME = join(TMP, 'state');
 
-const { handleSessionExitRequest, computeListenerDeviceId, SESSION_EXIT_STEP_MS } =
+const { handleSessionExitRequest, computeListenerDeviceId, SESSION_EXIT_STEP_MS, setSubscriberTrust, checkRateLimit, SUBMIT_COST } =
     await import('./listener.js');
+const { initDeviceCrypto, getDevicePublicKey } = await import('./crypto.js');
 const { rememberSessions } = await import('./session-registry.js');
 
 describe('agent.session.exit.request — ending a running session', () => {
@@ -240,5 +243,114 @@ describe('agent.session.exit.request — ending a running session', () => {
 
         await runOutTheSequence();
         expect(sent.at(-1)).toMatchObject({ exited: true });
+    });
+});
+
+
+describe('agent.session.exit.request — sealed', () => {
+    const phone = v2Party();
+    let listenerKey = '';
+    let sent: Array<Record<string, unknown>>;
+    const send = (data: Record<string, unknown>) => { sent.push(data); };
+    let next = 0;
+    let rid = '';
+
+    const body = (over: Record<string, unknown> = {}): string =>
+        JSON.stringify({ v: 1, requestId: rid, at: new Date().toISOString(), ...over });
+    const frame = (over: Record<string, unknown> = {}, sealed: string = body(), context = 'hwip-api', purpose = 'session.exit') => ({
+        subtype: 'agent.session.exit.request',
+        targetDeviceId: computeListenerDeviceId(),
+        sessionName: 'hwip-api',
+        requestId: rid,
+        deviceId: 'dev_phone',
+        subscriberPublicKey: phone.publicKey,
+        encrypted: phone.seal(purpose, sealed, listenerKey, context),
+        ...over,
+    });
+    const ended = () => tmuxCalls.some((c) => c[0] === 'send-keys');
+    /** Run the clock until the daemon has answered. */
+    const ask = async (msg: Record<string, unknown>) => {
+        const before = sent.length;
+        expect(handleSessionExitRequest(msg as never, send)).toBe(true);
+        for (let i = 0; i < 100 && sent.length === before; i += 1) {
+            await vi.advanceTimersByTimeAsync(SESSION_EXIT_STEP_MS);
+            await new Promise((resolve) => setImmediate(resolve));
+        }
+        return sent.at(-1);
+    };
+
+    beforeAll(async () => {
+        await initDeviceCrypto();
+        listenerKey = getDevicePublicKey()!;
+    });
+    beforeEach(() => {
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+        vi.spyOn(console, 'log').mockImplementation(() => {});
+        rid = `e${next++}`;
+        tmuxCalls = [];
+        sent = [];
+        liveSessions = ['hwip-api'];
+        diesAfterSignals = 1;
+        signalsSeen = 0;
+        setSubscriberTrust(trustEveryKey);
+    });
+    afterEach(() => {
+        vi.useRealTimers();
+        vi.restoreAllMocks();
+        setSubscriberTrust(null);
+    });
+
+    it('ends the session a sealed request from a trusted phone names', async () => {
+        expect(await ask(frame())).toMatchObject({ subtype: 'agent.session.exit.result', requestId: rid, exited: true });
+        expect(ended()).toBe(true);
+    });
+
+    it('never ends a session on a plaintext request once this listener has sealed', async () => {
+        setSubscriberTrust({ ...trustEveryKey, sealedOnly: () => true });
+        const plain = { subtype: 'agent.session.exit.request', targetDeviceId: computeListenerDeviceId(), sessionName: 'hwip-api', requestId: rid };
+        expect(await ask(plain)).toMatchObject({ error: 'e2ee_required' });
+        expect(ended()).toBe(false);
+        // The session's own command budget is not spent on a request that proved nothing.
+        expect(checkRateLimit('hwip-api', undefined, SUBMIT_COST)).toBe(true);
+    });
+
+    it('refuses an envelope with no key to answer it, and a key that does not check out', async () => {
+        expect(await ask(frame({ subscriberPublicKey: undefined }))).toMatchObject({ error: 'e2ee_required' });
+        setSubscriberTrust({ ...trustEveryKey, admit: async () => ({ kind: 'refuse', reason: 'subscriber_unverified' }) });
+        expect(await ask(frame({ requestId: `${rid}b` }, body({ requestId: `${rid}b` })))).toMatchObject({ error: 'subscriber_unverified' });
+        expect(ended()).toBe(false);
+    });
+
+    it('refuses a forged seal: another sender, session, purpose, request id or time', async () => {
+        const relay = v2Party();
+        const forged = [
+            frame({ encrypted: relay.seal('session.exit', body(), listenerKey, 'hwip-api') }),
+            frame({}, body(), 'hwip-web'),
+            frame({}, body(), 'hwip-api', 'agent.task.stop'),
+            frame({ requestId: 'other' }),
+            frame({}, body({ at: '2020-01-01T00:00:00.000Z' })),
+            frame({}, body({ v: 2 })),
+        ];
+        for (const msg of forged) expect(await ask(msg)).toMatchObject({ error: 'bad_request' });
+        expect(ended()).toBe(false);
+    });
+
+    it('does not act on the same sealed request twice', async () => {
+        const msg = frame();
+        expect(await ask(msg)).toMatchObject({ exited: true });
+        liveSessions = ['hwip-api'];
+        tmuxCalls = [];
+        expect(await ask(msg)).toMatchObject({ error: 'bad_request' });
+        expect(ended()).toBe(false);
+    });
+
+    it('keeps a seal for exit from being replayed as a forget', async () => {
+        const msg = frame();
+        const { handleSessionForgetRequest } = await import('./listener.js');
+        const replayed = { ...msg, subtype: 'agent.session.forget.request' };
+        const before = sent.length;
+        handleSessionForgetRequest(replayed as never, send);
+        for (let i = 0; i < 20 && sent.length === before; i += 1) await new Promise((resolve) => setImmediate(resolve));
+        expect(sent.at(-1)).toMatchObject({ error: 'bad_request' });
     });
 });

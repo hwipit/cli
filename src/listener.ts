@@ -512,7 +512,7 @@ export const commandsReportDue = (
 const RATE_LIMIT_TOKENS = 120;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 /** What one command submit costs, keeping its ceiling at the old 30/min. */
-const SUBMIT_COST = 4;
+export const SUBMIT_COST = 4;
 /**
  * What a fresh start costs on its family's own bucket (`start:<family base>`): three new agents a minute. Each one is a
  * process left running, and every name of the family leads to the same bucket, so a session budget of 30 a minute
@@ -1907,6 +1907,12 @@ const firstSeen = (purpose: string, key: string, now: number): boolean => {
     return true;
 };
 
+type LifecycleAsk = { deviceId?: string; subscriberPublicKey?: string; encrypted?: unknown };
+
+/** The device a request says it came from, as far as it reads as an id — the key of the bucket in front of the gate. */
+const askerOf = (req: { deviceId?: unknown }): string =>
+    typeof req.deviceId === 'string' && /^[\w-]{1,64}$/.test(req.deviceId) ? req.deviceId : '';
+
 type LifecyclePurpose = 'agent.task.stop' | 'session.exit' | 'session.resume' | 'session.forget';
 type LifecycleError = RefusalCode | 'bad_request';
 type LifecycleBody = Record<string, unknown>;
@@ -1921,7 +1927,7 @@ type LifecycleBody = Record<string, unknown>;
  * come from that body: fields outside the seal are the relay's to change.
  */
 const openLifecycle = (
-    req: { deviceId?: string; subscriberPublicKey?: string; encrypted?: unknown },
+    req: LifecycleAsk,
     purpose: LifecyclePurpose,
     sessionName: string,
     requestId: string,
@@ -1955,6 +1961,36 @@ const openLifecycle = (
 };
 
 /**
+ * Where a session lifecycle request (exit, resume, forget) enters. A request
+ * that asked for a seal is opened by `openLifecycle` and `sealed` gets its
+ * body — the only place the action's inputs may come from. One that did not
+ * is the plaintext of a phone that never sealed: it runs `plain` only while
+ * this listener has never sealed (`plainRefusal`), the same policy a typed
+ * command has. A sealed envelope without the key to answer with is a refusal,
+ * not a plaintext request.
+ *
+ * The bucket in front is the asking device's, not the session's: a flood of
+ * unproven requests must not spend a session's command budget.
+ */
+const lifecycleGate = (
+    req: LifecycleAsk,
+    purpose: Exclude<LifecyclePurpose, 'agent.task.stop'>,
+    sessionName: string,
+    requestId: string,
+    plain: () => void,
+    sealed: (body: LifecycleBody) => void,
+    refuse: (reason: LifecycleError | 'rate_limited') => void,
+): void => {
+    if (!checkRateLimit(`life:${askerOf(req)}`)) return refuse('rate_limited');
+    if (!asksForSeal(req)) {
+        if (req.encrypted !== undefined) return refuse('e2ee_required');
+        const refusal = plainRefusal();
+        return refusal ? refuse(refusal) : plain();
+    }
+    openLifecycle(req, purpose, sessionName, requestId, sealed, refuse);
+};
+
+/**
  * Stop a background command a Claude session runs, for a trusted phone. The
  * one remote path here that ends a process, so the request has to prove who
  * sent it: it is sealed by the phone's key, which must be the asking device's
@@ -1980,8 +2016,7 @@ export const handleBackgroundTaskStopRequest = (req: BackgroundTaskStopRequest, 
     };
     const reply = (fields: { error: BackgroundTaskStopError } | { result: StopOutcome }): void => { send({ ...frame, ...fields }); };
 
-    const asker = typeof req.deviceId === 'string' && /^[\w-]{1,64}$/.test(req.deviceId) ? req.deviceId : '';
-    if (!checkRateLimit(`tasks:stop:${asker}`)) {
+    if (!checkRateLimit(`tasks:stop:${askerOf(req)}`)) {
         reply({ error: 'rate_limited' });
         return true;
     }
@@ -2341,6 +2376,10 @@ export interface SessionExitRequest {
     targetDeviceId?: string;
     sessionName?: string;
     requestId?: string;
+    deviceId?: string;
+    subscriberPublicKey?: string;
+    /** `{v: 1, requestId, at}`, sealed by the phone for this listener (`session.exit`), bound to the session. */
+    encrypted?: unknown;
 }
 
 export interface SessionExitResult {
@@ -2427,7 +2466,8 @@ export const handleSessionExitRequest = (
     send: (data: Record<string, unknown>) => void,
 ): boolean => {
     if (req.subtype !== 'agent.session.exit.request') return false;
-    if (!req.requestId || !req.sessionName) return false;
+    if (typeof req.requestId !== 'string' || !req.requestId || req.requestId.length > MAX_REQUEST_ID_LENGTH) return false;
+    if (typeof req.sessionName !== 'string' || !req.sessionName || req.sessionName.length > MAX_REQUEST_ID_LENGTH) return false;
     if (req.targetDeviceId !== computeListenerDeviceId()) return false;
 
     const sessionName = req.sessionName;
@@ -2443,25 +2483,29 @@ export const handleSessionExitRequest = (
         return true;
     };
 
-    // Same budget as resume and as a submitted command: ending a session is a
-    // session-lifecycle action, and pricing it like a keystroke would let a
-    // flood through the cheaper door.
-    // Subagent refusal first, though — outside the bucket, like resume's:
+    // Subagent refusal first — outside every bucket, like resume's:
     // ending a subagent pane is a kill(2) on the parent's child, not a
     // lifecycle action the phone is ever offered.
     if (isSubagentSessionName(sessionName)) return answer({ error: 'subagent_view_only' });
-    if (!checkRateLimit(sessionName, undefined, SUBMIT_COST)) return answer({ error: 'rate_limited' });
-    if (!sessionExists(sessionName)) return answer({ error: 'unknown_session' });
 
-    void (async () => {
-        if (await endBySignals(sessionName)) {
-            log(`⏻ exit ${sessionName}: ended`);
-            answer({ exited: true });
-            return;
-        }
-        log(`✗ exit ${sessionName}: still running after the exit signals`);
-        answer({ error: 'still_running' });
-    })();
+    // Same budget as resume and as a submitted command: ending a session is a
+    // session-lifecycle action, and pricing it like a keystroke would let a
+    // flood through the cheaper door. Charged once the request has proved who
+    // sent it, so an unproven flood cannot spend the session's budget.
+    const run = (): void => {
+        if (!checkRateLimit(sessionName, undefined, SUBMIT_COST)) return void answer({ error: 'rate_limited' });
+        if (!sessionExists(sessionName)) return void answer({ error: 'unknown_session' });
+        void (async () => {
+            if (await endBySignals(sessionName)) {
+                log(`⏻ exit ${sessionName}: ended`);
+                answer({ exited: true });
+                return;
+            }
+            log(`✗ exit ${sessionName}: still running after the exit signals`);
+            answer({ error: 'still_running' });
+        })();
+    };
+    lifecycleGate(req, 'session.exit', sessionName, requestId, run, run, (error) => void answer({ error }));
     return true;
 };
 
@@ -2476,6 +2520,11 @@ export interface SessionForgetRequest {
     /** With `agentKind`, the one run of it to delete (hwip docs/session-runs.md). Absent: every run of that agent. */
     runId?: string;
     requestId?: string;
+    deviceId?: string;
+    subscriberPublicKey?: string;
+    /** `{v: 1, requestId, at, agentKind?, runId?}`, sealed by the phone for this listener (`session.forget`), bound to the session.
+     *  A sealed request takes `agentKind` and `runId` from there; the same fields in the clear are ignored. */
+    encrypted?: unknown;
 }
 
 export interface SessionForgetResult {
@@ -2514,14 +2563,16 @@ export const handleSessionForgetRequest = (
     send: (data: Record<string, unknown>) => void,
 ): boolean => {
     if (req.subtype !== 'agent.session.forget.request') return false;
-    if (!req.requestId || !req.sessionName) return false;
+    if (typeof req.requestId !== 'string' || !req.requestId || req.requestId.length > MAX_REQUEST_ID_LENGTH) return false;
+    if (typeof req.sessionName !== 'string' || !req.sessionName || req.sessionName.length > MAX_REQUEST_ID_LENGTH) return false;
     if (req.targetDeviceId !== computeListenerDeviceId()) return false;
 
     const sessionName = req.sessionName;
+    const requestId = req.requestId;
     const reply = (fields: Partial<SessionForgetResult>): true => {
         send({
             subtype: 'agent.session.forget.result' as const,
-            requestId: req.requestId,
+            requestId,
             sessionName,
             at: new Date().toISOString(),
             ...fields,
@@ -2529,52 +2580,68 @@ export const handleSessionForgetRequest = (
         return true;
     };
 
-    // Charged like a submitted command: it writes to disk and is irreversible,
-    // so it shares the budget with the paths that start and stop processes.
-    // Subagent refusal before the bucket: a subagent has no registry record
+    // Subagent refusal before any bucket: a subagent has no registry record
     // to forget (the sweep never remembers panes), so the honest answer is
     // the view-only one, not unknown_session.
     if (isSubagentSessionName(sessionName)) return reply({ error: 'subagent_view_only' });
-    if (!checkRateLimit(sessionName, undefined, SUBMIT_COST)) return reply({ error: 'rate_limited' });
 
+    // Charged like a submitted command — it writes to disk and is irreversible,
+    // so it shares the budget with the paths that start and stop processes —
+    // once the request has proved who sent it (`lifecycleGate`).
+    const run = (agentKind: string | undefined, runId: string | undefined): void => {
+        if (!checkRateLimit(sessionName, undefined, SUBMIT_COST)) return void reply({ error: 'rate_limited' });
+        reply(forgetNow(agentKind, runId));
+    };
     // `unknown` — no tmux answered at all — is refused with the running answer
     // rather than allowed through: the phone already renders that one, and the
     // alternative is an irreversible delete (registry AND scrollback) justified
     // by a question that failed to be asked. It says so in the log, because
     // from the phone the two refusals are the same sentence.
-    const runId = typeof req.runId === 'string' && RUN_ID.test(req.runId) ? req.runId : undefined;
-    const liveness = sessionLiveness(sessionName);
-    if (liveness === 'unknown') {
-        log(`✗ forget ${sessionName}: no tmux answered, so nothing was deleted`);
-        return reply({ error: 'still_running' });
-    }
-    // A name running again is not the run being forgotten: an ended run of it goes on its own (Q29).
-    // The running run itself, a request naming no run, or a run tmux could not tell apart stay refused.
-    if (liveness === 'running') {
-        const tmuxRun = runId ? liveRunIdOf(sessionName) : undefined;
-        const live = tmuxRun ? runOfTmuxSession(sessionName, tmuxRun) : undefined;
-        if (!runId || !live || live === runId) return reply({ error: 'still_running' });
-    }
-    const outcome = forgetSession(
+    const forgetNow = (agentKind: string | undefined, runId: string | undefined): Partial<SessionForgetResult> => {
+        const liveness = sessionLiveness(sessionName);
+        if (liveness === 'unknown') {
+            log(`✗ forget ${sessionName}: no tmux answered, so nothing was deleted`);
+            return { error: 'still_running' };
+        }
+        // A name running again is not the run being forgotten: an ended run of it goes on its own (Q29).
+        // The running run itself, a request naming no run, or a run tmux could not tell apart stay refused.
+        if (liveness === 'running') {
+            const tmuxRun = runId ? liveRunIdOf(sessionName) : undefined;
+            const live = tmuxRun ? runOfTmuxSession(sessionName, tmuxRun) : undefined;
+            if (!runId || !live || live === runId) return { error: 'still_running' };
+        }
+        const outcome = forgetSession(sessionName, agentKind, runId, liveness === 'running');
+        if (outcome === 'unknown') {
+            log(`✗ forget ${sessionName}: never seen on this machine`);
+            return { error: 'unknown_session' };
+        }
+        if (outcome === 'scrollback_kept') {
+            // The registry entry is gone, so the session is no longer resumable —
+            // but its chat scrollback would not delete, and answering a flat
+            // "forgotten" would overstate what actually happened.
+            log(`🗑 forget ${sessionName}: dropped from the record, but its chat scrollback would not delete`);
+            return { forgotten: true, scrollbackKept: true };
+        }
+        log(`🗑 forget ${sessionName}: dropped from this machine's record`);
+        return { forgotten: true };
+    };
+    lifecycleGate(
+        req,
+        'session.forget',
         sessionName,
-        typeof req.agentKind === 'string' ? req.agentKind : undefined,
-        runId,
-        liveness === 'running',
+        requestId,
+        // No seal asked for, none to read: the fields in the clear, as before.
+        () => run(typeof req.agentKind === 'string' ? req.agentKind : undefined, typeof req.runId === 'string' && RUN_ID.test(req.runId) ? req.runId : undefined),
+        (body) => {
+            // Only the sealed body names the run: a relay can rewrite what sits outside it.
+            const { agentKind, runId } = body;
+            if (agentKind !== undefined && typeof agentKind !== 'string') return void reply({ error: 'bad_request' });
+            if (runId !== undefined && (typeof runId !== 'string' || !RUN_ID.test(runId))) return void reply({ error: 'bad_request' });
+            run(agentKind, runId);
+        },
+        (error) => void reply({ error }),
     );
-    if (outcome === 'unknown') {
-        log(`✗ forget ${sessionName}: never seen on this machine`);
-        return reply({ error: 'unknown_session' });
-    }
-    if (outcome === 'scrollback_kept') {
-        // The registry entry is gone, so the session is no longer resumable —
-        // but its chat scrollback would not delete, and answering a flat
-        // "forgotten" would overstate what actually happened.
-        log(`🗑 forget ${sessionName}: dropped from the record, but its chat scrollback would not delete`);
-        return reply({ forgotten: true, scrollbackKept: true });
-    }
-
-    log(`🗑 forget ${sessionName}: dropped from this machine's record`);
-    return reply({ forgotten: true });
+    return true;
 };
 
 // ─── Deep pull: scrollback above the live window ───────────────────

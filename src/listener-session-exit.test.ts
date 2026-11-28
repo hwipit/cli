@@ -272,7 +272,8 @@ describe('agent.session.exit.request — sealed', () => {
     const ask = async (msg: Record<string, unknown>) => {
         const before = sent.length;
         expect(handleSessionExitRequest(msg as never, send)).toBe(true);
-        for (let i = 0; i < 100 && sent.length === before; i += 1) {
+        // Real time for WebCrypto, fake time for the signal steps.
+        for (const deadline = performance.now() + 5000; performance.now() < deadline && sent.length === before;) {
             await vi.advanceTimersByTimeAsync(SESSION_EXIT_STEP_MS);
             await new Promise((resolve) => setImmediate(resolve));
         }
@@ -350,7 +351,7 @@ describe('agent.session.exit.request — sealed', () => {
         const replayed = { ...msg, subtype: 'agent.session.forget.request' };
         const before = sent.length;
         handleSessionForgetRequest(replayed as never, send);
-        for (let i = 0; i < 20 && sent.length === before; i += 1) await new Promise((resolve) => setImmediate(resolve));
+        for (const deadline = performance.now() + 5000; performance.now() < deadline && sent.length === before;) await new Promise((resolve) => setImmediate(resolve));
         expect(sent.at(-1)).toMatchObject({ error: 'bad_request' });
     });
 });

@@ -2169,6 +2169,13 @@ export interface SessionResumeRequest {
      */
     fresh?: boolean;
     requestId?: string;
+    deviceId?: string;
+    subscriberPublicKey?: string;
+    /**
+     * `{v: 1, requestId, at, agentKind?, runId?, fresh?}`, sealed by the phone for this listener (`session.resume`), bound to the
+     * session. A sealed request takes `agentKind`, `runId` and `fresh` from there; the same fields in the clear are ignored.
+     */
+    encrypted?: unknown;
 }
 
 /** A run id as the registry writes it: tmux `session_created`, epoch seconds. */
@@ -2273,13 +2280,15 @@ export const handleSessionResumeRequest = (
     send: (data: Record<string, unknown>) => void,
 ): boolean => {
     if (req.subtype !== 'agent.session.resume.request') return false;
-    if (!req.requestId || !req.sessionName) return false;
+    if (typeof req.requestId !== 'string' || !req.requestId || req.requestId.length > MAX_REQUEST_ID_LENGTH) return false;
+    if (typeof req.sessionName !== 'string' || !req.sessionName || req.sessionName.length > MAX_REQUEST_ID_LENGTH) return false;
     if (req.targetDeviceId !== computeListenerDeviceId()) return false;
 
     const sessionName = req.sessionName;
+    const requestId = req.requestId;
     const base = {
         subtype: 'agent.session.resume.result' as const,
-        requestId: req.requestId,
+        requestId,
         sessionName,
         at: new Date().toISOString(),
     };
@@ -2292,83 +2301,102 @@ export const handleSessionResumeRequest = (
     // before the rate bucket, so refused subagent traffic costs nothing.
     if (isSubagentSessionName(sessionName)) return reply({ error: 'subagent_view_only' });
 
-    // Charged like a submitted command, not like a keystroke: this starts a
-    // process, and the two share one budget so a flood cannot be laundered
-    // through whichever path is cheaper.
-    if (!checkRateLimit(sessionName, undefined, SUBMIT_COST)) return reply({ error: 'rate_limited' });
+    // What the phone asked for comes in as arguments: from the sealed body when it sealed, from the clear fields only when it did not.
+    const run = (agentKind: unknown, rawRunId: unknown, wantsFresh: boolean): true => {
+        // Charged like a submitted command, not like a keystroke: this starts a
+        // process, and the two share one budget so a flood cannot be laundered
+        // through whichever path is cheaper.
+        if (!checkRateLimit(sessionName, undefined, SUBMIT_COST)) return reply({ error: 'rate_limited' });
 
-    if (req.fresh === true && req.agentKind === SHELL_START_KIND) return startShellBeside(sessionName, reply);
+        if (wantsFresh && agentKind === SHELL_START_KIND) return startShellBeside(sessionName, reply);
 
-    // A named agent is answered with that run or not at all. Falling back to the
-    // newest run would start claude for a phone that asked for pi — silently,
-    // which is the exact failure this path exists to remove. A phone that names
-    // nothing still means the newest run.
-    const runId = typeof req.runId === 'string' && RUN_ID.test(req.runId) ? req.runId : undefined;
-    const known =
-        typeof req.agentKind === 'string'
-            ? recallRun(sessionName, req.agentKind, Date.now(), runId)
-            : recallSession(sessionName, Date.now(), runId);
-    if (!known) {
-        log(`✗ resume ${sessionName}: never seen on this machine`);
-        return reply({ error: 'unknown_session' });
-    }
-    // A live name is refused unless the request names a run: then the phone
-    // asked for one earlier conversation, and the session holding the name is
-    // a different one — so it starts beside it, under the next free name of
-    // the family `hwip cc` would pick (Q41), counted from the family base so a
-    // busy `<base>-2` leads to `<base>-3`. A request without a run id is an
-    // older app that only knows the name, and still gets the refusal it renders.
-    // A fresh start asks for a new session, so a live name is no refusal either, and no conversation is picked up —
-    // the live one holding the recorded conversation included.
-    const fresh = req.fresh === true;
-    const live = new Set(liveSessionNames() ?? []);
-    const target = !live.has(sessionName)
-        ? sessionName
-        : runId !== undefined || fresh
-            ? familyNames(familyBase(sessionName)).find((name) => !live.has(name))
-            : undefined;
-    if (!target || (!fresh && conversationRunning(known, live))) return reply({ error: 'already_running' });
-    if (!sessionDirectoryExists(known)) {
-        log(`✗ resume ${sessionName}: ${known.cwd} is gone`);
-        return reply({ error: 'missing_directory' });
-    }
-    const agent = REMOTE_AGENTS.find((a) => a.kind === known.agentKind);
-    if (!agent) {
-        log(`✗ resume ${sessionName}: no binary for agent kind ${known.agentKind}`);
-        return reply({ error: 'unknown_agent' });
-    }
-    // A fresh start leaves one more process running each time, so the family pays on a bucket of its own as well —
-    // charged only here, where it starts one: a refusal above says why, not that the budget ran out.
-    if (fresh && !checkRateLimit(`start:${familyBase(sessionName)}`, undefined, FRESH_START_COST)) {
-        return reply({ error: 'rate_limited' });
-    }
+        // A named agent is answered with that run or not at all. Falling back to the
+        // newest run would start claude for a phone that asked for pi — silently,
+        // which is the exact failure this path exists to remove. A phone that names
+        // nothing still means the newest run.
+        const runId = typeof rawRunId === 'string' && RUN_ID.test(rawRunId) ? rawRunId : undefined;
+        const known =
+            typeof agentKind === 'string'
+                ? recallRun(sessionName, agentKind, Date.now(), runId)
+                : recallSession(sessionName, Date.now(), runId);
+        if (!known) {
+            log(`✗ resume ${sessionName}: never seen on this machine`);
+            return reply({ error: 'unknown_session' });
+        }
+        // A live name is refused unless the request names a run: then the phone
+        // asked for one earlier conversation, and the session holding the name is
+        // a different one — so it starts beside it, under the next free name of
+        // the family `hwip cc` would pick (Q41), counted from the family base so a
+        // busy `<base>-2` leads to `<base>-3`. A request without a run id is an
+        // older app that only knows the name, and still gets the refusal it renders.
+        // A fresh start asks for a new session, so a live name is no refusal either, and no conversation is picked up —
+        // the live one holding the recorded conversation included.
+        const fresh = wantsFresh;
+        const live = new Set(liveSessionNames() ?? []);
+        const target = !live.has(sessionName)
+            ? sessionName
+            : runId !== undefined || fresh
+                ? familyNames(familyBase(sessionName)).find((name) => !live.has(name))
+                : undefined;
+        if (!target || (!fresh && conversationRunning(known, live))) return reply({ error: 'already_running' });
+        if (!sessionDirectoryExists(known)) {
+            log(`✗ resume ${sessionName}: ${known.cwd} is gone`);
+            return reply({ error: 'missing_directory' });
+        }
+        const agent = REMOTE_AGENTS.find((a) => a.kind === known.agentKind);
+        if (!agent) {
+            log(`✗ resume ${sessionName}: no binary for agent kind ${known.agentKind}`);
+            return reply({ error: 'unknown_agent' });
+        }
+        // A fresh start leaves one more process running each time, so the family pays on a bucket of its own as well —
+        // charged only here, where it starts one: a refusal above says why, not that the budget ran out.
+        if (fresh && !checkRateLimit(`start:${familyBase(sessionName)}`, undefined, FRESH_START_COST)) {
+            return reply({ error: 'rate_limited' });
+        }
 
-    // argv, never a shell string: the binary comes from the agent table and the
-    // directory from our own record, and neither is concatenated into anything
-    // a shell would re-parse. A recorded label means the session carried
-    // sidecar options (wrapper `sessionSidecarArgs`) or the sweep inferred them
-    // from its checkout (config `groupOf`); a new tmux session starts without
-    // them, so they go on or it returns in a card of its own.
-    const sidecar = known.label && known.project
-        ? [';', 'set-option', SESSION_PROJECT_OPTION, known.project, ';', 'set-option', SESSION_LABEL_OPTION, known.label]
-        : [];
-    const conversation = fresh ? null : resumableConversation(agent, known);
-    // tmux gives the new pane this client's PATH. A login service's PATH has none
-    // of the agent directories, so they go on as schedule launches add them —
-    // otherwise the agent is not found and the session ends as it starts.
-    const started = spawnSync(
-        'tmux',
-        tmuxArgs(['new-session', '-d', '-s', target, '-c', known.cwd, agent.binary, ...(conversation?.args ?? []), ...sidecar]),
-        { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PATH: withAgentDirs(process.env.PATH) } },
+        // argv, never a shell string: the binary comes from the agent table and the
+        // directory from our own record, and neither is concatenated into anything
+        // a shell would re-parse. A recorded label means the session carried
+        // sidecar options (wrapper `sessionSidecarArgs`) or the sweep inferred them
+        // from its checkout (config `groupOf`); a new tmux session starts without
+        // them, so they go on or it returns in a card of its own.
+        const sidecar = known.label && known.project
+            ? [';', 'set-option', SESSION_PROJECT_OPTION, known.project, ';', 'set-option', SESSION_LABEL_OPTION, known.label]
+            : [];
+        const conversation = fresh ? null : resumableConversation(agent, known);
+        // tmux gives the new pane this client's PATH. A login service's PATH has none
+        // of the agent directories, so they go on as schedule launches add them —
+        // otherwise the agent is not found and the session ends as it starts.
+        const started = spawnSync(
+            'tmux',
+            tmuxArgs(['new-session', '-d', '-s', target, '-c', known.cwd, agent.binary, ...(conversation?.args ?? []), ...sidecar]),
+            { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PATH: withAgentDirs(process.env.PATH) } },
+        );
+        if (started.status !== 0) {
+            log(`✗ resume ${sessionName}: tmux refused (${(started.stderr ?? '').trim() || 'no detail'})`);
+            return reply({ error: 'start_failed' });
+        }
+        const resumedFrom = conversation ? ` (conversation ${conversation.id.slice(0, 8)})` : '';
+        const beside = target === sessionName ? '' : ` as ${target}`;
+        log(`${fresh ? '＋ start' : '⟲ resume'} ${sessionName}${beside}: ${agent.binary}${resumedFrom} in ${known.cwd}`);
+        return reply({ resumed: true, sessionName: target });
+    };
+    lifecycleGate(
+        req,
+        'session.resume',
+        sessionName,
+        requestId,
+        () => void run(req.agentKind, req.runId, req.fresh === true),
+        (body) => {
+            const { agentKind, runId, fresh } = body;
+            if (agentKind !== undefined && typeof agentKind !== 'string') return void reply({ error: 'bad_request' });
+            if (runId !== undefined && typeof runId !== 'string') return void reply({ error: 'bad_request' });
+            if (fresh !== undefined && typeof fresh !== 'boolean') return void reply({ error: 'bad_request' });
+            run(agentKind, runId, fresh === true);
+        },
+        (error) => void reply({ error }),
     );
-    if (started.status !== 0) {
-        log(`✗ resume ${sessionName}: tmux refused (${(started.stderr ?? '').trim() || 'no detail'})`);
-        return reply({ error: 'start_failed' });
-    }
-    const resumedFrom = conversation ? ` (conversation ${conversation.id.slice(0, 8)})` : '';
-    const beside = target === sessionName ? '' : ` as ${target}`;
-    log(`${fresh ? '＋ start' : '⟲ resume'} ${sessionName}${beside}: ${agent.binary}${resumedFrom} in ${known.cwd}`);
-    return reply({ resumed: true, sessionName: target });
+    return true;
 };
 
 export interface SessionExitRequest {

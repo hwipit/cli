@@ -111,6 +111,17 @@ describe('a proxy from the environment', () => {
         expect(globalThis.fetch).not.toBe(builtInFetch);
     });
 
+    // cli#58: once a proxy has been set, a later call with no proxy must also put
+    // the built-in fetch back — only the dispatcher was restored, so requests
+    // kept going through undici's fetch (and the last proxy's dispatcher slot).
+    it('puts the built-in fetch back when a later call has no proxy', async () => {
+        await useProxyFromEnv({ HTTPS_PROXY: proxyUrl });
+        expect(globalThis.fetch).not.toBe(builtInFetch);
+
+        await useProxyFromEnv({});
+        expect(globalThis.fetch).toBe(builtInFetch);
+    });
+
     it('carries the listener socket as well as fetch, and the messages get through', async () => {
         await useProxyFromEnv({ HTTP_PROXY: proxyUrl, HTTPS_PROXY: proxyUrl });
 

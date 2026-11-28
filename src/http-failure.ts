@@ -245,6 +245,9 @@ interface ActiveProxy {
 }
 let active: ActiveProxy | null = null;
 
+/** The fetch useProxyFromEnv found in globalThis at load, put back when a later call has no proxy (cli#58). */
+const fetchWithoutProxy = globalThis.fetch;
+
 /** undici says "experimental" once, on stderr, the first time it builds the env-proxy agent. */
 const withoutExperimentalWarning = <T>(build: () => T): T => {
     const emit = process.emitWarning;
@@ -320,6 +323,7 @@ export const useProxyFromEnv = async (env: ProxyEnv = process.env, config: Proxy
     // `http_proxy= hwip …`.
     if (!httpProxy && !httpsProxy) {
         active = null;
+        globalThis.fetch = fetchWithoutProxy;
         return;
     }
     checkProxyUrl(envHttp === undefined ? '"httpProxy" in config.json' : env.http_proxy !== undefined ? 'http_proxy' : 'HTTP_PROXY', httpProxy);

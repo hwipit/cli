@@ -127,6 +127,7 @@ import { useHttp1Transport, webSocketProxyOptions } from './http-failure.js';
 import { notifyDesktop, type DesktopNotification } from './desktop-notify.js';
 import { createWorktreeCleanup } from './listener-worktree-cleanup.js';
 import { tmuxRun } from './worktree.js';
+import { fitAttachmentName } from './attachment-name.js';
 import { chunkOf, createFileDecryptStream, DOWNLOAD_MAX_BYTES, GCM_TAG_BYTES, saveStream, withIdleTimeout } from './file-crypto.js';
 import { createTurnWatchers, type SendTurnFrame, type TurnWatchControl } from './turn-watch.js';
 import { diskTurnRing } from './turn-ring.js';
@@ -5685,20 +5686,6 @@ let deviceKeyRegistration: DeviceKeyRegistration | null = null;
 let deviceKeyRegistered = false;
 
 /**
- * Make a filesystem-safe single path segment: take the basename (drops
- * any `../` prefix), strip control chars and embedded separators, remove
- * leading dots, and cap length. Empty/dot-only names use the fallback.
- */
-const safeSegment = (raw: string, fallback: string): string => {
-    const cleaned = basename(raw)
-        .replace(/[\x00-\x1f\x7f]/g, '')
-        .replace(/[/\\]/g, '_')
-        .replace(/^\.+/, '')
-        .trim();
-    return (cleaned || fallback).slice(0, 200);
-};
-
-/**
  * How long the API may take to name an attachment's presigned URL. Unbounded,
  * a stalled call held the command that carried the file forever: it was never
  * typed, and nothing said why.
@@ -5845,7 +5832,7 @@ export const downloadAttachments = async (
     sealed?: SealedAttachments,
     io: AttachmentIo = {},
 ): Promise<string[]> => {
-    const dir = join(ATTACHMENTS_DIR, safeSegment(pushId, 'push'));
+    const dir = join(ATTACHMENTS_DIR, fitAttachmentName(pushId, 'push'));
     const paths: string[] = [];
     const taken = new Map<string, string>();
     if (sealed) {
@@ -5858,7 +5845,7 @@ export const downloadAttachments = async (
                 const bytes = meta && Number.isSafeInteger(meta.size) && meta.size >= 0 ? opened.subarray(0, meta.size) : opened;
                 const name = meta?.name ?? f.fileName;
                 mkdirHandedBack(dir);
-                const { abs, fresh } = attachmentPath(taken, dir, safeSegment(name || `file-${i}`, `file-${i}`), bytes);
+                const { abs, fresh } = attachmentPath(taken, dir, fitAttachmentName(name || `file-${i}`, `file-${i}`), bytes);
                 paths.push(abs);
                 if (!fresh) continue;
                 writeFileSync(abs, bytes);
@@ -5884,7 +5871,7 @@ export const downloadAttachments = async (
         try {
             const bytes = await fetchAttachmentBytes(f.fileKey, ctx, io);
             mkdirHandedBack(dir);
-            const { abs, fresh } = attachmentPath(taken, dir, safeSegment(f.fileName || `file-${i}`, `file-${i}`), bytes);
+            const { abs, fresh } = attachmentPath(taken, dir, fitAttachmentName(f.fileName || `file-${i}`, `file-${i}`), bytes);
             if (fresh) {
                 try {
                     writeFileSync(abs, bytes);
@@ -5932,7 +5919,7 @@ export const downloadSealedEach = async (
     sealed: SealedAttachments & { files: SealedFileMeta[] },
     io: AttachmentIo = {},
 ): Promise<{ paths: string[]; missing: string[] }> => {
-    const dir = join(ATTACHMENTS_DIR, safeSegment(eventId, 'answer'));
+    const dir = join(ATTACHMENTS_DIR, fitAttachmentName(eventId, 'answer'));
     const taken = new Map<string, string>();
     const paths: string[] = [];
     const missing: string[] = [];
@@ -5945,7 +5932,7 @@ export const downloadSealedEach = async (
             // Padded before sealing: cut back to the size the seal gives.
             const bytes = meta && Number.isSafeInteger(meta.size) && meta.size >= 0 ? opened.subarray(0, meta.size) : opened;
             mkdirHandedBack(dir);
-            const { abs, fresh } = attachmentPath(taken, dir, safeSegment(name, `file-${i}`), bytes);
+            const { abs, fresh } = attachmentPath(taken, dir, fitAttachmentName(name, `file-${i}`), bytes);
             if (!fresh) {
                 // The same bytes under a name already saved: said, so no file goes unaccounted for.
                 missing.push(`${name}: the same file was attached twice`);

@@ -227,7 +227,15 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
         bufferFails = true;
         openStream('hwip-a');
         handleCommandInput(input({ keys: undefined, body: 'hello' }), send);
-        expect(injections()).toEqual(['-l -t %0 hello', '-t %0 Enter']);
+        expect(injections()).toEqual(['-l -t %0 -- hello', '-t %0 Enter']);
+    });
+
+    it('typing fallback ends options with `--` so a leading-dash message is text', () => {
+        // `send-keys -l -t %0 -N 3 hi` would parse `-N 3` as tmux's repeat count.
+        bufferFails = true;
+        openStream('hwip-a');
+        handleCommandInput(input({ keys: undefined, body: '-N 3 hi' }), send);
+        expect(injections()).toEqual(['-l -t %0 -- -N 3 hi', '-t %0 Enter']);
     });
 
     it('drops the buffer it filled when the paste fails, then falls back', () => {
@@ -236,7 +244,7 @@ describe('agent.command.input — ephemeral injection into a streamed pane', () 
         openStream('hwip-a');
         handleCommandInput(input({ keys: undefined, body: 'hello' }), send);
         expect(tmuxInvocations()).toContain('delete-buffer -b hwip-inject');
-        expect(injections()).toEqual(['-l -t %0 hello', '-t %0 Enter']);
+        expect(injections()).toEqual(['-l -t %0 -- hello', '-t %0 Enter']);
     });
 
     it('refuses input for a session with no live stream', () => {

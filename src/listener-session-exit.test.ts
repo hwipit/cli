@@ -95,13 +95,13 @@ describe('agent.session.exit.request — ending a running session', () => {
 
     /**
      * Everything sent to the pane, in order, normalised past tmux's two
-     * argument shapes: `send-keys -l -t <s> <text>` types text, while
+     * argument shapes: `send-keys -l -t <s> -- <text>` types text, while
      * `send-keys -t <s> <tokens…>` presses named keys.
      */
     const signals = () =>
         tmuxCalls
             .filter((c) => c[0] === 'send-keys')
-            .map((c) => (c[1] === '-l' ? ['type', c[4]] : c.slice(3)));
+            .map((c) => (c[1] === '-l' ? ['type', c[5]] : c.slice(3)));
 
     /** What this machine recorded about the session while it was alive — the
      *  only place the agent's identity (and so its quit command) comes from. */

@@ -1907,3 +1907,64 @@ describe('hostile relay — a plaintext command to a listener that only seals', 
         expect(typed).toEqual(['do the thing']);
     });
 });
+
+
+describe('hostile relay — session lifecycle requests (exit, resume, forget)', () => {
+    const setUpLifecycle = async () => {
+        const rig = await setUp();
+        await rig.screenRequest();
+        const { initDeviceCrypto, getDevicePublicKey } = await import('./crypto.js');
+        await initDeviceCrypto();
+        const listenerKey = getDevicePublicKey() as string;
+        tmuxCalls = [];
+        const subtypes = { exit: 'agent.session.exit.request', resume: 'agent.session.resume.request', forget: 'agent.session.forget.request' } as const;
+        const handlers = { exit: rig.listener.handleSessionExitRequest, resume: rig.listener.handleSessionResumeRequest, forget: rig.listener.handleSessionForgetRequest };
+        const request = (kind: keyof typeof subtypes, fields: object = {}) => handlers[kind]({
+            subtype: subtypes[kind], targetDeviceId: rig.me, sessionName: 'hwip-a', requestId: 'l1', deviceId: PHONE_ID, ...fields,
+        } as never, rig.send);
+        const sealed = (who: V2Party, kind: keyof typeof subtypes, inner: object = {}, session = 'hwip-a') =>
+            who.seal(`session.${kind}`, JSON.stringify({ v: 1, requestId: 'l1', at: new Date().toISOString(), ...inner }), listenerKey, session);
+        /** Anything that would end, create or delete: the commands tmux was given other than questions. */
+        const mutations = () => tmuxCalls.filter((c) => ['send-keys', 'new', 'new-session', 'kill-session'].includes(c[0]));
+        return { ...rig, request, sealed, mutations };
+    };
+
+    it('should do nothing for a plain request of any of the three', async () => {
+        const { request, sent, mutations } = await setUpLifecycle();
+
+        request('exit');
+        request('forget', { requestId: 'l2' });
+        request('resume', { requestId: 'l3', agentKind: 'shell', fresh: true });
+        await aFewTicks();
+
+        expect(sent.map((m) => m.error)).toEqual(['e2ee_required', 'e2ee_required', 'e2ee_required']);
+        expect(mutations()).toEqual([]);
+    }, 20_000);
+
+    it('should do nothing for a request the relay sealed under the phone\'s key field, or under its own key', async () => {
+        const { request, relay, phone, sealed, sent, mutations } = await setUpLifecycle();
+
+        for (const kind of ['exit', 'forget', 'resume'] as const) {
+            request(kind, { subscriberPublicKey: phone.publicKey, encrypted: sealed(relay, kind) });
+            request(kind, { requestId: 'l1', subscriberPublicKey: relay.publicKey, encrypted: sealed(relay, kind) });
+        }
+        await aFewTicks();
+
+        expect(sent.map((m) => m.error).sort()).toEqual([...Array(3).fill('bad_request'), ...Array(3).fill('subscriber_unverified')]);
+        expect(mutations()).toEqual([]);
+    });
+
+    it('should ignore the clear agentKind and fresh of a sealed resume, and refuse the phone\'s request handed back', async () => {
+        const { request, phone, sealed, sent, mutations } = await setUpLifecycle();
+        // The phone sealed "resume the recorded agent"; the relay adds "shell, fresh" outside the seal.
+        const message = { subscriberPublicKey: phone.publicKey, encrypted: sealed(phone, 'resume', { agentKind: 'claude' }), agentKind: 'shell', fresh: true };
+
+        request('resume', message);
+        await aFewTicks();
+        request('resume', message);
+        await aFewTicks();
+
+        expect(sent.map((m) => m.error)).toEqual(['unknown_session', 'bad_request']);
+        expect(mutations()).toEqual([]);
+    });
+});

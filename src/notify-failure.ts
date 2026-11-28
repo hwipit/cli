@@ -34,7 +34,7 @@ import { readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { AuthenticationError, HwipError, QuotaExceededError } from './errors.js';
 import { stateDir } from './gate.js';
-import { handBackToSudoUser, mkdirHandedBack } from './private-files.js';
+import { ensurePrivateDir, handBackToSudoUser } from './private-files.js';
 
 export const NOTIFY_FAILURE_KINDS = [
     'no-key', 'auth', 'quota', 'rate-limit', 'client', 'server', 'timeout', 'network', 'no-app', 'unsealed',
@@ -79,7 +79,7 @@ export const recordNotifyFailure = (
     const path = notifyFailurePath();
     const tmp = `${path}.${process.pid}.tmp`;
     try {
-        mkdirHandedBack(stateDir());
+        ensurePrivateDir(stateDir());
         // Temp + rename: a reader never sees half a file.
         writeFileSync(tmp, `${JSON.stringify(record)}\n`, { mode: 0o600 });
         handBackToSudoUser(tmp);

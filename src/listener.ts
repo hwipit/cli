@@ -24,7 +24,7 @@
 import { spawnSync } from 'child_process';
 import { createHash } from 'crypto';
 import { constants as fsConstants, copyFileSync, existsSync, linkSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, truncateSync, unlinkSync, writeFileSync } from 'fs';
-import { handBackToSudoUser, mkdirHandedBack } from './private-files.js';
+import { ensurePrivateDir, handBackToSudoUser, mkdirHandedBack } from './private-files.js';
 import { homedir, hostname, userInfo } from 'os';
 import { join, basename, dirname, isAbsolute, resolve, sep } from 'path';
 import WebSocket from 'ws';
@@ -5371,8 +5371,8 @@ export const writeRemoteMarker = (
 ): boolean => {
     const hash = projectHash(paneCwd);
     try {
-        mkdirHandedBack(stateDir(), 0o700);
-        writeFileSync(remoteMarkerPath(hash), `${Math.floor(now() / 1000)} ${remoteDigest(text)}\n`);
+        ensurePrivateDir(stateDir());
+        writeFileSync(remoteMarkerPath(hash), `${Math.floor(now() / 1000)} ${remoteDigest(text)}\n`, { mode: 0o600 });
         handBackToSudoUser(remoteMarkerPath(hash));
         return true;
     } catch {

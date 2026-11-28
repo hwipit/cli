@@ -11,7 +11,7 @@
 import { lstatSync, readFileSync, writeFileSync } from 'node:fs';
 import { delimiter, dirname, isAbsolute, join } from 'node:path';
 import { stateDir } from './gate.js';
-import { handBackToSudoUser, mkdirHandedBack } from './private-files.js';
+import { ensurePrivateDir, handBackToSudoUser } from './private-files.js';
 
 /** More than anyone has agents in; bounds what a schedule launch puts on PATH. */
 const MAX_DIRS = 16;
@@ -54,7 +54,7 @@ export const rememberAgentDir = (binary: string): void => {
     const dirs = readDirs();
     if (dirs.includes(dir)) return;
     try {
-        mkdirHandedBack(stateDir(), 0o700);
+        ensurePrivateDir(stateDir());
         writeFileSync(path, JSON.stringify([...dirs, dir].slice(-MAX_DIRS)), { mode: 0o600 });
         handBackToSudoUser(path);
     } catch {

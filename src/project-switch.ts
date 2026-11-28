@@ -1,7 +1,7 @@
 import { lstatSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { projectHash, stateDir } from './gate.js';
-import { createdHandedBack, mkdirHandedBack } from './private-files.js';
+import { createdHandedBack, ensurePrivateDir } from './private-files.js';
 import { repoRootOf } from './session-diff.js';
 
 /**
@@ -64,9 +64,9 @@ export const projectSwitch = (name: string, envVar: string): ProjectSwitch => {
                 }
                 return;
             }
-            mkdirHandedBack(stateDir());
+            ensurePrivateDir(stateDir());
             createdHandedBack(file);
-            writeFileSync(file, 'off\n');
+            writeFileSync(file, 'off\n', { mode: 0o600 });
         },
     };
 };

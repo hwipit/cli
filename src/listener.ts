@@ -1897,13 +1897,61 @@ const STOP_CLOCK_SKEW_MS = 5 * 60_000;
 const actedStops = new Map<string, number>();
 const MAX_ACTED_STOPS = 512;
 
-/** True the first time a phone's request id is seen. */
-const firstStop = (key: string, now: number): boolean => {
+/** True the first time a phone's request id is seen for that purpose. */
+const firstSeen = (purpose: string, key: string, now: number): boolean => {
     for (const [seen, at] of actedStops) if (now - at > 2 * STOP_CLOCK_SKEW_MS) actedStops.delete(seen);
-    if (actedStops.has(key)) return false;
+    const id = `${purpose}\n${key}`;
+    if (actedStops.has(id)) return false;
     if (actedStops.size >= MAX_ACTED_STOPS) actedStops.delete(actedStops.keys().next().value!);
-    actedStops.set(key, now);
+    actedStops.set(id, now);
     return true;
+};
+
+type LifecyclePurpose = 'agent.task.stop' | 'session.exit' | 'session.resume' | 'session.forget';
+type LifecycleError = RefusalCode | 'bad_request';
+type LifecycleBody = Record<string, unknown>;
+
+/**
+ * The one gate a destructive phone request passes: it asked for a seal, the
+ * seal is the asking device's trusted key's, it opens for this purpose and
+ * session, and names this request and a time near now inside it. `opened`
+ * gets the body (still `unknown` fields) only the first time that request id
+ * is seen — a relay that kept a sealed request can hand it back, and the
+ * second one is refused. Everything the action reads from the phone has to
+ * come from that body: fields outside the seal are the relay's to change.
+ */
+const openLifecycle = (
+    req: { deviceId?: string; subscriberPublicKey?: string; encrypted?: unknown },
+    purpose: LifecyclePurpose,
+    sessionName: string,
+    requestId: string,
+    opened: (body: LifecycleBody) => void,
+    refused: (reason: LifecycleError) => void,
+): void => {
+    const sealed = req.encrypted;
+    if (!asksForSeal(req)) return refused('e2ee_required');
+    if (!isSealedV2(sealed)) return refused('bad_request');
+    whenSealAdmitted(
+        req as Pick<ScreenRequest, 'deviceId' | 'subscriberPublicKey'>,
+        (phoneKey) => {
+            void (async () => {
+                let body: LifecycleBody | null;
+                try {
+                    // Untrusted until the checks below: every field is `unknown`.
+                    body = JSON.parse(await openV2(purpose, sealed, phoneKey, sessionName)) as LifecycleBody | null;
+                } catch {
+                    return refused('bad_request');
+                }
+                if (typeof body !== 'object' || body === null || body.v !== 1 || body.requestId !== requestId) return refused('bad_request');
+                const now = Date.now();
+                const at = typeof body.at === 'string' ? Date.parse(body.at) : Number.NaN;
+                if (!Number.isFinite(at) || Math.abs(now - at) > STOP_CLOCK_SKEW_MS) return refused('bad_request');
+                if (!firstSeen(purpose, `${phoneKey}\n${requestId}`, now)) return refused('bad_request');
+                opened(body);
+            })();
+        },
+        refused,
+    );
 };
 
 /**
@@ -1941,27 +1989,9 @@ export const handleBackgroundTaskStopRequest = (req: BackgroundTaskStopRequest, 
         reply({ error: 'e2ee_required' });
         return true;
     }
-    const sealedRequest = req.encrypted;
-    if (!isSealedV2(sealedRequest)) {
-        reply({ error: 'bad_request' });
-        return true;
-    }
 
-    const answer = async (phoneKey: string): Promise<{ error: BackgroundTaskStopError } | { result: StopOutcome }> => {
-        let asked: { v?: unknown; requestId?: unknown; taskId?: unknown; at?: unknown } | null;
-        try {
-            // Untrusted until the checks below: every field is `unknown`.
-            asked = JSON.parse(await openV2('agent.task.stop', sealedRequest, phoneKey, sessionName)) as typeof asked;
-        } catch {
-            return { error: 'bad_request' };
-        }
-        if (typeof asked !== 'object' || asked === null || asked.v !== 1 || asked.requestId !== requestId) return { error: 'bad_request' };
+    const answer = async (asked: LifecycleBody): Promise<{ error: BackgroundTaskStopError } | { result: StopOutcome }> => {
         if (typeof asked.taskId !== 'string' || !TASK_ID_PATTERN.test(asked.taskId)) return { error: 'bad_request' };
-        const now = Date.now();
-        const at = typeof asked.at === 'string' ? Date.parse(asked.at) : Number.NaN;
-        if (!Number.isFinite(at) || Math.abs(now - at) > STOP_CLOCK_SKEW_MS) return { error: 'bad_request' };
-        // A relay that kept a sealed stop can hand it back; the seal names the request, so the second one is refused.
-        if (!firstStop(`${phoneKey}\n${requestId}`, now)) return { error: 'bad_request' };
         const { taskId } = asked;
         const running = backgroundTasksFor(sessionName);
         const task = running?.tasks.find((t) => t.id === taskId);
@@ -1971,10 +2001,13 @@ export const handleBackgroundTaskStopRequest = (req: BackgroundTaskStopRequest, 
         return { result };
     };
 
-    whenSealAdmitted(
+    openLifecycle(
         req,
-        (phoneKey) => {
-            answer(phoneKey)
+        'agent.task.stop',
+        sessionName,
+        requestId,
+        (asked) => {
+            answer(asked)
                 .then(reply)
                 .catch((err) => {
                     log(`⧉ tasks ${sessionName}: stop failed (${err instanceof Error ? err.message : err})`);

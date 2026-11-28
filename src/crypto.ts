@@ -716,6 +716,9 @@ export type SealPurpose =
   | 'agent.tasks'
   | 'agent.task.stop'
   | 'agent.task.output'
+  | 'session.exit'
+  | 'session.resume'
+  | 'session.forget'
   | 'turn.batch';
 
 export interface SealedV2 {

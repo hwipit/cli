@@ -727,15 +727,15 @@ describe('handlePush key events', () => {
         expect(sent).toBe(false);
     });
 
-    it('prefers keys over body when both are present', async () => {
+    it('refuses keys beside a body, typing neither', async () => {
         let injectedText = false;
         let sentKeys = false;
         const ok = await handlePush(
             { pushId: '1', type: 'agent.command', agentSessionName: 'hwip-myapp', keys: ['escape'], body: 'ignored' },
             keysDeps({ inject: () => { injectedText = true; return true; }, sendKeys: () => { sentKeys = true; return true; } }),
         );
-        expect(ok).toBe(true);
-        expect(sentKeys).toBe(true);
+        expect(ok).toBe(false);
+        expect(sentKeys).toBe(false);
         expect(injectedText).toBe(false);
     });
 });
@@ -807,7 +807,7 @@ describe('handlePush insert (text without the submitting Enter)', () => {
         expect(touched).toBe(false);
     });
 
-    it('prefers keys over insert when both are present', async () => {
+    it('refuses keys beside an insert, typing neither', async () => {
         let inserted = false;
         let sentKeys = false;
         const ok = await handlePush(
@@ -817,8 +817,8 @@ describe('handlePush insert (text without the submitting Enter)', () => {
                 insertText: () => { inserted = true; return true; },
             }),
         );
-        expect(ok).toBe(true);
-        expect(sentKeys).toBe(true);
+        expect(ok).toBe(false);
+        expect(sentKeys).toBe(false);
         expect(inserted).toBe(false);
     });
 

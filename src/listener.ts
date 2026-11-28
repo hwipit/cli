@@ -537,19 +537,33 @@ const BUCKET_IDLE_TTL_MS = RATE_LIMIT_WINDOW_MS * 2;
 /** Refusal frames to the phone (command-refusal.ts), per session: a flood of refused commands answers a bounded number. */
 const refusalFrameLimit = createRefusalLimiter(REFUSAL_FRAMES_PER_MINUTE, REFUSAL_WINDOW_MS);
 
+/** Hard cap on live buckets: names reach checkRateLimit before they are validated, so the map must not grow with them. */
+const MAX_BUCKETS = 4096;
+/** Idle buckets are swept at most this often — a sweep walks the whole map. */
+const BUCKET_PRUNE_INTERVAL_MS = 10_000;
+let lastBucketPruneAt = 0;
+
 const pruneStaleBuckets = (now: number): void => {
+    lastBucketPruneAt = now;
     for (const [key, b] of buckets) {
         if (now - b.lastRefillAt > BUCKET_IDLE_TTL_MS) buckets.delete(key);
     }
 };
-
 export const checkRateLimit = (
     session: string,
     now: number = Date.now(),
     cost: number = 1,
 ): boolean => {
-    pruneStaleBuckets(now);
-    const b = buckets.get(session) ?? { tokens: RATE_LIMIT_TOKENS, lastRefillAt: now };
+    if (Math.abs(now - lastBucketPruneAt) >= BUCKET_PRUNE_INTERVAL_MS) pruneStaleBuckets(now);
+    let b = buckets.get(session);
+    if (!b) {
+        // A new name with the map full: sweep once, and refuse if every bucket is still live.
+        if (buckets.size >= MAX_BUCKETS) {
+            pruneStaleBuckets(now);
+            if (buckets.size >= MAX_BUCKETS) return false;
+        }
+        b = { tokens: RATE_LIMIT_TOKENS, lastRefillAt: now };
+    }
     const elapsed = Math.max(0, now - b.lastRefillAt);
     // Fractional refill is intentional: smooths the boundary so a session
     // hitting the cap doesn't have to wait a full window for the next slot.
@@ -5301,6 +5315,7 @@ const passesInjectGuards = (
     addressed: boolean,
     cost = 1,
     bucket = session,
+    spendRate = true,
 ): PaneProbe | null => {
     // Subagent panes are view-only: the phone reads them but the agent
     // itself answers at the terminal. This sits above the rate bucket so a
@@ -5315,7 +5330,7 @@ const passesInjectGuards = (
     // Rate bucket first: the pane probe below is a blocking tmux spawnSync,
     // and the sequencer can flush several held messages back-to-back — an
     // empty bucket must refuse before paying that probe N times, not after.
-    if (!(deps.rateLimit ?? checkRateLimit)(bucket, Date.now(), cost)) {
+    if (spendRate && !(deps.rateLimit ?? checkRateLimit)(bucket, Date.now(), cost)) {
         log(`! ${session}: rate-limited — drop`);
         deps.noteRefusal?.('rate_limited');
         return null;
@@ -5415,14 +5430,14 @@ const tryInject = (
     session: string,
     text: string,
     deps: HandlePushDeps,
-    opts: { submit: boolean; addressed: boolean; files?: boolean },
+    opts: { submit: boolean; addressed: boolean; files?: boolean; rateSpent?: boolean },
 ): boolean => {
     if (!text) {
         log(`! ${session}: empty text — drop`);
         deps.noteRefusal?.('invalid_command');
         return false;
     }
-    const probe = passesInjectGuards(session, deps, opts.addressed, SUBMIT_COST);
+    const probe = passesInjectGuards(session, deps, opts.addressed, SUBMIT_COST, session, !opts.rateSpent);
     if (!probe) return false;
     if (probe.shellMarked) {
         const refusal = shellTextRefusal(text, opts);
@@ -6225,6 +6240,8 @@ const openSealedCommand = async (
         if (!outside || Object.keys(outside).length !== 1 || outside.op !== schedule.op) return drop('the op beside the seal is not the sealed one');
     } else if (!opened.body && attached.length === 0 && !keys?.length) {
         return drop('no text and no attachment');
+    } else if (keys?.length && (opened.body || attached.length > 0)) {
+        return drop('keys beside text or attachments');
     }
     if (!trust.acceptCommand(sender, cmd.n, senderKey)) return null;
     return { text: opened.body ?? '', sender: senderKey, files: named, keys, ifPrompt, schedule };
@@ -6303,6 +6320,14 @@ const handlePushInner = async (
     // A schedule request changes the schedules and types nothing, whichever way it came.
     if (push.schedule !== undefined) return handleScheduleRequest(push, push.agentSessionName, addressed, deps);
 
+    // Keys are a command of their own: text, an insert or attachments beside them would be dropped while
+    // the push reads as done. The stream refuses the same mix (validateInputMessage).
+    if (push.keys?.length && (push.body || push.insert !== undefined || push.files?.length)) {
+        log(`! ${push.agentSessionName}: keys beside text or attachments — drop`);
+        deps.noteRefusal?.('invalid_command');
+        return false;
+    }
+
     // A command bound to a blocked prompt types only while that prompt is on screen. Checked
     // before anything is downloaded or typed, and before the rate limit is spent.
     if (push.ifPrompt !== undefined && !promptBound(push.agentSessionName, push.ifPrompt, deps.capturePane ? deps.capturePane(push.agentSessionName) : capturePaneText(push.agentSessionName, undefined, true))) {
@@ -6352,7 +6377,12 @@ const handlePushInner = async (
     // isolated: the body text still injects so the command itself isn't
     // blocked. A sealed command is typed whole or not at all.
     let paths: string[] = [];
+    let rateSpent = false;
     if (push.files?.length) {
+        // Same admission as typing (session, rate, shell), asked before the bytes are fetched. It spends the
+        // rate token; tryInject below must not spend a second one.
+        if (!passesInjectGuards(push.agentSessionName, deps, addressed, SUBMIT_COST)) return false;
+        rateSpent = true;
         const download = deps.downloadAttachments ?? defaultDownloadAttachments;
         if (sealedSender) {
             // A sealed command is typed whole or not at all.
@@ -6380,7 +6410,7 @@ const handlePushInner = async (
     }
 
     return promptAnswered(push.agentSessionName, push.ifPrompt,
-        tryInject(push.agentSessionName, composeInjection(push.body ?? '', paths), deps, { submit: true, addressed, files: !!push.files?.length }));
+        tryInject(push.agentSessionName, composeInjection(push.body ?? '', paths), deps, { submit: true, addressed, files: !!push.files?.length, rateSpent }));
 };
 
 /**

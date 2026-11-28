@@ -127,6 +127,7 @@ import { useHttp1Transport, webSocketProxyOptions } from './http-failure.js';
 import { notifyDesktop, type DesktopNotification } from './desktop-notify.js';
 import { createWorktreeCleanup } from './listener-worktree-cleanup.js';
 import { tmuxRun } from './worktree.js';
+import { fitAttachmentName } from './attachment-name.js';
 import { chunkOf, createFileDecryptStream, DOWNLOAD_MAX_BYTES, GCM_TAG_BYTES, saveStream, withIdleTimeout } from './file-crypto.js';
 import { createTurnWatchers, type SendTurnFrame, type TurnWatchControl } from './turn-watch.js';
 import { diskTurnRing } from './turn-ring.js';
@@ -512,7 +513,7 @@ export const commandsReportDue = (
 const RATE_LIMIT_TOKENS = 120;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 /** What one command submit costs, keeping its ceiling at the old 30/min. */
-const SUBMIT_COST = 4;
+export const SUBMIT_COST = 4;
 /**
  * What a fresh start costs on its family's own bucket (`start:<family base>`): three new agents a minute. Each one is a
  * process left running, and every name of the family leads to the same bucket, so a session budget of 30 a minute
@@ -1897,13 +1898,97 @@ const STOP_CLOCK_SKEW_MS = 5 * 60_000;
 const actedStops = new Map<string, number>();
 const MAX_ACTED_STOPS = 512;
 
-/** True the first time a phone's request id is seen. */
-const firstStop = (key: string, now: number): boolean => {
+/** True the first time a phone's request id is seen for that purpose. */
+const firstSeen = (purpose: string, key: string, now: number): boolean => {
     for (const [seen, at] of actedStops) if (now - at > 2 * STOP_CLOCK_SKEW_MS) actedStops.delete(seen);
-    if (actedStops.has(key)) return false;
+    const id = `${purpose}\n${key}`;
+    if (actedStops.has(id)) return false;
     if (actedStops.size >= MAX_ACTED_STOPS) actedStops.delete(actedStops.keys().next().value!);
-    actedStops.set(key, now);
+    actedStops.set(id, now);
     return true;
+};
+
+type LifecycleAsk = { deviceId?: string; subscriberPublicKey?: string; encrypted?: unknown };
+
+/** The device a request says it came from, as far as it reads as an id — the key of the bucket in front of the gate. */
+const askerOf = (req: { deviceId?: unknown }): string =>
+    typeof req.deviceId === 'string' && /^[\w-]{1,64}$/.test(req.deviceId) ? req.deviceId : '';
+
+type LifecyclePurpose = 'agent.task.stop' | 'session.exit' | 'session.resume' | 'session.forget';
+type LifecycleError = RefusalCode | 'bad_request';
+type LifecycleBody = Record<string, unknown>;
+
+/**
+ * The one gate a destructive phone request passes: it asked for a seal, the
+ * seal is the asking device's trusted key's, it opens for this purpose and
+ * session, and names this request and a time near now inside it. `opened`
+ * gets the body (still `unknown` fields) only the first time that request id
+ * is seen — a relay that kept a sealed request can hand it back, and the
+ * second one is refused. Everything the action reads from the phone has to
+ * come from that body: fields outside the seal are the relay's to change.
+ */
+const openLifecycle = (
+    req: LifecycleAsk,
+    purpose: LifecyclePurpose,
+    sessionName: string,
+    requestId: string,
+    opened: (body: LifecycleBody) => void,
+    refused: (reason: LifecycleError) => void,
+): void => {
+    const sealed = req.encrypted;
+    if (!asksForSeal(req)) return refused('e2ee_required');
+    if (!isSealedV2(sealed)) return refused('bad_request');
+    whenSealAdmitted(
+        req as Pick<ScreenRequest, 'deviceId' | 'subscriberPublicKey'>,
+        (phoneKey) => {
+            void (async () => {
+                let body: LifecycleBody | null;
+                try {
+                    // Untrusted until the checks below: every field is `unknown`.
+                    body = JSON.parse(await openV2(purpose, sealed, phoneKey, sessionName)) as LifecycleBody | null;
+                } catch {
+                    return refused('bad_request');
+                }
+                if (typeof body !== 'object' || body === null || body.v !== 1 || body.requestId !== requestId) return refused('bad_request');
+                const now = Date.now();
+                const at = typeof body.at === 'string' ? Date.parse(body.at) : Number.NaN;
+                if (!Number.isFinite(at) || Math.abs(now - at) > STOP_CLOCK_SKEW_MS) return refused('bad_request');
+                if (!firstSeen(purpose, `${phoneKey}\n${requestId}`, now)) return refused('bad_request');
+                opened(body);
+            })();
+        },
+        refused,
+    );
+};
+
+/**
+ * Where a session lifecycle request (exit, resume, forget) enters. A request
+ * that asked for a seal is opened by `openLifecycle` and `sealed` gets its
+ * body — the only place the action's inputs may come from. One that did not
+ * is the plaintext of a phone that never sealed: it runs `plain` only while
+ * this listener has never sealed (`plainRefusal`), the same policy a typed
+ * command has. A sealed envelope without the key to answer with is a refusal,
+ * not a plaintext request.
+ *
+ * The bucket in front is the asking device's, not the session's: a flood of
+ * unproven requests must not spend a session's command budget.
+ */
+const lifecycleGate = (
+    req: LifecycleAsk,
+    purpose: Exclude<LifecyclePurpose, 'agent.task.stop'>,
+    sessionName: string,
+    requestId: string,
+    plain: () => void,
+    sealed: (body: LifecycleBody) => void,
+    refuse: (reason: LifecycleError | 'rate_limited') => void,
+): void => {
+    if (!checkRateLimit(`life:${askerOf(req)}`)) return refuse('rate_limited');
+    if (!asksForSeal(req)) {
+        if (req.encrypted !== undefined) return refuse('e2ee_required');
+        const refusal = plainRefusal();
+        return refusal ? refuse(refusal) : plain();
+    }
+    openLifecycle(req, purpose, sessionName, requestId, sealed, refuse);
 };
 
 /**
@@ -1932,8 +2017,7 @@ export const handleBackgroundTaskStopRequest = (req: BackgroundTaskStopRequest, 
     };
     const reply = (fields: { error: BackgroundTaskStopError } | { result: StopOutcome }): void => { send({ ...frame, ...fields }); };
 
-    const asker = typeof req.deviceId === 'string' && /^[\w-]{1,64}$/.test(req.deviceId) ? req.deviceId : '';
-    if (!checkRateLimit(`tasks:stop:${asker}`)) {
+    if (!checkRateLimit(`tasks:stop:${askerOf(req)}`)) {
         reply({ error: 'rate_limited' });
         return true;
     }
@@ -1941,27 +2025,9 @@ export const handleBackgroundTaskStopRequest = (req: BackgroundTaskStopRequest, 
         reply({ error: 'e2ee_required' });
         return true;
     }
-    const sealedRequest = req.encrypted;
-    if (!isSealedV2(sealedRequest)) {
-        reply({ error: 'bad_request' });
-        return true;
-    }
 
-    const answer = async (phoneKey: string): Promise<{ error: BackgroundTaskStopError } | { result: StopOutcome }> => {
-        let asked: { v?: unknown; requestId?: unknown; taskId?: unknown; at?: unknown } | null;
-        try {
-            // Untrusted until the checks below: every field is `unknown`.
-            asked = JSON.parse(await openV2('agent.task.stop', sealedRequest, phoneKey, sessionName)) as typeof asked;
-        } catch {
-            return { error: 'bad_request' };
-        }
-        if (typeof asked !== 'object' || asked === null || asked.v !== 1 || asked.requestId !== requestId) return { error: 'bad_request' };
+    const answer = async (asked: LifecycleBody): Promise<{ error: BackgroundTaskStopError } | { result: StopOutcome }> => {
         if (typeof asked.taskId !== 'string' || !TASK_ID_PATTERN.test(asked.taskId)) return { error: 'bad_request' };
-        const now = Date.now();
-        const at = typeof asked.at === 'string' ? Date.parse(asked.at) : Number.NaN;
-        if (!Number.isFinite(at) || Math.abs(now - at) > STOP_CLOCK_SKEW_MS) return { error: 'bad_request' };
-        // A relay that kept a sealed stop can hand it back; the seal names the request, so the second one is refused.
-        if (!firstStop(`${phoneKey}\n${requestId}`, now)) return { error: 'bad_request' };
         const { taskId } = asked;
         const running = backgroundTasksFor(sessionName);
         const task = running?.tasks.find((t) => t.id === taskId);
@@ -1971,10 +2037,13 @@ export const handleBackgroundTaskStopRequest = (req: BackgroundTaskStopRequest, 
         return { result };
     };
 
-    whenSealAdmitted(
+    openLifecycle(
         req,
-        (phoneKey) => {
-            answer(phoneKey)
+        'agent.task.stop',
+        sessionName,
+        requestId,
+        (asked) => {
+            answer(asked)
                 .then(reply)
                 .catch((err) => {
                     log(`⧉ tasks ${sessionName}: stop failed (${err instanceof Error ? err.message : err})`);
@@ -2101,6 +2170,13 @@ export interface SessionResumeRequest {
      */
     fresh?: boolean;
     requestId?: string;
+    deviceId?: string;
+    subscriberPublicKey?: string;
+    /**
+     * `{v: 1, requestId, at, agentKind?, runId?, fresh?}`, sealed by the phone for this listener (`session.resume`), bound to the
+     * session. A sealed request takes `agentKind`, `runId` and `fresh` from there; the same fields in the clear are ignored.
+     */
+    encrypted?: unknown;
 }
 
 /** A run id as the registry writes it: tmux `session_created`, epoch seconds. */
@@ -2205,13 +2281,15 @@ export const handleSessionResumeRequest = (
     send: (data: Record<string, unknown>) => void,
 ): boolean => {
     if (req.subtype !== 'agent.session.resume.request') return false;
-    if (!req.requestId || !req.sessionName) return false;
+    if (typeof req.requestId !== 'string' || !req.requestId || req.requestId.length > MAX_REQUEST_ID_LENGTH) return false;
+    if (typeof req.sessionName !== 'string' || !req.sessionName || req.sessionName.length > MAX_REQUEST_ID_LENGTH) return false;
     if (req.targetDeviceId !== computeListenerDeviceId()) return false;
 
     const sessionName = req.sessionName;
+    const requestId = req.requestId;
     const base = {
         subtype: 'agent.session.resume.result' as const,
-        requestId: req.requestId,
+        requestId,
         sessionName,
         at: new Date().toISOString(),
     };
@@ -2224,83 +2302,102 @@ export const handleSessionResumeRequest = (
     // before the rate bucket, so refused subagent traffic costs nothing.
     if (isSubagentSessionName(sessionName)) return reply({ error: 'subagent_view_only' });
 
-    // Charged like a submitted command, not like a keystroke: this starts a
-    // process, and the two share one budget so a flood cannot be laundered
-    // through whichever path is cheaper.
-    if (!checkRateLimit(sessionName, undefined, SUBMIT_COST)) return reply({ error: 'rate_limited' });
+    // What the phone asked for comes in as arguments: from the sealed body when it sealed, from the clear fields only when it did not.
+    const run = (agentKind: unknown, rawRunId: unknown, wantsFresh: boolean): true => {
+        // Charged like a submitted command, not like a keystroke: this starts a
+        // process, and the two share one budget so a flood cannot be laundered
+        // through whichever path is cheaper.
+        if (!checkRateLimit(sessionName, undefined, SUBMIT_COST)) return reply({ error: 'rate_limited' });
 
-    if (req.fresh === true && req.agentKind === SHELL_START_KIND) return startShellBeside(sessionName, reply);
+        if (wantsFresh && agentKind === SHELL_START_KIND) return startShellBeside(sessionName, reply);
 
-    // A named agent is answered with that run or not at all. Falling back to the
-    // newest run would start claude for a phone that asked for pi — silently,
-    // which is the exact failure this path exists to remove. A phone that names
-    // nothing still means the newest run.
-    const runId = typeof req.runId === 'string' && RUN_ID.test(req.runId) ? req.runId : undefined;
-    const known =
-        typeof req.agentKind === 'string'
-            ? recallRun(sessionName, req.agentKind, Date.now(), runId)
-            : recallSession(sessionName, Date.now(), runId);
-    if (!known) {
-        log(`✗ resume ${sessionName}: never seen on this machine`);
-        return reply({ error: 'unknown_session' });
-    }
-    // A live name is refused unless the request names a run: then the phone
-    // asked for one earlier conversation, and the session holding the name is
-    // a different one — so it starts beside it, under the next free name of
-    // the family `hwip cc` would pick (Q41), counted from the family base so a
-    // busy `<base>-2` leads to `<base>-3`. A request without a run id is an
-    // older app that only knows the name, and still gets the refusal it renders.
-    // A fresh start asks for a new session, so a live name is no refusal either, and no conversation is picked up —
-    // the live one holding the recorded conversation included.
-    const fresh = req.fresh === true;
-    const live = new Set(liveSessionNames() ?? []);
-    const target = !live.has(sessionName)
-        ? sessionName
-        : runId !== undefined || fresh
-            ? familyNames(familyBase(sessionName)).find((name) => !live.has(name))
-            : undefined;
-    if (!target || (!fresh && conversationRunning(known, live))) return reply({ error: 'already_running' });
-    if (!sessionDirectoryExists(known)) {
-        log(`✗ resume ${sessionName}: ${known.cwd} is gone`);
-        return reply({ error: 'missing_directory' });
-    }
-    const agent = REMOTE_AGENTS.find((a) => a.kind === known.agentKind);
-    if (!agent) {
-        log(`✗ resume ${sessionName}: no binary for agent kind ${known.agentKind}`);
-        return reply({ error: 'unknown_agent' });
-    }
-    // A fresh start leaves one more process running each time, so the family pays on a bucket of its own as well —
-    // charged only here, where it starts one: a refusal above says why, not that the budget ran out.
-    if (fresh && !checkRateLimit(`start:${familyBase(sessionName)}`, undefined, FRESH_START_COST)) {
-        return reply({ error: 'rate_limited' });
-    }
+        // A named agent is answered with that run or not at all. Falling back to the
+        // newest run would start claude for a phone that asked for pi — silently,
+        // which is the exact failure this path exists to remove. A phone that names
+        // nothing still means the newest run.
+        const runId = typeof rawRunId === 'string' && RUN_ID.test(rawRunId) ? rawRunId : undefined;
+        const known =
+            typeof agentKind === 'string'
+                ? recallRun(sessionName, agentKind, Date.now(), runId)
+                : recallSession(sessionName, Date.now(), runId);
+        if (!known) {
+            log(`✗ resume ${sessionName}: never seen on this machine`);
+            return reply({ error: 'unknown_session' });
+        }
+        // A live name is refused unless the request names a run: then the phone
+        // asked for one earlier conversation, and the session holding the name is
+        // a different one — so it starts beside it, under the next free name of
+        // the family `hwip cc` would pick (Q41), counted from the family base so a
+        // busy `<base>-2` leads to `<base>-3`. A request without a run id is an
+        // older app that only knows the name, and still gets the refusal it renders.
+        // A fresh start asks for a new session, so a live name is no refusal either, and no conversation is picked up —
+        // the live one holding the recorded conversation included.
+        const fresh = wantsFresh;
+        const live = new Set(liveSessionNames() ?? []);
+        const target = !live.has(sessionName)
+            ? sessionName
+            : runId !== undefined || fresh
+                ? familyNames(familyBase(sessionName)).find((name) => !live.has(name))
+                : undefined;
+        if (!target || (!fresh && conversationRunning(known, live))) return reply({ error: 'already_running' });
+        if (!sessionDirectoryExists(known)) {
+            log(`✗ resume ${sessionName}: ${known.cwd} is gone`);
+            return reply({ error: 'missing_directory' });
+        }
+        const agent = REMOTE_AGENTS.find((a) => a.kind === known.agentKind);
+        if (!agent) {
+            log(`✗ resume ${sessionName}: no binary for agent kind ${known.agentKind}`);
+            return reply({ error: 'unknown_agent' });
+        }
+        // A fresh start leaves one more process running each time, so the family pays on a bucket of its own as well —
+        // charged only here, where it starts one: a refusal above says why, not that the budget ran out.
+        if (fresh && !checkRateLimit(`start:${familyBase(sessionName)}`, undefined, FRESH_START_COST)) {
+            return reply({ error: 'rate_limited' });
+        }
 
-    // argv, never a shell string: the binary comes from the agent table and the
-    // directory from our own record, and neither is concatenated into anything
-    // a shell would re-parse. A recorded label means the session carried
-    // sidecar options (wrapper `sessionSidecarArgs`) or the sweep inferred them
-    // from its checkout (config `groupOf`); a new tmux session starts without
-    // them, so they go on or it returns in a card of its own.
-    const sidecar = known.label && known.project
-        ? [';', 'set-option', SESSION_PROJECT_OPTION, known.project, ';', 'set-option', SESSION_LABEL_OPTION, known.label]
-        : [];
-    const conversation = fresh ? null : resumableConversation(agent, known);
-    // tmux gives the new pane this client's PATH. A login service's PATH has none
-    // of the agent directories, so they go on as schedule launches add them —
-    // otherwise the agent is not found and the session ends as it starts.
-    const started = spawnSync(
-        'tmux',
-        tmuxArgs(['new-session', '-d', '-s', target, '-c', known.cwd, agent.binary, ...(conversation?.args ?? []), ...sidecar]),
-        { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PATH: withAgentDirs(process.env.PATH) } },
+        // argv, never a shell string: the binary comes from the agent table and the
+        // directory from our own record, and neither is concatenated into anything
+        // a shell would re-parse. A recorded label means the session carried
+        // sidecar options (wrapper `sessionSidecarArgs`) or the sweep inferred them
+        // from its checkout (config `groupOf`); a new tmux session starts without
+        // them, so they go on or it returns in a card of its own.
+        const sidecar = known.label && known.project
+            ? [';', 'set-option', SESSION_PROJECT_OPTION, known.project, ';', 'set-option', SESSION_LABEL_OPTION, known.label]
+            : [];
+        const conversation = fresh ? null : resumableConversation(agent, known);
+        // tmux gives the new pane this client's PATH. A login service's PATH has none
+        // of the agent directories, so they go on as schedule launches add them —
+        // otherwise the agent is not found and the session ends as it starts.
+        const started = spawnSync(
+            'tmux',
+            tmuxArgs(['new-session', '-d', '-s', target, '-c', known.cwd, agent.binary, ...(conversation?.args ?? []), ...sidecar]),
+            { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PATH: withAgentDirs(process.env.PATH) } },
+        );
+        if (started.status !== 0) {
+            log(`✗ resume ${sessionName}: tmux refused (${(started.stderr ?? '').trim() || 'no detail'})`);
+            return reply({ error: 'start_failed' });
+        }
+        const resumedFrom = conversation ? ` (conversation ${conversation.id.slice(0, 8)})` : '';
+        const beside = target === sessionName ? '' : ` as ${target}`;
+        log(`${fresh ? '＋ start' : '⟲ resume'} ${sessionName}${beside}: ${agent.binary}${resumedFrom} in ${known.cwd}`);
+        return reply({ resumed: true, sessionName: target });
+    };
+    lifecycleGate(
+        req,
+        'session.resume',
+        sessionName,
+        requestId,
+        () => void run(req.agentKind, req.runId, req.fresh === true),
+        (body) => {
+            const { agentKind, runId, fresh } = body;
+            if (agentKind !== undefined && typeof agentKind !== 'string') return void reply({ error: 'bad_request' });
+            if (runId !== undefined && (typeof runId !== 'string' || !RUN_ID.test(runId))) return void reply({ error: 'bad_request' });
+            if (fresh !== undefined && typeof fresh !== 'boolean') return void reply({ error: 'bad_request' });
+            run(agentKind, runId, fresh === true);
+        },
+        (error) => void reply({ error }),
     );
-    if (started.status !== 0) {
-        log(`✗ resume ${sessionName}: tmux refused (${(started.stderr ?? '').trim() || 'no detail'})`);
-        return reply({ error: 'start_failed' });
-    }
-    const resumedFrom = conversation ? ` (conversation ${conversation.id.slice(0, 8)})` : '';
-    const beside = target === sessionName ? '' : ` as ${target}`;
-    log(`${fresh ? '＋ start' : '⟲ resume'} ${sessionName}${beside}: ${agent.binary}${resumedFrom} in ${known.cwd}`);
-    return reply({ resumed: true, sessionName: target });
+    return true;
 };
 
 export interface SessionExitRequest {
@@ -2308,6 +2405,10 @@ export interface SessionExitRequest {
     targetDeviceId?: string;
     sessionName?: string;
     requestId?: string;
+    deviceId?: string;
+    subscriberPublicKey?: string;
+    /** `{v: 1, requestId, at}`, sealed by the phone for this listener (`session.exit`), bound to the session. */
+    encrypted?: unknown;
 }
 
 export interface SessionExitResult {
@@ -2394,7 +2495,8 @@ export const handleSessionExitRequest = (
     send: (data: Record<string, unknown>) => void,
 ): boolean => {
     if (req.subtype !== 'agent.session.exit.request') return false;
-    if (!req.requestId || !req.sessionName) return false;
+    if (typeof req.requestId !== 'string' || !req.requestId || req.requestId.length > MAX_REQUEST_ID_LENGTH) return false;
+    if (typeof req.sessionName !== 'string' || !req.sessionName || req.sessionName.length > MAX_REQUEST_ID_LENGTH) return false;
     if (req.targetDeviceId !== computeListenerDeviceId()) return false;
 
     const sessionName = req.sessionName;
@@ -2410,25 +2512,29 @@ export const handleSessionExitRequest = (
         return true;
     };
 
-    // Same budget as resume and as a submitted command: ending a session is a
-    // session-lifecycle action, and pricing it like a keystroke would let a
-    // flood through the cheaper door.
-    // Subagent refusal first, though — outside the bucket, like resume's:
+    // Subagent refusal first — outside every bucket, like resume's:
     // ending a subagent pane is a kill(2) on the parent's child, not a
     // lifecycle action the phone is ever offered.
     if (isSubagentSessionName(sessionName)) return answer({ error: 'subagent_view_only' });
-    if (!checkRateLimit(sessionName, undefined, SUBMIT_COST)) return answer({ error: 'rate_limited' });
-    if (!sessionExists(sessionName)) return answer({ error: 'unknown_session' });
 
-    void (async () => {
-        if (await endBySignals(sessionName)) {
-            log(`⏻ exit ${sessionName}: ended`);
-            answer({ exited: true });
-            return;
-        }
-        log(`✗ exit ${sessionName}: still running after the exit signals`);
-        answer({ error: 'still_running' });
-    })();
+    // Same budget as resume and as a submitted command: ending a session is a
+    // session-lifecycle action, and pricing it like a keystroke would let a
+    // flood through the cheaper door. Charged once the request has proved who
+    // sent it, so an unproven flood cannot spend the session's budget.
+    const run = (): void => {
+        if (!checkRateLimit(sessionName, undefined, SUBMIT_COST)) return void answer({ error: 'rate_limited' });
+        if (!sessionExists(sessionName)) return void answer({ error: 'unknown_session' });
+        void (async () => {
+            if (await endBySignals(sessionName)) {
+                log(`⏻ exit ${sessionName}: ended`);
+                answer({ exited: true });
+                return;
+            }
+            log(`✗ exit ${sessionName}: still running after the exit signals`);
+            answer({ error: 'still_running' });
+        })();
+    };
+    lifecycleGate(req, 'session.exit', sessionName, requestId, run, run, (error) => void answer({ error }));
     return true;
 };
 
@@ -2443,6 +2549,11 @@ export interface SessionForgetRequest {
     /** With `agentKind`, the one run of it to delete (hwip docs/session-runs.md). Absent: every run of that agent. */
     runId?: string;
     requestId?: string;
+    deviceId?: string;
+    subscriberPublicKey?: string;
+    /** `{v: 1, requestId, at, agentKind?, runId?}`, sealed by the phone for this listener (`session.forget`), bound to the session.
+     *  A sealed request takes `agentKind` and `runId` from there; the same fields in the clear are ignored. */
+    encrypted?: unknown;
 }
 
 export interface SessionForgetResult {
@@ -2481,14 +2592,16 @@ export const handleSessionForgetRequest = (
     send: (data: Record<string, unknown>) => void,
 ): boolean => {
     if (req.subtype !== 'agent.session.forget.request') return false;
-    if (!req.requestId || !req.sessionName) return false;
+    if (typeof req.requestId !== 'string' || !req.requestId || req.requestId.length > MAX_REQUEST_ID_LENGTH) return false;
+    if (typeof req.sessionName !== 'string' || !req.sessionName || req.sessionName.length > MAX_REQUEST_ID_LENGTH) return false;
     if (req.targetDeviceId !== computeListenerDeviceId()) return false;
 
     const sessionName = req.sessionName;
+    const requestId = req.requestId;
     const reply = (fields: Partial<SessionForgetResult>): true => {
         send({
             subtype: 'agent.session.forget.result' as const,
-            requestId: req.requestId,
+            requestId,
             sessionName,
             at: new Date().toISOString(),
             ...fields,
@@ -2496,52 +2609,68 @@ export const handleSessionForgetRequest = (
         return true;
     };
 
-    // Charged like a submitted command: it writes to disk and is irreversible,
-    // so it shares the budget with the paths that start and stop processes.
-    // Subagent refusal before the bucket: a subagent has no registry record
+    // Subagent refusal before any bucket: a subagent has no registry record
     // to forget (the sweep never remembers panes), so the honest answer is
     // the view-only one, not unknown_session.
     if (isSubagentSessionName(sessionName)) return reply({ error: 'subagent_view_only' });
-    if (!checkRateLimit(sessionName, undefined, SUBMIT_COST)) return reply({ error: 'rate_limited' });
 
+    // Charged like a submitted command — it writes to disk and is irreversible,
+    // so it shares the budget with the paths that start and stop processes —
+    // once the request has proved who sent it (`lifecycleGate`).
+    const run = (agentKind: string | undefined, runId: string | undefined): void => {
+        if (!checkRateLimit(sessionName, undefined, SUBMIT_COST)) return void reply({ error: 'rate_limited' });
+        reply(forgetNow(agentKind, runId));
+    };
     // `unknown` — no tmux answered at all — is refused with the running answer
     // rather than allowed through: the phone already renders that one, and the
     // alternative is an irreversible delete (registry AND scrollback) justified
     // by a question that failed to be asked. It says so in the log, because
     // from the phone the two refusals are the same sentence.
-    const runId = typeof req.runId === 'string' && RUN_ID.test(req.runId) ? req.runId : undefined;
-    const liveness = sessionLiveness(sessionName);
-    if (liveness === 'unknown') {
-        log(`✗ forget ${sessionName}: no tmux answered, so nothing was deleted`);
-        return reply({ error: 'still_running' });
-    }
-    // A name running again is not the run being forgotten: an ended run of it goes on its own (Q29).
-    // The running run itself, a request naming no run, or a run tmux could not tell apart stay refused.
-    if (liveness === 'running') {
-        const tmuxRun = runId ? liveRunIdOf(sessionName) : undefined;
-        const live = tmuxRun ? runOfTmuxSession(sessionName, tmuxRun) : undefined;
-        if (!runId || !live || live === runId) return reply({ error: 'still_running' });
-    }
-    const outcome = forgetSession(
+    const forgetNow = (agentKind: string | undefined, runId: string | undefined): Partial<SessionForgetResult> => {
+        const liveness = sessionLiveness(sessionName);
+        if (liveness === 'unknown') {
+            log(`✗ forget ${sessionName}: no tmux answered, so nothing was deleted`);
+            return { error: 'still_running' };
+        }
+        // A name running again is not the run being forgotten: an ended run of it goes on its own (Q29).
+        // The running run itself, a request naming no run, or a run tmux could not tell apart stay refused.
+        if (liveness === 'running') {
+            const tmuxRun = runId ? liveRunIdOf(sessionName) : undefined;
+            const live = tmuxRun ? runOfTmuxSession(sessionName, tmuxRun) : undefined;
+            if (!runId || !live || live === runId) return { error: 'still_running' };
+        }
+        const outcome = forgetSession(sessionName, agentKind, runId, liveness === 'running');
+        if (outcome === 'unknown') {
+            log(`✗ forget ${sessionName}: never seen on this machine`);
+            return { error: 'unknown_session' };
+        }
+        if (outcome === 'scrollback_kept') {
+            // The registry entry is gone, so the session is no longer resumable —
+            // but its chat scrollback would not delete, and answering a flat
+            // "forgotten" would overstate what actually happened.
+            log(`🗑 forget ${sessionName}: dropped from the record, but its chat scrollback would not delete`);
+            return { forgotten: true, scrollbackKept: true };
+        }
+        log(`🗑 forget ${sessionName}: dropped from this machine's record`);
+        return { forgotten: true };
+    };
+    lifecycleGate(
+        req,
+        'session.forget',
         sessionName,
-        typeof req.agentKind === 'string' ? req.agentKind : undefined,
-        runId,
-        liveness === 'running',
+        requestId,
+        // No seal asked for, none to read: the fields in the clear, as before.
+        () => run(typeof req.agentKind === 'string' ? req.agentKind : undefined, typeof req.runId === 'string' && RUN_ID.test(req.runId) ? req.runId : undefined),
+        (body) => {
+            // Only the sealed body names the run: a relay can rewrite what sits outside it.
+            const { agentKind, runId } = body;
+            if (agentKind !== undefined && typeof agentKind !== 'string') return void reply({ error: 'bad_request' });
+            if (runId !== undefined && (typeof runId !== 'string' || !RUN_ID.test(runId))) return void reply({ error: 'bad_request' });
+            run(agentKind, runId);
+        },
+        (error) => void reply({ error }),
     );
-    if (outcome === 'unknown') {
-        log(`✗ forget ${sessionName}: never seen on this machine`);
-        return reply({ error: 'unknown_session' });
-    }
-    if (outcome === 'scrollback_kept') {
-        // The registry entry is gone, so the session is no longer resumable —
-        // but its chat scrollback would not delete, and answering a flat
-        // "forgotten" would overstate what actually happened.
-        log(`🗑 forget ${sessionName}: dropped from the record, but its chat scrollback would not delete`);
-        return reply({ forgotten: true, scrollbackKept: true });
-    }
-
-    log(`🗑 forget ${sessionName}: dropped from this machine's record`);
-    return reply({ forgotten: true });
+    return true;
 };
 
 // ─── Deep pull: scrollback above the live window ───────────────────
@@ -5557,20 +5686,6 @@ let deviceKeyRegistration: DeviceKeyRegistration | null = null;
 let deviceKeyRegistered = false;
 
 /**
- * Make a filesystem-safe single path segment: take the basename (drops
- * any `../` prefix), strip control chars and embedded separators, remove
- * leading dots, and cap length. Empty/dot-only names use the fallback.
- */
-const safeSegment = (raw: string, fallback: string): string => {
-    const cleaned = basename(raw)
-        .replace(/[\x00-\x1f\x7f]/g, '')
-        .replace(/[/\\]/g, '_')
-        .replace(/^\.+/, '')
-        .trim();
-    return (cleaned || fallback).slice(0, 200);
-};
-
-/**
  * How long the API may take to name an attachment's presigned URL. Unbounded,
  * a stalled call held the command that carried the file forever: it was never
  * typed, and nothing said why.
@@ -5717,7 +5832,7 @@ export const downloadAttachments = async (
     sealed?: SealedAttachments,
     io: AttachmentIo = {},
 ): Promise<string[]> => {
-    const dir = join(ATTACHMENTS_DIR, safeSegment(pushId, 'push'));
+    const dir = join(ATTACHMENTS_DIR, fitAttachmentName(pushId, 'push'));
     const paths: string[] = [];
     const taken = new Map<string, string>();
     if (sealed) {
@@ -5730,7 +5845,7 @@ export const downloadAttachments = async (
                 const bytes = meta && Number.isSafeInteger(meta.size) && meta.size >= 0 ? opened.subarray(0, meta.size) : opened;
                 const name = meta?.name ?? f.fileName;
                 mkdirHandedBack(dir);
-                const { abs, fresh } = attachmentPath(taken, dir, safeSegment(name || `file-${i}`, `file-${i}`), bytes);
+                const { abs, fresh } = attachmentPath(taken, dir, fitAttachmentName(name || `file-${i}`, `file-${i}`), bytes);
                 paths.push(abs);
                 if (!fresh) continue;
                 writeFileSync(abs, bytes);
@@ -5756,7 +5871,7 @@ export const downloadAttachments = async (
         try {
             const bytes = await fetchAttachmentBytes(f.fileKey, ctx, io);
             mkdirHandedBack(dir);
-            const { abs, fresh } = attachmentPath(taken, dir, safeSegment(f.fileName || `file-${i}`, `file-${i}`), bytes);
+            const { abs, fresh } = attachmentPath(taken, dir, fitAttachmentName(f.fileName || `file-${i}`, `file-${i}`), bytes);
             if (fresh) {
                 try {
                     writeFileSync(abs, bytes);
@@ -5804,7 +5919,7 @@ export const downloadSealedEach = async (
     sealed: SealedAttachments & { files: SealedFileMeta[] },
     io: AttachmentIo = {},
 ): Promise<{ paths: string[]; missing: string[] }> => {
-    const dir = join(ATTACHMENTS_DIR, safeSegment(eventId, 'answer'));
+    const dir = join(ATTACHMENTS_DIR, fitAttachmentName(eventId, 'answer'));
     const taken = new Map<string, string>();
     const paths: string[] = [];
     const missing: string[] = [];
@@ -5817,7 +5932,7 @@ export const downloadSealedEach = async (
             // Padded before sealing: cut back to the size the seal gives.
             const bytes = meta && Number.isSafeInteger(meta.size) && meta.size >= 0 ? opened.subarray(0, meta.size) : opened;
             mkdirHandedBack(dir);
-            const { abs, fresh } = attachmentPath(taken, dir, safeSegment(name, `file-${i}`), bytes);
+            const { abs, fresh } = attachmentPath(taken, dir, fitAttachmentName(name, `file-${i}`), bytes);
             if (!fresh) {
                 // The same bytes under a name already saved: said, so no file goes unaccounted for.
                 missing.push(`${name}: the same file was attached twice`);

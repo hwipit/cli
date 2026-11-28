@@ -589,6 +589,20 @@ the phone is `agent.session.exit.request`: `C-c`, the agent's own quit
 command, then `C-d` — never a forced kill, so an agent that will not quit is
 reported as still running.
 
+Starting, ending and forgetting a session (`agent.session.resume.request`,
+`agent.session.exit.request`, `agent.session.forget.request`) are sealed the
+way a background-task stop is: the request carries `subscriberPublicKey` and
+`encrypted`, a body `{ v: 1, requestId, at }` sealed for this machine and bound
+to the session name (purposes `session.exit`, `session.resume`,
+`session.forget`). A resume's body also holds `agentKind` and `fresh` (and
+`runId`); a forget's holds `agentKind` and `runId`. A sealed request takes
+those only from the body — the same fields in the clear are ignored — and each
+request id is acted on once, within five minutes of its `at`. A listener that has
+sealed before answers a request in the clear with `e2ee_required`; one that
+never has still takes it, as it takes a typed command. Other errors are
+`subscriber_unverified`, `bad_request` and `rate_limited`. The session's own
+command budget is spent only after the seal checks out.
+
 Two details worth knowing:
 
 - It fires at **user login**, not at boot. Without automatic login, the

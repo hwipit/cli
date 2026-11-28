@@ -11,7 +11,9 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
+import { describe, expect, it, beforeAll, beforeEach, afterEach, vi } from 'vitest';
+import { v2Party } from '../tests/helpers/seal.js';
+import { trustEveryKey } from '../tests/helpers/trust.js';
 
 const FIELD_SEP = '␟';
 /** tmux sessions that exist right now. */
@@ -85,7 +87,8 @@ process.env.XDG_STATE_HOME = join(TMP, 'state');
 const PROJECT_DIR = join(TMP, 'work', 'api');
 mkdirSync(PROJECT_DIR, { recursive: true });
 
-const { handleSessionResumeRequest, computeListenerDeviceId } = await import('./listener.js');
+const { handleSessionResumeRequest, computeListenerDeviceId, setSubscriberTrust, checkRateLimit, SUBMIT_COST } = await import('./listener.js');
+const { initDeviceCrypto, getDevicePublicKey } = await import('./crypto.js');
 const { rememberSessions } = await import('./session-registry.js');
 const { claudeProjectDirName, REMOTE_AGENTS } = await import('./remote-agents.js');
 const { rememberAgentDir } = await import('./agent-dirs.js');
@@ -818,6 +821,111 @@ describe('agent.session.resume.request — Terminal start', () => {
 
     it('without fresh, shell is an agent kind like any other: no record, no start', () => {
         expect(ask({ fresh: undefined })).toMatchObject({ error: 'unknown_session' });
+        expect(shellStarts()).toEqual([]);
+    });
+});
+
+
+describe('agent.session.resume.request — sealed', () => {
+    const phone = v2Party();
+    let listenerKey = '';
+    let sent: Array<Record<string, unknown>>;
+    const send = (data: Record<string, unknown>) => { sent.push(data); };
+    let next = 0;
+    let rid = '';
+
+    const body = (over: Record<string, unknown> = {}): string =>
+        JSON.stringify({ v: 1, requestId: rid, at: new Date().toISOString(), agentKind: 'shell', fresh: true, ...over });
+    const frame = (over: Record<string, unknown> = {}, sealed: string = body(), context = 'hwip-term', purpose = 'session.resume') => ({
+        subtype: 'agent.session.resume.request',
+        targetDeviceId: computeListenerDeviceId(),
+        sessionName: 'hwip-term',
+        requestId: rid,
+        deviceId: 'dev_phone',
+        subscriberPublicKey: phone.publicKey,
+        encrypted: phone.seal(purpose, sealed, listenerKey, context),
+        ...over,
+    });
+    const ask = async (msg: Record<string, unknown>) => {
+        const before = sent.length;
+        expect(handleSessionResumeRequest(msg as never, send)).toBe(true);
+        await vi.waitFor(() => expect(sent.length).toBeGreaterThan(before), { timeout: 5000 });
+        return sent.at(-1);
+    };
+    const shellStarts = () => tmuxCalls.filter((c) => c[0] === 'new');
+
+    beforeAll(async () => {
+        await initDeviceCrypto();
+        listenerKey = getDevicePublicKey()!;
+    });
+    beforeEach(() => {
+        vi.spyOn(console, 'log').mockImplementation(() => {});
+        rid = `s${next++}`;
+        sent = [];
+        tmuxCalls = [];
+        liveSessions = [];
+        markedShells = new Set();
+        rmSync(join(TMP, 'state'), { recursive: true, force: true });
+        rememberSessions([{ name: 'hwip-term', cwd: PROJECT_DIR, agentKind: 'claude', runId: '1785546000' }]);
+        setSubscriberTrust(trustEveryKey);
+    });
+    afterEach(() => {
+        vi.restoreAllMocks();
+        setSubscriberTrust(null);
+    });
+
+    it('starts the Terminal a sealed request from a trusted phone asks for', async () => {
+        expect(await ask(frame())).toMatchObject({ subtype: 'agent.session.resume.result', requestId: rid, resumed: true });
+        expect(shellStarts()).toHaveLength(1);
+    });
+
+    it('starts nothing for a plaintext request once this listener has sealed — a shell included', async () => {
+        setSubscriberTrust({ ...trustEveryKey, sealedOnly: () => true });
+        const plain = { subtype: 'agent.session.resume.request', targetDeviceId: computeListenerDeviceId(), sessionName: 'hwip-term',
+            requestId: rid, agentKind: 'shell', fresh: true };
+        expect(await ask(plain)).toMatchObject({ error: 'e2ee_required' });
+        expect(tmuxCalls.filter((c) => c[0] === 'new' || c[0] === 'new-session')).toEqual([]);
+        expect(checkRateLimit('hwip-term', undefined, SUBMIT_COST)).toBe(true);
+    });
+
+    it('takes agentKind and fresh from the sealed body, not from fields outside the seal', async () => {
+        // A relay turning a sealed "start the agent" into a shell: the clear fields say shell, the body does not.
+        const turned = frame({ agentKind: 'shell', fresh: true }, body({ agentKind: 'claude', fresh: false }));
+        const reply = await ask(turned);
+        expect(shellStarts()).toEqual([]);
+        expect(reply).not.toHaveProperty('error', 'e2ee_required');
+        // And the other way: a sealed shell start is not undone by clear fields naming the agent.
+        rid = `s${next++}`;
+        expect(await ask(frame({ agentKind: 'claude', fresh: false }))).toMatchObject({ resumed: true });
+        expect(shellStarts()).toHaveLength(1);
+    });
+
+    it('refuses a forged seal and a replay, starting nothing the second time', async () => {
+        const relay = v2Party();
+        const forged = [
+            frame({ encrypted: relay.seal('session.resume', body(), listenerKey, 'hwip-term') }),
+            frame({}, body(), 'hwip-api'),
+            frame({}, body(), 'hwip-term', 'session.exit'),
+            frame({ requestId: 'other' }),
+            frame({}, body({ at: '2020-01-01T00:00:00.000Z' })),
+            frame({}, body({ fresh: 'yes' })),
+        ];
+        for (const msg of forged) expect(await ask(msg)).toMatchObject({ error: 'bad_request' });
+        expect(shellStarts()).toEqual([]);
+        rid = `s${next++}`;
+        const once = frame();
+        expect(await ask(once)).toMatchObject({ resumed: true });
+        expect(await ask(once)).toMatchObject({ error: 'bad_request' });
+        expect(shellStarts()).toHaveLength(1);
+    });
+
+    it('refuses a sealed run id that is not one rather than falling back to the newest run', async () => {
+        expect(await ask(frame({}, body({ agentKind: 'claude', fresh: false, runId: '../x' })))).toMatchObject({ error: 'bad_request' });
+        expect(tmuxCalls.filter((c) => c[0] === 'new-session')).toEqual([]);
+    });
+
+    it('refuses a sealed envelope with no key to answer it', async () => {
+        expect(await ask(frame({ subscriberPublicKey: undefined }))).toMatchObject({ error: 'e2ee_required' });
         expect(shellStarts()).toEqual([]);
     });
 });

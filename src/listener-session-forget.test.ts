@@ -11,7 +11,9 @@
 import { chmodSync, mkdirSync, mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
+import { describe, expect, it, beforeAll, beforeEach, afterEach, vi } from 'vitest';
+import { v2Party } from '../tests/helpers/seal.js';
+import { trustEveryKey } from '../tests/helpers/trust.js';
 
 const FIELD_SEP = '␟';
 /** tmux sessions that exist right now. */
@@ -55,7 +57,8 @@ process.env.XDG_STATE_HOME = join(TMP, 'state');
 const PROJECT_DIR = join(TMP, 'work', 'api');
 mkdirSync(PROJECT_DIR, { recursive: true });
 
-const { handleSessionForgetRequest, computeListenerDeviceId } = await import('./listener.js');
+const { handleSessionForgetRequest, computeListenerDeviceId, setSubscriberTrust, checkRateLimit, SUBMIT_COST } = await import('./listener.js');
+const { initDeviceCrypto, getDevicePublicKey } = await import('./crypto.js');
 const { rememberSessions, knownSessions, isKnownSession } = await import('./session-registry.js');
 const { appendTurnRing, readTurnRing, turnRingDir } = await import('./turn-ring.js');
 
@@ -218,5 +221,104 @@ describe('agent.session.forget.request — deleting a session this machine ran',
             expect(ask().reply).toMatchObject({ forgotten: true });
             expect(isKnownSession('hwip-api')).toBe(false);
         });
+    });
+});
+
+
+describe('agent.session.forget.request — sealed', () => {
+    const phone = v2Party();
+    let listenerKey = '';
+    let sent: Array<Record<string, unknown>>;
+    const send = (data: Record<string, unknown>) => { sent.push(data); };
+    let next = 0;
+    let rid = '';
+
+    const body = (over: Record<string, unknown> = {}): string =>
+        JSON.stringify({ v: 1, requestId: rid, at: new Date().toISOString(), ...over });
+    const frame = (over: Record<string, unknown> = {}, sealed: string = body(), context = 'hwip-api', purpose = 'session.forget') => ({
+        subtype: 'agent.session.forget.request',
+        targetDeviceId: computeListenerDeviceId(),
+        sessionName: 'hwip-api',
+        requestId: rid,
+        deviceId: 'dev_phone',
+        subscriberPublicKey: phone.publicKey,
+        encrypted: phone.seal(purpose, sealed, listenerKey, context),
+        ...over,
+    });
+    const ask = async (msg: Record<string, unknown>) => {
+        const before = sent.length;
+        expect(handleSessionForgetRequest(msg as never, send)).toBe(true);
+        await vi.waitFor(() => expect(sent.length).toBeGreaterThan(before), { timeout: 5000 });
+        return sent.at(-1);
+    };
+    const remember = (...kinds: string[]) =>
+        rememberSessions(kinds.map((agentKind) => ({ name: 'hwip-api', cwd: PROJECT_DIR, agentKind, project: 'api' })));
+
+    beforeAll(async () => {
+        await initDeviceCrypto();
+        listenerKey = getDevicePublicKey()!;
+    });
+    beforeEach(() => {
+        vi.spyOn(console, 'log').mockImplementation(() => {});
+        rid = `f${next++}`;
+        sent = [];
+        liveSessions = [];
+        tmuxUnrunnable = false;
+        rmSync(join(TMP, 'state'), { recursive: true, force: true });
+        setSubscriberTrust(trustEveryKey);
+    });
+    afterEach(() => {
+        vi.restoreAllMocks();
+        setSubscriberTrust(null);
+    });
+
+    it('forgets what a sealed request from a trusted phone names', async () => {
+        remember('claude');
+        expect(await ask(frame())).toMatchObject({ subtype: 'agent.session.forget.result', requestId: rid, forgotten: true });
+        expect(isKnownSession('hwip-api')).toBe(false);
+    });
+
+    it('never forgets on a plaintext request once this listener has sealed, and spends no session budget', async () => {
+        remember('claude');
+        setSubscriberTrust({ ...trustEveryKey, sealedOnly: () => true });
+        const plain = { subtype: 'agent.session.forget.request', targetDeviceId: computeListenerDeviceId(), sessionName: 'hwip-api', requestId: rid };
+        expect(await ask(plain)).toMatchObject({ error: 'e2ee_required' });
+        expect(isKnownSession('hwip-api')).toBe(true);
+        expect(checkRateLimit('hwip-api', undefined, SUBMIT_COST)).toBe(true);
+    });
+
+    it('refuses a forged seal and a replay', async () => {
+        remember('claude');
+        const relay = v2Party();
+        const forged = [
+            frame({ encrypted: relay.seal('session.forget', body(), listenerKey, 'hwip-api') }),
+            frame({}, body(), 'hwip-web'),
+            frame({}, body(), 'hwip-api', 'session.exit'),
+            frame({ requestId: 'other' }),
+            frame({}, body({ at: '2020-01-01T00:00:00.000Z' })),
+        ];
+        for (const msg of forged) expect(await ask(msg)).toMatchObject({ error: 'bad_request' });
+        expect(isKnownSession('hwip-api')).toBe(true);
+        const once = frame();
+        expect(await ask(once)).toMatchObject({ forgotten: true });
+        remember('claude');
+        expect(await ask(once)).toMatchObject({ error: 'bad_request' });
+        expect(isKnownSession('hwip-api')).toBe(true);
+    });
+
+    it('takes the run from the sealed body, not from fields outside the seal', async () => {
+        remember('claude', 'pi');
+        const msg = frame({ agentKind: 'pi', runId: 'run-from-the-relay' }, body({ agentKind: 'claude' }));
+        expect(await ask(msg)).toMatchObject({ forgotten: true });
+        const left = knownSessions().filter((s) => s.name === 'hwip-api').map((s) => s.agentKind);
+        expect(left).toEqual(['pi']);
+    });
+
+    it('refuses a sealed body whose run fields are not what they should be', async () => {
+        remember('claude');
+        expect(await ask(frame({}, body({ agentKind: 7 })))).toMatchObject({ error: 'bad_request' });
+        rid = `f${next++}`;
+        expect(await ask(frame({}, body({ runId: '../x' })))).toMatchObject({ error: 'bad_request' });
+        expect(isKnownSession('hwip-api')).toBe(true);
     });
 });

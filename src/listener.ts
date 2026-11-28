@@ -557,10 +557,14 @@ export const checkRateLimit = (
     if (Math.abs(now - lastBucketPruneAt) >= BUCKET_PRUNE_INTERVAL_MS) pruneStaleBuckets(now);
     let b = buckets.get(session);
     if (!b) {
-        // A new name with the map full: sweep once, and refuse if every bucket is still live.
+        // A new name with the map full: sweep once, then drop the oldest-inserted bucket. Refusing instead
+        // would let a flood of made-up names lock real sessions out; the evicted name just restarts at a full bucket.
         if (buckets.size >= MAX_BUCKETS) {
             pruneStaleBuckets(now);
-            if (buckets.size >= MAX_BUCKETS) return false;
+            if (buckets.size >= MAX_BUCKETS) {
+                const oldest = buckets.keys().next();
+                if (!oldest.done) buckets.delete(oldest.value);
+            }
         }
         b = { tokens: RATE_LIMIT_TOKENS, lastRefillAt: now };
     }

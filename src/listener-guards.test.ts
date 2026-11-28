@@ -56,14 +56,13 @@ describe('an attachment is downloaded only for a push that would be typed', () =
 });
 
 describe('the rate map stays bounded', () => {
-    it('refuses new names once full of live ones, and frees stale ones on demand', () => {
+    it('a full map admits a new name by evicting the oldest, never by refusing', () => {
         const t0 = 1_000_000_000_000;
-        let admitted = 0;
-        for (let i = 0; i < 20_000; i++) if (checkRateLimit(`bound-${i}`, t0)) admitted++;
-        expect(admitted).toBeLessThan(20_000);
-        expect(checkRateLimit('bound-one-more', t0)).toBe(false);
-        // Two windows later every bucket is idle: a full map clears itself.
-        expect(checkRateLimit('bound-later', t0 + 10 * 60_000)).toBe(true);
+        for (let i = 0; i < 5_000; i++) expect(checkRateLimit(`bound-${i}`, t0)).toBe(true);
+        expect(checkRateLimit('bound-one-more', t0)).toBe(true);
+        // The earliest names were evicted and restart with a full bucket; recent ones keep their spent tokens.
+        expect(checkRateLimit('bound-0', t0)).toBe(true);
+        expect(checkRateLimit('bound-one-more', t0 + 10 * 60_000)).toBe(true);
     });
 });
 

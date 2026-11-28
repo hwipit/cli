@@ -1,7 +1,7 @@
 import { appendFileSync, renameSync, statSync } from 'fs';
 import { join } from 'path';
 import { stateDir } from './gate.js';
-import { handBackToSudoUser, mkdirHandedBack } from './private-files.js';
+import { ensurePrivateDir, handBackToSudoUser } from './private-files.js';
 
 /** One phone → shell-session injection, as the listener admitted it. */
 export interface ShellAuditEntry {
@@ -47,7 +47,7 @@ export const formatShellAuditLine = (e: ShellAuditEntry): string => {
  */
 export const appendShellAudit = (entry: ShellAuditEntry, path: string = shellAuditPath()): boolean => {
     try {
-        mkdirHandedBack(stateDir(), 0o700);
+        ensurePrivateDir(stateDir());
         if ((statSync(path, { throwIfNoEntry: false })?.size ?? 0) >= SHELL_AUDIT_MAX_BYTES) renameSync(path, `${path}.1`);
         appendFileSync(path, formatShellAuditLine(entry), { mode: 0o600 });
         handBackToSudoUser(path);

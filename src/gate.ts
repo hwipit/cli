@@ -21,7 +21,7 @@ import { createHash } from 'crypto';
 import { existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
-import { createdHandedBack, mkdirHandedBack } from './private-files.js';
+import { createdHandedBack, ensurePrivateDir } from './private-files.js';
 
 export type GateMarker = 'skip' | 'push' | 'high' | 'none';
 export type GatePushMode = 'quiet' | 'loud' | 'normal';
@@ -261,10 +261,10 @@ export const touchRemoteActive = (dir: string, now: () => number = Date.now): vo
 const writeRemoteNow = (dir: string, now: () => number): boolean => {
   const hash = projectHash(dir);
   try {
-    mkdirHandedBack(stateDir());
+    ensurePrivateDir(stateDir());
     // Before the write, so a file root makes is the sudo user's from the start (and the write follows it).
     createdHandedBack(remoteStatePath(hash));
-    writeFileSync(remoteStatePath(hash), `${Math.floor(now() / 1000)}\n`);
+    writeFileSync(remoteStatePath(hash), `${Math.floor(now() / 1000)}\n`, { mode: 0o600 });
     return true;
   } catch {
     /* a hook must never fail on state IO */
